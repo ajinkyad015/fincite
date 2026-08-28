@@ -119,38 +119,46 @@ class UserMessageCreate(BaseModel):
     content: str
 
 
+# ---------------------------------------------------------------------------
+# NSE / Indian Financial Document Metadata
+# ---------------------------------------------------------------------------
+
+
 class DocumentMetadataKeysEnum(str, Enum):
     """
-    Enum for the keys of the metadata map for a document
+    Enum for the top-level keys of the metadata_map JSONB column for a document.
     """
 
-    SEC_DOCUMENT = "sec_document"
+    NSE_DOCUMENT = "nse_document"
 
 
-class SecDocumentTypeEnum(str, Enum):
+class NSEDocumentTypeEnum(str, Enum):
     """
-    Enum for the type of sec document
+    Type of Indian / NSE financial document.
     """
 
-    TEN_K = "10-K"
-    TEN_Q = "10-Q"
+    ANNUAL_REPORT = "annual_report"
+    FINANCIAL_RESULTS = "financial_results"
+    CORPORATE_FILING = "corporate_filing"
+    INVESTOR_PRESENTATION = "investor_presentation"
+    OTHER = "other"
 
 
-class SecDocumentMetadata(BaseModel):
+class NSEDocumentMetadata(BaseModel):
     """
-    Metadata for a document that is a sec document
+    Metadata for an Indian / NSE financial document.
+
+    All fields except company_name are optional so that users can upload PDFs
+    with minimal information.
     """
 
     company_name: str
-    company_ticker: str
-    doc_type: SecDocumentTypeEnum
-    year: int
-    quarter: Optional[int] = None
-    accession_number: Optional[str] = None
-    cik: Optional[str] = None
-    period_of_report_date: Optional[datetime] = None
-    filed_as_of_date: Optional[datetime] = None
-    date_as_of_change: Optional[datetime] = None
+    company_symbol: Optional[str] = None
+    document_type: NSEDocumentTypeEnum = NSEDocumentTypeEnum.ANNUAL_REPORT
+    financial_year: Optional[str] = None
+    report_date: Optional[datetime] = None
+    exchange: str = "NSE"
+    original_filename: Optional[str] = None
 
 
 DocumentMetadataMap = Dict[Union[DocumentMetadataKeysEnum, str], Any]
@@ -159,6 +167,16 @@ DocumentMetadataMap = Dict[Union[DocumentMetadataKeysEnum, str], Any]
 class Document(Base):
     url: str
     metadata_map: Optional[DocumentMetadataMap] = None
+
+
+class DocumentUploadResponse(Base):
+    """
+    Response returned after a successful document upload and indexing.
+    """
+
+    url: str
+    metadata_map: Optional[DocumentMetadataMap] = None
+    status: str = "indexed"
 
 
 class Conversation(Base):

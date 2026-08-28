@@ -1,3 +1,16 @@
+"""
+Application entry point.
+
+Startup sequence:
+    1. Configure logging
+    2. Configure Sentry (optional)
+    3. Set up LlamaIndex settings (OpenAI LLM + embeddings)
+    4. Wait for database connection
+    5. Verify migrations are up to date
+    6. Initialise pgvector store
+    7. Initialise NLTK sentence tokenizer
+    8. Start FastAPI
+"""
 from typing import cast
 import uvicorn
 import logging
@@ -11,13 +24,11 @@ from alembic import script
 from alembic.runtime import migration
 from sqlalchemy.engine import create_engine, Engine
 from llama_index.core.node_parser.text.utils import split_by_sentence_tokenizer
-import llama_index.core
+from contextlib import asynccontextmanager
 
 from app.api.api import api_router
 from app.db.wait_for_db import check_database_connection
-from app.core.config import settings, AppEnvironment
-from app.loader_io import loader_io_router
-from contextlib import asynccontextmanager
+from app.core.config import settings
 from app.chat.pg_vector import get_vector_store_singleton, CustomPGVectorStore
 from app.llama_index_settings import _setup_llama_index_settings
 
@@ -31,120 +42,97 @@ def check_current_head(alembic_cfg: Config, connectable: Engine) -> bool:
         return set(context.get_current_heads()) == set(directory.get_heads())
 
 
-def __setup_logging(log_level: str):
-    log_level = getattr(logging, log_level.upper())
+def _setup_logging(log_level: str) -> None:
+    level = getattr(logging, log_level.upper())
     log_formatter = logging.Formatter(
         "%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s"
     )
     root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
-
+    root_logger.setLevel(level)
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(log_formatter)
     root_logger.addHandler(stream_handler)
-    logger.info("Set up logging with log level %s", log_level)
+    logger.info("Logging initialised at level %s", log_level)
 
 
-def __setup_sentry():
+def _setup_sentry() -> None:
     if settings.SENTRY_DSN:
-        logger.info("Setting up Sentry")
-        if settings.ENVIRONMENT == AppEnvironment.PRODUCTION:
-            profiles_sample_rate = None
-        else:
-            profiles_sample_rate = settings.SENTRY_SAMPLE_RATE
+        logger.info("Initialising Sentry")
         sentry_sdk.init(
             dsn=settings.SENTRY_DSN,
-            environment=settings.ENVIRONMENT.value,
-            release=settings.RENDER_GIT_COMMIT,
-            debug=settings.VERBOSE,
-            traces_sample_rate=settings.SENTRY_SAMPLE_RATE,
-            profiles_sample_rate=profiles_sample_rate,
+            traces_sample_rate=0.1,
         )
     else:
-        logger.info("Skipping Sentry setup")
+        logger.info("Sentry DSN not set — skipping Sentry initialisation")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # first wait for DB to be connectable
+    # 1. Wait for the database to become available
     await check_database_connection()
+
+    # 2. Verify Alembic migrations are current
     cfg = Config("alembic.ini")
-    # Change DB URL to use psycopg2 driver for this specific check
     db_url = settings.DATABASE_URL.replace(
         "postgresql+asyncpg://", "postgresql+psycopg2://"
     )
     cfg.set_main_option("sqlalchemy.url", db_url)
-    engine = create_engine(db_url, echo=True)
+    engine = create_engine(db_url, echo=False)
     if not check_current_head(cfg, engine):
         raise Exception(
             "Database is not up to date. Please run `poetry run alembic upgrade head`"
         )
-    # initialize pg vector store singleton
+    engine.dispose()
+
+    # 3. Initialise pgvector store
     vector_store = await get_vector_store_singleton()
     vector_store = cast(CustomPGVectorStore, vector_store)
     await vector_store.run_setup()
 
+    # 4. Pre-download NLTK sentence tokenizer data
     try:
-        # Some setup is required to initialize the llama-index sentence splitter
         split_by_sentence_tokenizer()
     except FileExistsError:
-        # Sometimes seen in deployments, should be benign.
-        logger.info("Tried to re-download NLTK files but already exists.")
-
-    if not settings.RENDER:
-        llama_index.core.set_global_handler("arize_phoenix")
+        logger.info("NLTK tokenizer files already present.")
 
     yield
-    # This section is run on app shutdown
+
+    # Shutdown: close vector store connections
     await vector_store.close()
 
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
+    description=(
+        "AI financial research backend for Indian / NSE company annual reports "
+        "and filings. Upload PDFs, then ask questions across them using RAG."
+    ),
     openapi_url=f"{settings.API_PREFIX}/openapi.json",
     lifespan=lifespan,
 )
 
-
 if settings.BACKEND_CORS_ORIGINS:
-    origins = settings.BACKEND_CORS_ORIGINS.copy()
-    if settings.CODESPACES and settings.CODESPACE_NAME and \
-        settings.ENVIRONMENT == AppEnvironment.LOCAL:
-        # add codespace origin if running in Github codespace
-        origins.append(f"https://{settings.CODESPACE_NAME}-3000.app.github.dev")
-    # allow all origins
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[str(origin) for origin in origins],
-        allow_origin_regex="https://llama-app-frontend.*\.vercel\.app",
+        allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
 app.include_router(api_router, prefix=settings.API_PREFIX)
-app.mount(f"/{settings.LOADER_IO_VERIFICATION_STR}", loader_io_router)
 
 
-def start():
-    print("Running in AppEnvironment: " + settings.ENVIRONMENT.value)
-    __setup_logging(settings.LOG_LEVEL)
-    __setup_sentry()
+def start() -> None:
+    """Launched with `poetry run start`."""
+    _setup_logging(settings.LOG_LEVEL)
+    _setup_sentry()
     _setup_llama_index_settings()
-    """Launched with `poetry run start` at root level"""
-    if settings.RENDER:
-        # on render.com deployments, run migrations
-        logger.debug("Running migrations")
-        alembic_args = ["--raiseerr", "upgrade", "head"]
-        alembic.config.main(argv=alembic_args)
-        logger.debug("Migrations complete")
-    else:
-        logger.debug("Skipping migrations")
-    live_reload = not settings.RENDER
+    logger.info("Starting %s", settings.PROJECT_NAME)
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=live_reload,
-        workers=settings.UVICORN_WORKER_COUNT,
+        reload=settings.LOG_LEVEL == "DEBUG",
+        workers=1,
     )

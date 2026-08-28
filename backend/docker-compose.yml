@@ -1,55 +1,47 @@
 version: '3'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local development docker-compose for fincite backend
+#
+# NOTE: This compose file is for local development ONLY.
+# In production, use Supabase for PostgreSQL + pgvector + Storage.
+#
+# To use:
+#   1. Copy .env.example to .env and fill in your values
+#   2. docker compose up
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
-  llama-app-fastapi:
+  fincite-backend:
     build:
       context: .
     volumes:
-      # allows for live reloading of the app
-      # when the code within the ./app directory changes
+      # Live reload: reflect code changes without rebuild
       - ./:/app
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
       - db
-      - phoenix
     env_file:
       - .env
-      - .env.docker
     environment:
-      BACKEND_CORS_ORIGINS: '["http://localhost", "http://localhost:8000"]'
+      # Override DATABASE_URL to point at the local pgvector container
+      DATABASE_URL: "postgresql://user:password@db:5432/fincite_db"
+      BACKEND_CORS_ORIGINS: '["http://localhost:3000", "http://localhost:8000"]'
 
+  # Local PostgreSQL + pgvector for development without a Supabase project.
+  # For storage (PDFs), you still need SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
+  # set in your .env even for local dev.
   db:
     image: ankane/pgvector:v0.5.0
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
-      POSTGRES_DB: llama_app_db
+      POSTGRES_DB: fincite_db
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data/
-
-  localstack:
-    container_name: "${LOCALSTACK_DOCKER_NAME-localstack_main}"
-    image: localstack/localstack
-    ports:
-      - "127.0.0.1:4566:4566" # LocalStack Gateway
-      - "127.0.0.1:4510-4559:4510-4559" # external services port range
-    environment:
-      - DEBUG=${DEBUG-}
-      - DOCKER_HOST=unix:///var/run/docker.sock
-    volumes:
-      - "${LOCALSTACK_VOLUME_DIR:-./volume}:/var/lib/localstack"
-      - "/var/run/docker.sock:/var/run/docker.sock"
-
-  # useful for local workflow debugging
-  # taken from here: https://docs.arize.com/phoenix/deployment/docker#postgresql
-  phoenix:
-    image: arizephoenix/phoenix:latest # Must be greater than 4.0 version to work
-    ports:
-      - 6006:6006 # PHOENIX_PORT
-      - 4317:4317 # PHOENIX_GRPC_PORT
-      - 9090:9090 # [Optional] PROMETHEUS PORT IF ENABLED
 
 volumes:
   postgres_data:

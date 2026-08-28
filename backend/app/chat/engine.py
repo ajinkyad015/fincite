@@ -1,173 +1,153 @@
-from typing import Dict, List, Optional
+"""
+Chat engine construction.
+
+Builds an OpenAI agent with per-document RAG query engines.
+Documents are retrieved from Supabase Storage and indexed into pgvector.
+
+Flow:
+    conversation documents
+          ↓
+    build_doc_id_to_index_map()
+       ↓ (per document)
+    fetch PDF from Supabase Storage
+       ↓
+    PDFReader → LlamaIndex nodes (with DB_DOC_ID_KEY)
+       ↓
+    VectorStoreIndex (backed by pgvector)
+          ↓
+    QueryEngineTool (one per document, with MetadataFilter by doc ID)
+          ↓
+    SubQuestionQueryEngine
+          ↓
+    OpenAIAgent (streaming)
+"""
+from typing import Dict, List
 import logging
-from pathlib import Path
 from datetime import datetime
-import s3fs
-from fsspec.asyn import AsyncFileSystem
-from llama_index.core import (
-    VectorStoreIndex,
-    StorageContext,
-    load_indices_from_storage,
-)
-from llama_index.core.vector_stores.types import VectorStore
 from tempfile import TemporaryDirectory
-import requests
+from pathlib import Path
+
 import nest_asyncio
-from datetime import timedelta
+import requests
 from cachetools import cached, TTLCache
-from llama_index.readers.file.docs.base import PDFReader
+from datetime import timedelta
+
+from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.core.vector_stores.types import VectorStore
+from llama_index.core.vector_stores.types import MetadataFilters, ExactMatchFilter
+from llama_index.core.indices.query.base import BaseQueryEngine
 from llama_index.core.schema import Document as LlamaIndexDocument
 from llama_index.core.chat_engine.types import ChatMessage
-from llama_index.agent.openai import OpenAIAgent
-from llama_index.llms.openai import OpenAI
-from llama_index.core.base.llms.types import MessageRole
 from llama_index.core.callbacks.base import BaseCallbackHandler, CallbackManager
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core.query_engine import SubQuestionQueryEngine
-from llama_index.core.indices.query.base import BaseQueryEngine
-from llama_index.core.vector_stores.types import (
-    MetadataFilters,
-    ExactMatchFilter,
-)
+from llama_index.agent.openai import OpenAIAgent
+from llama_index.llms.openai import OpenAI
+from llama_index.core.base.llms.types import MessageRole
+from llama_index.readers.file.docs.base import PDFReader
+
 from app.core.config import settings
 from app.schema import (
     Message as MessageSchema,
     Document as DocumentSchema,
     Conversation as ConversationSchema,
-    DocumentMetadataKeysEnum,
-    SecDocumentMetadata,
 )
 from app.models.db import MessageRoleEnum, MessageStatusEnum
-from app.chat.constants import (
-    DB_DOC_ID_KEY,
-    SYSTEM_MESSAGE,
-)
-from app.chat.tools import get_api_query_engine_tool
-from app.chat.utils import build_title_for_document
+from app.chat.constants import DB_DOC_ID_KEY, SYSTEM_MESSAGE
+from app.chat.utils import build_title_for_document, build_description_for_document
 from app.chat.pg_vector import get_vector_store_singleton
 from app.chat.qa_response_synth import get_custom_response_synth
-
+from app.storage.supabase import download_document
 
 logger = logging.getLogger(__name__)
-
 
 logger.info("Applying nested asyncio patch")
 nest_asyncio.apply()
 
 
-
-def get_s3_fs() -> AsyncFileSystem:
-    s3 = s3fs.S3FileSystem(
-        key=settings.AWS_KEY,
-        secret=settings.AWS_SECRET,
-        endpoint_url=settings.S3_ENDPOINT_URL,
-    )
-    if not (settings.RENDER or s3.exists(settings.S3_BUCKET_NAME)):
-        s3.mkdir(settings.S3_BUCKET_NAME)
-    return s3
-
-
 def fetch_and_read_document(
     document: DocumentSchema,
 ) -> List[LlamaIndexDocument]:
-    # Super hacky approach to get this to feature complete on time.
-    # TODO: Come up with better abstractions for this and the other methods in this module.
+    """
+    Download a PDF from Supabase Storage (or fall back to HTTP GET of
+    document.url if the URL is a direct HTTP link) and parse it with
+    LlamaIndex PDFReader.
+
+    Each resulting LlamaIndex Document carries DB_DOC_ID_KEY in its
+    metadata so retrieval can be filtered per document.
+    """
     with TemporaryDirectory() as temp_dir:
         temp_file_path = Path(temp_dir) / f"{str(document.id)}.pdf"
-        with open(temp_file_path, "wb") as temp_file:
+
+        try:
+            # Primary path: download from Supabase Storage
+            pdf_bytes = download_document(str(document.id))
+            temp_file_path.write_bytes(pdf_bytes)
+        except Exception:
+            logger.warning(
+                "Could not download document %s from Supabase Storage. "
+                "Falling back to HTTP GET of document URL.",
+                document.id,
+            )
             with requests.get(document.url, stream=True) as r:
                 r.raise_for_status()
-                for chunk in r.iter_content(chunk_size=8192):
-                    temp_file.write(chunk)
-            temp_file.seek(0)
-            reader = PDFReader()
-            return reader.load_data(
-                temp_file_path, extra_info={DB_DOC_ID_KEY: str(document.id)}
-            )
+                with open(temp_file_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
 
-
-def build_description_for_document(document: DocumentSchema) -> str:
-    if DocumentMetadataKeysEnum.SEC_DOCUMENT in document.metadata_map:
-        sec_metadata = SecDocumentMetadata.parse_obj(
-            document.metadata_map[DocumentMetadataKeysEnum.SEC_DOCUMENT]
+        reader = PDFReader()
+        return reader.load_data(
+            temp_file_path,
+            extra_info={DB_DOC_ID_KEY: str(document.id)},
         )
-        time_period = (
-            f"{sec_metadata.year} Q{sec_metadata.quarter}"
-            if sec_metadata.quarter
-            else str(sec_metadata.year)
-        )
-        return f"A SEC {sec_metadata.doc_type.value} filing describing the financials of {sec_metadata.company_name} ({sec_metadata.company_ticker}) for the {time_period} time period."
-    return "A document containing useful information that the user pre-selected to discuss with the assistant."
 
 
 def index_to_query_engine(doc_id: str, index: VectorStoreIndex) -> BaseQueryEngine:
+    """Create a query engine filtered to a single document."""
     filters = MetadataFilters(
         filters=[ExactMatchFilter(key=DB_DOC_ID_KEY, value=doc_id)]
     )
-    kwargs = {"similarity_top_k": 3, "filters": filters}
-    return index.as_query_engine(**kwargs)
-
-
-@cached(
-    TTLCache(maxsize=10, ttl=timedelta(minutes=5).total_seconds()),
-    key=lambda *args, **kwargs: "global_storage_context",
-)
-def get_storage_context(
-    persist_dir: str, vector_store: VectorStore, fs: Optional[AsyncFileSystem] = None
-) -> StorageContext:
-    logger.info("Creating new storage context.")
-    return StorageContext.from_defaults(
-        persist_dir=persist_dir, vector_store=vector_store, fs=fs
-    )
+    return index.as_query_engine(similarity_top_k=3, filters=filters)
 
 
 async def build_doc_id_to_index_map(
     callback_manager: CallbackManager,
     documents: List[DocumentSchema],
-    fs: Optional[AsyncFileSystem] = None,
 ) -> Dict[str, VectorStoreIndex]:
-    persist_dir = f"{settings.S3_BUCKET_NAME}"
+    """
+    For each document, attempt to load an existing VectorStoreIndex from
+    pgvector. If the index is not found (new document), fetch + index the PDF.
 
+    Since pgvector IS the persistent store, we do not need an S3 persist dir.
+    """
     vector_store = await get_vector_store_singleton()
-    try:
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    doc_id_to_index: Dict[str, VectorStoreIndex] = {}
+    for doc in documents:
+        doc_id = str(doc.id)
         try:
-            storage_context = get_storage_context(persist_dir, vector_store, fs=fs)
-        except FileNotFoundError:
-            logger.info(
-                "Could not find storage context in S3. Creating new storage context."
+            index = VectorStoreIndex.from_vector_store(
+                vector_store=vector_store,
+                callback_manager=callback_manager,
             )
-            storage_context = StorageContext.from_defaults(
-                vector_store=vector_store, fs=fs
+            doc_id_to_index[doc_id] = index
+            logger.debug("Loaded index for document %s from pgvector.", doc_id)
+        except Exception:
+            logger.warning(
+                "Could not load index for document %s. "
+                "Re-indexing from storage.",
+                doc_id,
             )
-            storage_context.persist(persist_dir=persist_dir, fs=fs)
-        index_ids = [str(doc.id) for doc in documents]
-        indices = load_indices_from_storage(
-            storage_context,
-            index_ids=index_ids,
-            callback_manager=callback_manager,
-        )
-        doc_id_to_index = dict(zip(index_ids, indices))
-        logger.debug("Loaded indices from storage.")
-    except ValueError:
-        logger.error(
-            "Failed to load indices from storage. Creating new indices. "
-            "If you're running the seed_db script, this is normal and expected."
-        )
-        storage_context = StorageContext.from_defaults(
-            persist_dir=persist_dir, vector_store=vector_store, fs=fs
-        )
-        doc_id_to_index = {}
-        for doc in documents:
-            llama_index_docs = fetch_and_read_document(doc)
-            storage_context.docstore.add_documents(llama_index_docs)
+            llama_docs = fetch_and_read_document(doc)
             index = VectorStoreIndex.from_documents(
-                llama_index_docs,
+                llama_docs,
                 storage_context=storage_context,
                 callback_manager=callback_manager,
             )
-            index.set_index_id(str(doc.id))
-            index.storage_context.persist(persist_dir=persist_dir, fs=fs)
-            doc_id_to_index[str(doc.id)] = index
+            index.set_index_id(doc_id)
+            doc_id_to_index[doc_id] = index
+
     return doc_id_to_index
 
 
@@ -180,13 +160,11 @@ def get_chat_history(
     Failed chat messages are filtered out and then the remaining ones are
     sorted by created_at.
     """
-    # pre-process chat messages
     chat_messages = [
         m
         for m in chat_messages
         if m.content.strip() and m.status == MessageStatusEnum.SUCCESS
     ]
-    # TODO: could be a source of high CPU utilization
     chat_messages = sorted(chat_messages, key=lambda m: m.created_at)
 
     chat_history = []
@@ -205,15 +183,25 @@ async def get_chat_engine(
     callback_handler: BaseCallbackHandler,
     conversation: ConversationSchema,
 ) -> OpenAIAgent:
+    """
+    Build an OpenAIAgent for a conversation.
+
+    Architecture:
+        One QueryEngineTool per selected document (filtered to that doc's vectors)
+          ↓
+        SubQuestionQueryEngine (decomposes multi-doc questions)
+          ↓
+        OpenAIAgent (streaming, with system prompt)
+    """
     callback_manager = CallbackManager([callback_handler])
-    s3_fs = get_s3_fs()
     doc_id_to_index = await build_doc_id_to_index_map(
-        callback_manager, conversation.documents, fs=s3_fs
+        callback_manager, conversation.documents
     )
     id_to_doc: Dict[str, DocumentSchema] = {
         str(doc.id): doc for doc in conversation.documents
     }
 
+    # One tool per document, each with a metadata filter for that doc's ID
     vector_query_engine_tools = [
         QueryEngineTool(
             query_engine=index_to_query_engine(doc_id, index),
@@ -227,45 +215,27 @@ async def get_chat_engine(
 
     response_synth = get_custom_response_synth(callback_manager, conversation.documents)
 
-    qualitative_question_engine = SubQuestionQueryEngine.from_defaults(
+    # Single sub-question engine for all qualitative + quantitative questions.
+    # (Polygon quantitative engine has been removed — answers come from the PDFs.)
+    document_question_engine = SubQuestionQueryEngine.from_defaults(
         query_engine_tools=vector_query_engine_tools,
         response_synthesizer=response_synth,
-        verbose=settings.VERBOSE,
+        verbose=settings.LOG_LEVEL == "DEBUG",
         use_async=True,
     )
 
-    api_query_engine_tools = [
-        get_api_query_engine_tool(doc, callback_manager)
-        for doc in conversation.documents
-        if DocumentMetadataKeysEnum.SEC_DOCUMENT in doc.metadata_map
-    ]
-
-    quantitative_question_engine = SubQuestionQueryEngine.from_defaults(
-        query_engine_tools=api_query_engine_tools,
-        response_synthesizer=response_synth,
-        verbose=settings.VERBOSE,
-        use_async=True,
-    )
-
-    top_level_sub_tools = [
+    top_level_tools = [
         QueryEngineTool(
-            query_engine=qualitative_question_engine,
+            query_engine=document_question_engine,
             metadata=ToolMetadata(
-                name="qualitative_question_engine",
-                description="""
-A query engine that can answer qualitative questions about a set of SEC financial documents that the user pre-selected for the conversation.
-Any questions about company-related headwinds, tailwinds, risks, sentiments, or administrative information should be asked here.
-""".strip(),
-            ),
-        ),
-        QueryEngineTool(
-            query_engine=quantitative_question_engine,
-            metadata=ToolMetadata(
-                name="quantitative_question_engine",
-                description="""
-A query engine that can answer quantitative questions about a set of SEC financial documents that the user pre-selected for the conversation.
-Any questions about company-related financials or other metrics should be asked here.
-""".strip(),
+                name="document_question_engine",
+                description=(
+                    "A query engine that answers questions about the Indian financial "
+                    "documents (annual reports, NSE filings, investor presentations) "
+                    "that the user has selected for this conversation. "
+                    "Use this for ALL questions — financial metrics, risk factors, "
+                    "management commentary, governance, ESG, and cross-document comparisons."
+                ),
             ),
         ),
     ]
@@ -276,8 +246,7 @@ Any questions about company-related financials or other metrics should be asked 
         streaming=True,
         api_key=settings.OPENAI_API_KEY,
     )
-    chat_messages: List[MessageSchema] = conversation.messages
-    chat_history = get_chat_history(chat_messages)
+    chat_history = get_chat_history(conversation.messages)
     logger.debug("Chat history: %s", chat_history)
 
     if conversation.documents:
@@ -289,10 +258,10 @@ Any questions about company-related financials or other metrics should be asked 
 
     curr_date = datetime.utcnow().strftime("%Y-%m-%d")
     chat_engine = OpenAIAgent.from_tools(
-        tools=top_level_sub_tools,
+        tools=top_level_tools,
         llm=chat_llm,
         chat_history=chat_history,
-        verbose=settings.VERBOSE,
+        verbose=settings.LOG_LEVEL == "DEBUG",
         system_prompt=SYSTEM_MESSAGE.format(doc_titles=doc_titles, curr_date=curr_date),
         callback_manager=callback_manager,
         max_function_calls=3,
