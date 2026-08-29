@@ -67,8 +67,11 @@ class Settings(BaseSettings):
             raise ValueError("Invalid log level: " + str(v))
         return v
 
-    model_config = SettingsConfigDict(env_prefix="")
-
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
 settings = Settings()
 os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY
