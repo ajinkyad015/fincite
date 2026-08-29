@@ -138,7 +138,7 @@ async def upsert_document_by_url(
     """
     Upsert a document by URL (for backward compatibility).
     """
-    stmt = insert(Document).values(**document.dict(exclude_none=True))
+    stmt = insert(Document).values(**document.model_dump(exclude_none=True))
     stmt = stmt.on_conflict_do_update(
         index_elements=[Document.url],
         set_=document.model_dump(mode="json", include={"metadata_map"}),

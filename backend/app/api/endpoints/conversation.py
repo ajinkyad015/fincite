@@ -34,7 +34,7 @@ async def create_conversation(
     db: AsyncSession = Depends(get_db),
 ) -> schema.Conversation:
     """
-    Create a new conversation
+    Create a new conversation linked to one or more previously uploaded documents.
     """
     return await crud.create_conversation(db, payload)
 
@@ -44,7 +44,7 @@ async def get_conversation(
     conversation_id: UUID, db: AsyncSession = Depends(get_db)
 ) -> schema.Conversation:
     """
-    Get a conversation by ID along with its messages and message subprocesses.
+    Get a conversation by ID along with its messages and message sub-processes.
     """
     conversation = await crud.fetch_conversation_with_messages(db, str(conversation_id))
     if conversation is None:
@@ -74,17 +74,20 @@ async def message_conversation(
     db: AsyncSession = Depends(get_db),
 ) -> EventSourceResponse:
     """
-    Send a message from a user to a conversation, receive a SSE stream of the assistant's response.
-    Each event in the SSE stream is a Message object. As the assistant continues processing the response,
-    the message object's sub_processes list and content string is appended to. While the message is being
-    generated, the status of the message will be PENDING. Once the message is generated, the status will
-    be SUCCESS. If there was an error in processing the message, the final status will be ERROR.
+    Send a message and receive a Server-Sent Events (SSE) stream of the assistant's response.
+
+    Each SSE event is a JSON-serialised `Message` object. As the assistant processes the
+    response the `sub_processes` list and `content` string grow. While generating,
+    `status` is `PENDING`; on completion it becomes `SUCCESS` or `ERROR`.
+
+    **Note**: Swagger UI does not render SSE streams natively — use a browser `EventSource`
+    or `curl -N` to consume this endpoint.
     """
     conversation = await crud.fetch_conversation_with_messages(db, str(conversation_id))
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    user_message = Message(
+    user_msg_obj = Message(
         created_at=datetime.datetime.utcnow(),
         updated_at=datetime.datetime.utcnow(),
         conversation_id=conversation_id,
@@ -98,7 +101,7 @@ async def message_conversation(
     async def event_publisher():
         async with send_chan:
             task = asyncio.create_task(
-                handle_chat_message(conversation, user_message, send_chan)
+                handle_chat_message(conversation, user_msg_obj, send_chan)
             )
             message_id = str(uuid4())
             message = Message(
@@ -116,7 +119,7 @@ async def message_conversation(
                     if isinstance(message_obj, StreamedMessage):
                         message.content = message_obj.content
                     elif isinstance(message_obj, StreamedMessageSubProcess):
-                        status = (
+                        sub_status = (
                             MessageSubProcessStatusEnum.FINISHED
                             if message_obj.has_ended
                             else MessageSubProcessStatusEnum.PENDING
@@ -128,39 +131,38 @@ async def message_conversation(
                         else:
                             created_at = datetime.datetime.utcnow()
                         sub_process = MessageSubProcess(
-                            # NOTE: By setting the created_at to the current time, we are
-                            # no longer able to use the created_at field to determine the
-                            # time at which the subprocess was inserted into the database.
                             created_at=created_at,
                             message_id=message_id,
                             source=message_obj.source,
                             metadata_map=message_obj.metadata_map,
-                            status=status,
+                            status=sub_status,
                         )
                         event_id_to_sub_process[message_obj.event_id] = sub_process
-
                         message.sub_processes = list(event_id_to_sub_process.values())
                     else:
                         logger.error(
-                            f"Unknown message object type: {type(message_obj)}"
+                            "Unknown message object type: %s", type(message_obj)
                         )
                         continue
-                    yield schema.Message.from_orm(message).json()
+                    # Pydantic v2: model_validate + model_dump_json
+                    yield schema.Message.model_validate(
+                        message, from_attributes=True
+                    ).model_dump_json()
                 await task
                 if task.exception():
                     raise ValueError(
                         "handle_chat_message task failed"
                     ) from task.exception()
                 final_status = MessageStatusEnum.SUCCESS
-            except:
+            except Exception:
                 logger.error("Error in message publisher", exc_info=True)
                 final_status = MessageStatusEnum.ERROR
             message.status = final_status
-            db.add(user_message)
+            db.add(user_msg_obj)
             db.add(message)
             await db.commit()
             final_message = await crud.fetch_message_with_sub_processes(db, message_id)
-            yield final_message.json()
+            yield final_message.model_dump_json()
 
     return EventSourceResponse(event_publisher())
 
@@ -172,7 +174,9 @@ async def test_message_conversation(
     db: AsyncSession = Depends(get_db),
 ) -> schema.Message:
     """
-    Test version of /message endpoint that returns a single message object instead of a SSE stream.
+    Non-streaming version of `/message` — returns a single `Message` object.
+    Useful for Swagger UI testing where SSE is not rendered.
+    Internally consumes the full SSE stream and returns the final message.
     """
     response: EventSourceResponse = await message_conversation(
         conversation_id, user_message, db
@@ -181,6 +185,6 @@ async def test_message_conversation(
     async for message in response.body_iterator:
         final_message = message
     if final_message is not None:
-        return schema.Message.parse_raw(final_message)
+        return schema.Message.model_validate_json(final_message)
     else:
         raise HTTPException(status_code=500, detail="Internal server error")

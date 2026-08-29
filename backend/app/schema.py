@@ -1,7 +1,7 @@
 """
 Pydantic Schemas for the API
 """
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from enum import Enum
 from typing import List, Optional, Dict, Union, Any
 from uuid import UUID
@@ -18,22 +18,16 @@ from app.models.db import (
 from app.chat.constants import DB_DOC_ID_KEY
 
 
-def build_uuid_validator(*field_names: str):
-    return validator(*field_names)(lambda x: str(x) if x else x)
-
-
 class Base(BaseModel):
     id: Optional[UUID] = Field(None, description="Unique identifier")
     created_at: Optional[datetime] = Field(None, description="Creation datetime")
     updated_at: Optional[datetime] = Field(None, description="Update datetime")
 
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class BaseMetadataObject(BaseModel):
-    class Config:
-        from_attributes = True
+    model_config = {"from_attributes": True}
 
 
 class Citation(BaseMetadataObject):
@@ -42,7 +36,8 @@ class Citation(BaseMetadataObject):
     page_number: int
     score: Optional[float] = None
 
-    @validator("document_id")
+    @field_validator("document_id", mode="before")
+    @classmethod
     def validate_document_id(cls, value):
         if value:
             return str(value)
@@ -91,12 +86,10 @@ class QuestionAnswerPair(BaseMetadataObject):
         )
 
 
-# later will be Union[QuestionAnswerPair, more to add later... ]
 class SubProcessMetadataKeysEnum(str, Enum):
     SUB_QUESTION = EventPayload.SUB_QUESTION.value
 
 
-# keeping the typing pretty loose here, in case there are changes to the metadata data formats.
 SubProcessMetadataMap = Dict[Union[SubProcessMetadataKeysEnum, str], Any]
 
 

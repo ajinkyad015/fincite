@@ -2,8 +2,8 @@
 Document endpoints.
 
 Provides:
-    POST /upload       — Upload a PDF and index it (new)
-    GET  /             — List / filter documents
+    POST /upload        — Upload a PDF and index it
+    GET  /              — List / filter documents
     GET  /{document_id} — Get a single document
 """
 import hashlib
@@ -20,7 +20,7 @@ from app.api import crud
 from app import schema
 from app.chat.pg_vector import get_vector_store_singleton
 from app.ingestion.pdf import ingest_document
-from app.storage.supabase import upload_document, delete_document
+from app.storage.supabase import upload_document, delete_document, get_document_url
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -105,7 +105,11 @@ async def upload_document_endpoint(
 
     # Derive company_name from filename if not supplied
     original_filename = file.filename or "document.pdf"
-    resolved_company_name = company_name or original_filename.replace(".pdf", "").replace("-", " ").replace("_", " ").title() or "Unknown Company"
+    resolved_company_name = (
+        company_name
+        or original_filename.replace(".pdf", "").replace("-", " ").replace("_", " ").title()
+        or "Unknown Company"
+    )
 
     # Build NSE metadata
     nse_metadata = schema.NSEDocumentMetadata(
@@ -122,7 +126,7 @@ async def upload_document_endpoint(
 
     # Upload to Supabase Storage
     try:
-        storage_path = upload_document(content, document_id)
+        upload_document(content, document_id)
     except RuntimeError as exc:
         raise HTTPException(
             status_code=500,
@@ -130,7 +134,6 @@ async def upload_document_endpoint(
         )
 
     # Build the public storage URL
-    from app.storage.supabase import get_document_url
     storage_url = get_document_url(document_id)
 
     # Create database record

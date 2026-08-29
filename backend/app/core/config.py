@@ -50,10 +50,13 @@ class Settings(BaseSettings):
         """Preprocesses the database URL to make it compatible with asyncpg."""
         if not v or not v.startswith("postgres"):
             raise ValueError("Invalid database URL: " + str(v))
+        v = v.strip()
+        # Already in asyncpg form — leave as-is
+        if "+asyncpg" in v:
+            return v
         return (
             v.replace("postgres://", "postgresql://")
             .replace("postgresql://", "postgresql+asyncpg://")
-            .strip()
         )
 
     @field_validator("LOG_LEVEL", mode="before")

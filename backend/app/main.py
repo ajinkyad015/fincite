@@ -2,9 +2,9 @@
 Application entry point.
 
 Startup sequence:
-    1. Configure logging
-    2. Configure Sentry (optional)
-    3. Set up LlamaIndex settings (OpenAI LLM + embeddings)
+    1. Configure LlamaIndex settings (OpenAI LLM + embeddings)
+    2. Configure logging
+    3. Configure Sentry (optional)
     4. Wait for database connection
     5. Verify migrations are up to date
     6. Initialise pgvector store
@@ -68,10 +68,13 @@ def _setup_sentry() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Wait for the database to become available
+    # 1. Configure LlamaIndex (LLM + embeddings) — must happen before any index ops
+    _setup_llama_index_settings()
+
+    # 2. Wait for the database to become available
     await check_database_connection()
 
-    # 2. Verify Alembic migrations are current
+    # 3. Verify Alembic migrations are current
     cfg = Config("alembic.ini")
     db_url = settings.DATABASE_URL.replace(
         "postgresql+asyncpg://", "postgresql+psycopg2://"
@@ -80,16 +83,16 @@ async def lifespan(app: FastAPI):
     engine = create_engine(db_url, echo=False)
     if not check_current_head(cfg, engine):
         raise Exception(
-            "Database is not up to date. Please run `poetry run alembic upgrade head`"
+            "Database is not up to date. Please run `uv run alembic upgrade head`"
         )
     engine.dispose()
 
-    # 3. Initialise pgvector store
+    # 4. Initialise pgvector store
     vector_store = await get_vector_store_singleton()
     vector_store = cast(CustomPGVectorStore, vector_store)
     await vector_store.run_setup()
 
-    # 4. Pre-download NLTK sentence tokenizer data
+    # 5. Pre-download NLTK sentence tokenizer data
     try:
         split_by_sentence_tokenizer()
     except FileExistsError:
@@ -108,6 +111,8 @@ app = FastAPI(
         "and filings. Upload PDFs, then ask questions across them using RAG."
     ),
     openapi_url=f"{settings.API_PREFIX}/openapi.json",
+    docs_url=f"{settings.API_PREFIX}/docs",
+    redoc_url=f"{settings.API_PREFIX}/redoc",
     lifespan=lifespan,
 )
 
@@ -124,10 +129,9 @@ app.include_router(api_router, prefix=settings.API_PREFIX)
 
 
 def start() -> None:
-    """Launched with `poetry run start`."""
+    """Launched with `uv run start`."""
     _setup_logging(settings.LOG_LEVEL)
     _setup_sentry()
-    _setup_llama_index_settings()
     logger.info("Starting %s", settings.PROJECT_NAME)
     uvicorn.run(
         "app.main:app",

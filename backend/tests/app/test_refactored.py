@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import uuid4, UUID
 from fastapi.exceptions import HTTPException
 from fastapi import UploadFile
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import schema
 from app.api import crud
@@ -159,8 +160,8 @@ async def test_upload_document_endpoint_success(
             }
         }
     )
-    mock_crud.fetch_document_by_content_hash.return_value = None
-    mock_crud.create_document.return_value = mock_db_doc
+    mock_crud.fetch_document_by_content_hash = AsyncMock(return_value=None)
+    mock_crud.create_document = AsyncMock(return_value=mock_db_doc)
     
     # Create mock UploadFile
     mock_file = AsyncMock(spec=UploadFile)

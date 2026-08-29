@@ -29,8 +29,6 @@ from pathlib import Path
 
 import nest_asyncio
 import requests
-from cachetools import cached, TTLCache
-from datetime import timedelta
 
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core.vector_stores.types import VectorStore
@@ -215,8 +213,6 @@ async def get_chat_engine(
 
     response_synth = get_custom_response_synth(callback_manager, conversation.documents)
 
-    # Single sub-question engine for all qualitative + quantitative questions.
-    # (Polygon quantitative engine has been removed — answers come from the PDFs.)
     document_question_engine = SubQuestionQueryEngine.from_defaults(
         query_engine_tools=vector_query_engine_tools,
         response_synthesizer=response_synth,
