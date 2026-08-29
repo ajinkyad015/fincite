@@ -6,8 +6,8 @@ Live at https://secinsights.ai/
     * This step can be skipped if you're running from the devcontainer image in Github Codespaces
 1. [Install docker](https://docs.docker.com/engine/install/)
     * This step can be skipped if you're running from the devcontainer image in Github Codespaces
-1. Run `poetry shell`
-1. Run `poetry install` to install dependencies for the project
+1. Run `uv sync --all-groups` to create the virtual environment and install project + dev dependencies.
+1. Activate the environment with `source .venv/bin/activate` on macOS/Linux or `.\.venv\Scripts\Activate.ps1` on Windows (or use `uv run ...` without activating it).
 1. Create the `.env` file and source it. The `.env.development` file is a good template.
     1. `cp .env.development .env`
     1. `set -a`
@@ -47,9 +47,8 @@ The script takes an optional `--base_url` argument that defaults to `http://loca
 Usage is as follows:
 
 ```
-$ poetry shell  # if you aren't already in your poetry shell
+$ uv run python -m scripts.chat_llama
 $ make chat
-poetry run python -m scripts.chat_llama
 (Chat🦙) create
 Created conversation with ID 8371bbc8-a7fd-4b1f-889b-d0bc882df2a5
 (Chat🦙) detail
@@ -111,8 +110,8 @@ These steps assume you've already followed the steps above for setting up your d
     - Steps:
         - `sudo apt-get update`
         - `sudo apt-get install wkhtmltopdf`
-1. Get into your poetry shell with `poetry shell` from the project's root directory.
-1. Run the script! `python scripts/download_sec_pdf.py -o ~/mounted_folder --file-types="['10-Q','10-K']"`
+1. Activate the uv environment with `source .venv/bin/activate` on macOS/Linux or `.\.venv\Scripts\Activate.ps1` on Windows from the project's root directory, or run commands with `uv run ...`.
+1. Run the script! `uv run python scripts/download_sec_pdf.py -o ~/mounted_folder --file-types="['10-Q','10-K']"`
     - Take a 🚽 break while it's running, it'll take a while!
 1. Go to AWS Console and verify you're seeing the SEC files in the S3 bucket.
 
@@ -134,11 +133,13 @@ This is useful for times when:
 
 ### Usage
 To run the script, make sure you've:
-1. Activated your Python virtual environment using `poetry shell`
+1. Created the project environment with `uv sync --all-groups`
 1. Installed all the pre-requisite dependencies for the `SEC Document Downloader` script.
 1. Defined all the environment variables from `.env.development` within your shell environment according to the environment you want to execute the seed script (e.g. local, preview, prod environments)
 
-After that you can run `python scripts/seed_db.py` to start the seed process.
+After that you can run `uv run python scripts/seed_db.py` to start the seed process.
+
+> Note: the Arize Phoenix dev dependency is gated off on Windows because its SQLite dependency requires Microsoft C++ Build Tools. If you need that observability stack on Windows, install the C++ toolchain first or run on WSL/Linux.
 
 To make things easier, the Makefile has some shorthand commands.
 1. `make seed_db`

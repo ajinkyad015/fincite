@@ -1,53 +1,55 @@
-[tool.poetry]
+[project]
 name = "fincite-backend"
 version = "0.1.0"
 description = "AI financial research backend for Indian/NSE annual reports — FastAPI + LlamaIndex + Supabase"
-authors = ["Your Name <you@example.com>"]
 readme = "README.md"
-packages = [{include = "app"}]
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "fastapi==0.115.11",
+  "pydantic==2.9.2",
+  "uvicorn==0.22.0",
+  "sqlalchemy[asyncio]==2.0.19",
+  "asyncpg==0.29.0",
+  "alembic==1.11.2",
+  "psycopg2-binary==2.9.10",
+  "sse-starlette==1.6.5",
+  "pypdf==5.3.1",
+  "anyio==3.7.1",
+  "pgvector==0.3.6",
+  "sentry-sdk[fastapi]==1.29.2",
+  "llama-index-core==0.12.23",
+  "nltk==3.9.1",
+  "cachetools==5.3.1",
+  "greenlet==2.0.2",
+  "pydantic-settings==2.8.1",
+  "openai==1.66.2",
+  "llama-index-vector-stores-postgres==0.4.2",
+  "llama-index-embeddings-openai==0.3.1",
+  "llama-index-readers-file==0.4.6",
+  "llama-index-llms-openai==0.3.25",
+  "llama-index-agent-openai==0.4.6",
+  "llama-index-question-gen-openai==0.3.0",
+  "supabase==2.16.0",
+  "python-multipart==0.0.9",
+]
 
-[tool.poetry.dependencies]
-python = "^3.11,<3.12"
-fastapi = "0.115.11"
-pydantic = "^2.9.2"
-uvicorn = "^0.22.0"
-sqlalchemy = {extras = ["async"], version = "^2.0.15"}
-asyncpg = "^0.29.0"
-alembic = "^1.11.1"
-psycopg2 = {extras = ["binary"], version = "^2.9.6"}
-psycopg2-binary = "^2.9.6"
-sse-starlette = "^1.6.1"
-pypdf = "^5.3.1"
-anyio = "^3.7.0"
-pgvector = "^0.3.6"
-sentry-sdk = {extras = ["fastapi"], version = "^1.28.1"}
-llama-index-core = "0.12.23"
-nltk = "^3.8.1"
-cachetools = "^5.3.1"
-greenlet = "^2.0.2"
-pydantic-settings = "^2.8.1"
-openai = "^1.66.2"
-llama-index-vector-stores-postgres = "^0.4.2"
-llama-index-embeddings-openai = "^0.3.1"
-llama-index-readers-file = "^0.4.6"
-llama-index-llms-openai = "^0.3.25"
-llama-index-agent-openai = "^0.4.6"
-llama-index-question-gen-openai = "^0.3.0"
-supabase = "^2.10.0"
-python-multipart = "^0.0.9"
+[dependency-groups]
+dev = [
+  "pylint==2.17.5",
+  "pytest==7.4.0",
+  "pytest-asyncio==0.23.8",
+  "httpx==0.27.2",
+  "sseclient-py==1.7.2",
+  "llama-index-callbacks-arize-phoenix==0.4.0; platform_system != 'Windows'",
+  "arize-phoenix==8.12.1; platform_system != 'Windows'",
+]
 
-[tool.poetry.group.dev.dependencies]
-pylint = "^2.17.4"
-pytest = "^7.3.2"
-pytest-asyncio = "^0.23.0"
-httpx = "^0.27.0"
-sseclient-py = "^1.7.2"
-llama-index-callbacks-arize-phoenix = "^0.4.0"
-arize-phoenix = "^8.12.1"
-
-[tool.poetry.scripts]
+[project.scripts]
 start = "app.main:start"
 
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"

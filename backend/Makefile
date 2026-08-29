@@ -2,7 +2,7 @@ run:
 	echo "Running in local mode."
 	docker compose create db localstack phoenix
 	docker compose start db localstack phoenix
-	poetry run start
+	uv run start
 
 run_docker:
 	echo "Running in local mode with docker."
@@ -12,9 +12,9 @@ migrate:
 	echo "Running migrations."
 	docker compose create db
 	docker compose start db
-	poetry run python -m alembic upgrade head
+	uv run python -m alembic upgrade head
 	# workaround for having PGVector create its tables
-	poetry run python -m scripts.build_vector_tables
+	uv run python -m scripts.build_vector_tables
 
 refresh_db:
 	# First ask for confirmation.
@@ -29,10 +29,10 @@ confirmed_refresh_db:
 	make migrate
 
 test:
-	poetry run python -m pytest tests/
+	uv run python -m pytest tests/
 
 chat:
-	poetry run python -m scripts.chat_llama
+	uv run python -m scripts.chat_llama
 
 setup_localstack:
 	docker compose create localstack
@@ -59,7 +59,7 @@ setup_localstack:
 seed_db_based_on_env:
 	# Call either seed_db or seed_db_preview, seed_db_local based on the environment
 	# This is used by the CI/CD pipeline
-	ENVIRONMENT=$$(poetry run python -c "from app.core.config import settings;print(settings.ENVIRONMENT.value)"); \
+	ENVIRONMENT=$$(uv run python -c "from app.core.config import settings;print(settings.ENVIRONMENT.value)"); \
 	echo "Environment: $$ENVIRONMENT"; \
 	if [ "$$ENVIRONMENT" = "preview" ]; then \
 		make seed_db_preview; \
@@ -71,16 +71,16 @@ seed_db_based_on_env:
 
 seed_db:
 	echo "Seeding database."
-	poetry run python scripts/seed_db.py
+	uv run python scripts/seed_db.py
 
 seed_db_preview:
 	echo "Seeding database for Preview."
 	# only need to populate with two companies for Preview
-	poetry run python scripts/seed_db.py  --ciks '["0001018724", "1326801"]'
+	uv run python scripts/seed_db.py  --ciks '["0001018724", "1326801"]'
 
 seed_db_local:
 	echo "Seeding database for local."
 	docker compose create db
 	docker compose start db
 	make setup_localstack
-	python scripts/seed_db.py --ciks '["0001018724", "1326801"]'  --filing_types '["10-K"]'
+	uv run python scripts/seed_db.py --ciks '["0001018724", "1326801"]'  --filing_types '["10-K"]'

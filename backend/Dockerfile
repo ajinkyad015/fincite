@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=True
 ENV APP_HOME=/app
 WORKDIR $APP_HOME
 
-RUN pip install poetry
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 COPY . ./
 
@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
-RUN poetry install --without dev
+RUN uv sync --frozen --no-dev
 
 # Environment variables — pass at runtime via -e or docker-compose
 ARG DATABASE_URL
@@ -35,4 +35,4 @@ ENV SUPABASE_SERVICE_ROLE_KEY=$SUPABASE_SERVICE_ROLE_KEY
 ARG SUPABASE_STORAGE_BUCKET
 ENV SUPABASE_STORAGE_BUCKET=$SUPABASE_STORAGE_BUCKET
 
-CMD ["poetry", "run", "start"]
+CMD ["uv", "run", "start"]
