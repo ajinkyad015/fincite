@@ -20,12 +20,14 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_ROLE_KEY: str = ""
     SUPABASE_STORAGE_BUCKET: str = "annual-reports"
 
-    # OpenAI
-    OPENAI_API_KEY: str
-    OPENAI_CHAT_LLM_NAME: str = "gpt-4o-mini"
+    # Google / Gemini AI
+    GOOGLE_API_KEY: str
+    GEMINI_CHAT_LLM_NAME: str = "models/gemini-1.5-flash"
+    GEMINI_EMBEDDING_MODEL_NAME: str = "models/gemini-embedding-001"
 
     # Vector store
     VECTOR_STORE_TABLE_NAME: str = "pg_vector_store"
+    VECTOR_STORE_EMBED_DIM: int = 3072
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -68,10 +70,10 @@ class Settings(BaseSettings):
         return v
 
     model_config = SettingsConfigDict(
-        env_prefix="",
+        env_prefix="", 
         env_file=".env",
         env_file_encoding="utf-8",
     )
 
 settings = Settings()
-os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY
+os.environ["GOOGLE_API_KEY"] = settings.GOOGLE_API_KEY

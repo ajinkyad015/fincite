@@ -1,3 +1,4 @@
+import asyncio
 from typing import List, Tuple, Optional
 from uuid import UUID, uuid4
 from datetime import datetime
@@ -5,6 +6,7 @@ from llama_index.core.chat_engine.types import ChatMessage
 from app.schema import Message
 from app.models.db import MessageStatusEnum, MessageRoleEnum
 from app.chat.engine import get_chat_history
+from app.chat import pg_vector
 
 
 class MockMessage(Message):
@@ -37,6 +39,26 @@ def chat_tuples_to_chat_messages(
                 )
             )
     return chat_messages
+
+
+def test_get_vector_store_singleton_uses_3072_embedding_dimension(monkeypatch):
+    calls = {}
+
+    def fake_from_params(cls, *args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        pg_vector.CustomPGVectorStore,
+        "from_params",
+        classmethod(fake_from_params),
+    )
+
+    result = asyncio.run(pg_vector.get_vector_store_singleton())
+
+    assert result is not None
+    assert calls["kwargs"]["embed_dim"] == 3072
 
 
 class TestGetChatHistory:

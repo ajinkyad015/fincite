@@ -2,7 +2,7 @@
 Application entry point.
 
 Startup sequence:
-    1. Configure LlamaIndex settings (OpenAI LLM + embeddings)
+    1. Configure LlamaIndex settings (Gemini LLM + embeddings)
     2. Configure logging
     3. Configure Sentry (optional)
     4. Wait for database connection
@@ -68,7 +68,7 @@ def _setup_sentry() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Configure LlamaIndex (LLM + embeddings) — must happen before any index ops
+    # 1. Configure LlamaIndex (Gemini LLM + embeddings) — must happen before any index ops
     _setup_llama_index_settings()
 
     # 2. Wait for the database to become available

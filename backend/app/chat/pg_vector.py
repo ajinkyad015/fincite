@@ -66,5 +66,6 @@ async def get_vector_store_singleton() -> VectorStore:
         url.username,
         url.password,
         settings.VECTOR_STORE_TABLE_NAME,
+        embed_dim=settings.VECTOR_STORE_EMBED_DIM,
     )
     return singleton_instance

@@ -1,7 +1,7 @@
 """
 Chat engine construction.
 
-Builds an OpenAI agent with per-document RAG query engines.
+Builds a ReActAgent with per-document RAG query engines powered by Google Gemini.
 Documents are retrieved from Supabase Storage and indexed into pgvector.
 
 Flow:
@@ -19,7 +19,7 @@ Flow:
           ↓
     SubQuestionQueryEngine
           ↓
-    OpenAIAgent (streaming)
+    ReActAgent (streaming, powered by Gemini)
 """
 from typing import Dict, List
 import logging
@@ -39,9 +39,10 @@ from llama_index.core.chat_engine.types import ChatMessage
 from llama_index.core.callbacks.base import BaseCallbackHandler, CallbackManager
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core.query_engine import SubQuestionQueryEngine
-from llama_index.agent.openai import OpenAIAgent
-from llama_index.llms.openai import OpenAI
+from llama_index.core.agent import ReActAgent
+from llama_index.llms.gemini import Gemini
 from llama_index.core.base.llms.types import MessageRole
+
 from llama_index.readers.file.docs.base import PDFReader
 
 from app.core.config import settings
@@ -180,16 +181,16 @@ def get_chat_history(
 async def get_chat_engine(
     callback_handler: BaseCallbackHandler,
     conversation: ConversationSchema,
-) -> OpenAIAgent:
+) -> ReActAgent:
     """
-    Build an OpenAIAgent for a conversation.
+    Build a ReActAgent (powered by Gemini) for a conversation.
 
     Architecture:
         One QueryEngineTool per selected document (filtered to that doc's vectors)
           ↓
         SubQuestionQueryEngine (decomposes multi-doc questions)
           ↓
-        OpenAIAgent (streaming, with system prompt)
+        ReActAgent (streaming, with system prompt)
     """
     callback_manager = CallbackManager([callback_handler])
     doc_id_to_index = await build_doc_id_to_index_map(
@@ -236,11 +237,9 @@ async def get_chat_engine(
         ),
     ]
 
-    chat_llm = OpenAI(
-        temperature=0,
-        model=settings.OPENAI_CHAT_LLM_NAME,
-        streaming=True,
-        api_key=settings.OPENAI_API_KEY,
+    chat_llm = Gemini(
+        model=settings.GEMINI_CHAT_LLM_NAME,
+        api_key=settings.GOOGLE_API_KEY,
     )
     chat_history = get_chat_history(conversation.messages)
     logger.debug("Chat history: %s", chat_history)
@@ -253,14 +252,14 @@ async def get_chat_engine(
         doc_titles = "No documents selected."
 
     curr_date = datetime.utcnow().strftime("%Y-%m-%d")
-    chat_engine = OpenAIAgent.from_tools(
+    chat_engine = ReActAgent.from_tools(
         tools=top_level_tools,
         llm=chat_llm,
         chat_history=chat_history,
         verbose=settings.LOG_LEVEL == "DEBUG",
-        system_prompt=SYSTEM_MESSAGE.format(doc_titles=doc_titles, curr_date=curr_date),
+        context=SYSTEM_MESSAGE.format(doc_titles=doc_titles, curr_date=curr_date),
         callback_manager=callback_manager,
-        max_function_calls=3,
+        max_iterations=6,
     )
 
     return chat_engine

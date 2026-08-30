@@ -13,9 +13,9 @@ Users upload PDFs (annual reports, NSE filings, investor presentations), then as
 | ORM | SQLAlchemy 2.0 async (asyncpg) |
 | Migrations | Alembic |
 | Vector store | pgvector via llama-index-vector-stores-postgres |
-| LLM | OpenAI (gpt-4o-mini default) |
-| Embeddings | OpenAI text-embedding-3-small |
-| RAG | LlamaIndex Core 0.12 — SubQuestionQueryEngine + OpenAIAgent |
+| LLM | Google Gemini (gemini-1.5-flash default) via llama-index-llms-gemini |
+| Embeddings | Google Gemini gemini-embedding-001 via llama-index-embeddings-gemini |
+| RAG | LlamaIndex Core 0.12 — SubQuestionQueryEngine + ReActAgent |
 | PDF storage | Supabase Storage |
 | Package manager | uv |
 
@@ -25,7 +25,7 @@ backend/
   app/
     main.py               # FastAPI app, lifespan startup
     schema.py             # Pydantic v2 request/response schemas
-    llama_index_settings.py  # LLM + embedding global config
+    llama_index_settings.py  # LLM + embedding global config (Gemini)
     api/
       api.py              # Router aggregation
       crud.py             # DB query helpers (async SQLAlchemy)
@@ -35,7 +35,7 @@ backend/
         documents.py      # POST /api/document/upload, GET /api/document/
         conversation.py   # POST/GET/DELETE /api/conversation/
     chat/
-      engine.py           # Build OpenAIAgent per conversation
+      engine.py           # Build ReActAgent (Gemini) per conversation
       messaging.py        # SSE streaming + callback handler
       pg_vector.py        # CustomPGVectorStore singleton
       qa_response_synth.py  # Custom LlamaIndex response synthesizer
@@ -100,19 +100,21 @@ Enums: `MessageRoleEnum` (user/assistant), `MessageStatusEnum` (PENDING/SUCCESS/
 ## Required Environment Variables
 ```
 DATABASE_URL               # PostgreSQL connection string
-OPENAI_API_KEY             # OpenAI API key
+GOOGLE_API_KEY             # Google AI Studio API key (https://aistudio.google.com/apikey)
 SUPABASE_URL               # Supabase project URL
 SUPABASE_SERVICE_ROLE_KEY  # Supabase service role key
 ```
 
 Optional:
 ```
-OPENAI_CHAT_LLM_NAME       # default: gpt-4o-mini
-SUPABASE_STORAGE_BUCKET    # default: annual-reports
-VECTOR_STORE_TABLE_NAME    # default: pg_vector_store
-LOG_LEVEL                  # default: INFO
-BACKEND_CORS_ORIGINS       # JSON array of allowed origins
-SENTRY_DSN                 # Sentry DSN (optional)
+GEMINI_CHAT_LLM_NAME         # default: models/gemini-1.5-flash
+GEMINI_EMBEDDING_MODEL_NAME  # default: models/text-embedding-004
+SUPABASE_STORAGE_BUCKET      # default: annual-reports
+VECTOR_STORE_TABLE_NAME      # default: pg_vector_store
+VECTOR_STORE_EMBED_DIM       # default: 3072
+LOG_LEVEL                    # default: INFO
+BACKEND_CORS_ORIGINS         # JSON array of allowed origins
+SENTRY_DSN                   # Sentry DSN (optional)
 ```
 
 ## Developer Commands
@@ -137,7 +139,7 @@ uv run alembic revision --autogenerate -m "description"
 ```
 
 ## Startup Sequence (lifespan)
-1. `_setup_llama_index_settings()` — configure OpenAI LLM + embeddings globally
+1. `_setup_llama_index_settings()` — configure Gemini LLM + embeddings globally
 2. `check_database_connection()` — wait for Postgres
 3. Alembic head check — raise if migrations are not current
 4. `get_vector_store_singleton()` + `run_setup()` — ensure pgvector extension + table exist
@@ -147,7 +149,7 @@ uv run alembic revision --autogenerate -m "description"
 ```
 Upload:  PDF bytes -> Supabase Storage -> LlamaIndex PDFReader -> VectorStoreIndex -> pgvector
 Query:   User message
-           -> OpenAIAgent
+           -> ReActAgent (Gemini)
            -> SubQuestionQueryEngine (one sub-Q per doc)
            -> per-doc QueryEngineTool (MetadataFilter by DB_DOC_ID_KEY)
            -> pgvector similarity search
@@ -160,3 +162,4 @@ Query:   User message
 - `DB_DOC_ID_KEY = "db_document_id"` is injected into every LlamaIndex node metadata at ingest time and used as the vector store filter key.
 - `nest_asyncio.apply()` is called once in `engine.py` to allow nested event loops (LlamaIndex requirement).
 - The `/conversation/{id}/test_message` endpoint is the Swagger-friendly alternative to the SSE `/message` endpoint.
+- **No OpenAI dependency** — the project exclusively uses Google Gemini for LLM inference and embeddings.

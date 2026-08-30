@@ -101,7 +101,7 @@ async def ingest_document(
     # 3. Build storage context backed by pgvector
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    # 4. Index — this calls OpenAI embeddings and writes to pgvector
+    # 4. Index — this calls Gemini embeddings and writes to pgvector
     logger.info("Document indexing started for document %s", document_id)
     km = {"callback_manager": callback_manager} if callback_manager else {}
     index = VectorStoreIndex.from_documents(
