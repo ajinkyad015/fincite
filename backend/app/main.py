@@ -138,5 +138,5 @@ def start() -> None:
         host="0.0.0.0",
         port=8000,
         reload=settings.LOG_LEVEL == "DEBUG",
-        workers=1,
+        workers=4,
     )

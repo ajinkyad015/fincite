@@ -19,20 +19,7 @@ RUN apt-get update && apt-get install -y \
 
 RUN uv sync --frozen --no-dev
 
-# Environment variables — pass at runtime via -e or docker-compose
-ARG DATABASE_URL
-ENV DATABASE_URL=$DATABASE_URL
-
-ARG OPENAI_API_KEY
-ENV OPENAI_API_KEY=$OPENAI_API_KEY
-
-ARG SUPABASE_URL
-ENV SUPABASE_URL=$SUPABASE_URL
-
-ARG SUPABASE_SERVICE_ROLE_KEY
-ENV SUPABASE_SERVICE_ROLE_KEY=$SUPABASE_SERVICE_ROLE_KEY
-
-ARG SUPABASE_STORAGE_BUCKET
-ENV SUPABASE_STORAGE_BUCKET=$SUPABASE_STORAGE_BUCKET
+# Pre-download NLTK tokenizer data
+RUN uv run python -m nltk.downloader punkt punkt_tab
 
 CMD ["uv", "run", "start"]
