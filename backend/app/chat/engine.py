@@ -214,8 +214,17 @@ async def get_chat_engine(
 
     response_synth = get_custom_response_synth(callback_manager, conversation.documents)
 
+    from llama_index.core.question_gen import LLMQuestionGenerator
+    
+    chat_llm = Gemini(
+        model=settings.GEMINI_CHAT_LLM_NAME,
+        api_key=settings.GOOGLE_API_KEY,
+    )
+    question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)
+
     document_question_engine = SubQuestionQueryEngine.from_defaults(
         query_engine_tools=vector_query_engine_tools,
+        question_gen=question_gen,
         response_synthesizer=response_synth,
         verbose=settings.LOG_LEVEL == "DEBUG",
         use_async=True,
@@ -237,10 +246,6 @@ async def get_chat_engine(
         ),
     ]
 
-    chat_llm = Gemini(
-        model=settings.GEMINI_CHAT_LLM_NAME,
-        api_key=settings.GOOGLE_API_KEY,
-    )
     chat_history = get_chat_history(conversation.messages)
     logger.debug("Chat history: %s", chat_history)
 

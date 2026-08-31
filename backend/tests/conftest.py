@@ -1,6 +1,6 @@
 """
 pytest configuration — sets required environment variables before any app
-module is imported, so unit tests don't need a real database or OpenAI key.
+module is imported, so unit tests don't need a real database or Google API key.
 """
 import os
 
