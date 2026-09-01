@@ -36,6 +36,17 @@ async def create_conversation(
     """
     Create a new conversation linked to one or more previously uploaded documents.
     """
+    if payload.document_ids:
+        doc_ids_str = [str(doc_id) for doc_id in payload.document_ids]
+        found_docs = await crud.fetch_documents(db, ids=doc_ids_str)
+        found_doc_ids = {str(doc.id) for doc in found_docs}
+        missing_ids = [doc_id for doc_id in doc_ids_str if doc_id not in found_doc_ids]
+        if missing_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Documents not found: {', '.join(missing_ids)}"
+            )
+
     return await crud.create_conversation(db, payload)
 
 
