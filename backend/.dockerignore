@@ -1,0 +1,18 @@
+# Git and local env (secrets must not be baked into the image)
+.git
+.env
+.env.*
+!.env.example
+
+# Python artefacts
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Not needed inside the image
+tests/
+docker-compose.yml
+CONTEXT.md

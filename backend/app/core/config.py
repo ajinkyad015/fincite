@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
 
+    # Server
+    # Uvicorn worker processes (ignored by uvicorn when reload is enabled)
+    BACKEND_WORKERS: int = 4
+
     # CORS — JSON-formatted list of origins
     # e.g: '["http://localhost", "http://localhost:3000"]'
     BACKEND_CORS_ORIGINS: List[AnyHttpUrl | Literal["*"]] = []

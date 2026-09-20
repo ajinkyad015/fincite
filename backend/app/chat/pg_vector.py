@@ -53,6 +53,15 @@ class CustomPGVectorStore(PGVectorStore):
                 await conn.run_sync(self._base.metadata.create_all)
         did_run_setup = True
 
+    async def ensure_initialized(self) -> None:
+        """Create this process's engines without running any DDL.
+
+        The extension/tables are ensured once per deploy via run_setup()
+        (see app.main._bootstrap); each process only needs connection pools
+        (the base class also calls _initialize lazily on first add/query).
+        """
+        self._initialize()
+
 
 async def get_vector_store_singleton() -> VectorStore:
     global singleton_instance

@@ -7,19 +7,22 @@ WORKDIR $APP_HOME
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
+# No gcc / build-essential / libpq-dev needed: psycopg2-binary and
+# psycopg[binary] ship manylinux wheels, so nothing compiles at build time.
+
+# Install dependencies in their own layer so code changes don't bust the cache.
+# --no-install-project: only the locked dependencies; the project itself needs
+# the source, which is copied below.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Pre-download NLTK tokenizer data (rides the cached dependency layer)
+RUN .venv/bin/python -m nltk.downloader punkt punkt_tab
+
+# Add the source and install the project itself
 COPY . ./
-
-# libpq-dev and gcc are needed for psycopg2 compilation
-RUN apt-get update && apt-get install -y \
-    libpq-dev \
-    gcc \
-    build-essential \
-    --no-install-recommends \
- && rm -rf /var/lib/apt/lists/*
-
 RUN uv sync --frozen --no-dev
 
-# Pre-download NLTK tokenizer data
-RUN uv run python -m nltk.downloader punkt punkt_tab
-
-CMD ["uv", "run", "start"]
+# Run the venv entrypoint directly: `uv run start` would re-sync the
+# environment (dev group included by default) on every container start.
+CMD ["/app/.venv/bin/start"]

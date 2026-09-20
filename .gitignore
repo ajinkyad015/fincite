@@ -36,6 +36,11 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+.agents
+.adoc
+/adoc
+skills-lock.json
+/agent_implement.md
 # Unit test / coverage reports
 htmlcov/
 .tox/
@@ -143,7 +148,7 @@ rabbitmq-data/
 
 # ActiveMQ
 activemq-data/
-
+adoc/
 # SageMath parsed files
 *.sage.py
 

@@ -1,17 +1,27 @@
 """
 Application entry point.
 
-Startup sequence:
-    1. Configure LlamaIndex settings (Gemini LLM + embeddings)
-    2. Configure logging
-    3. Configure Sentry (optional)
-    4. Wait for database connection
-    5. Verify migrations are up to date
-    6. Initialise pgvector store
-    7. Initialise NLTK sentence tokenizer
-    8. Start FastAPI
+start() (once per deploy, in the process that launches uvicorn):
+    1. Configure logging
+    2. Configure Sentry (optional)
+    3. _bootstrap(): wait for database connection, verify Alembic migrations,
+       initialise pgvector store (CREATE EXTENSION + tables), pre-download
+       NLTK sentence tokenizer data, release the parent's DB connections
+    4. Start uvicorn (BACKEND_WORKERS workers, default 4; reload when
+       LOG_LEVEL=DEBUG, in which case workers are ignored by uvicorn)
+
+lifespan (per worker process):
+    1. _bootstrap() only if start() did not already run it (e.g. when the app
+       is launched via `uvicorn app.main:app` directly)
+    2. Configure LlamaIndex settings (Gemini LLM + embeddings) — per process;
+       the blocking Gemini model-metadata lookup runs in a worker thread
+    3. Initialise pgvector store engines for this process (no DDL — tables
+       were already created in start())
+    4. Start FastAPI
 """
 from typing import cast
+import asyncio
+import os
 import uvicorn
 import logging
 import sys
@@ -33,6 +43,8 @@ from app.chat.pg_vector import get_vector_store_singleton, CustomPGVectorStore
 from app.llama_index_settings import _setup_llama_index_settings
 
 logger = logging.getLogger(__name__)
+
+_BOOTSTRAP_DONE_ENV_VAR = "FINCITE_BOOTSTRAP_DONE"
 
 
 def check_current_head(alembic_cfg: Config, connectable: Engine) -> bool:
@@ -66,37 +78,59 @@ def _setup_sentry() -> None:
         logger.info("Sentry DSN not set — skipping Sentry initialisation")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # 1. Configure LlamaIndex (Gemini LLM + embeddings) — must happen before any index ops
-    _setup_llama_index_settings()
-
-    # 2. Wait for the database to become available
+async def _bootstrap(release_connections: bool = False) -> None:
+    """Deploy-time initialisation that only needs to run once per deploy,
+    not once per uvicorn worker. All steps are idempotent."""
+    # 1. Wait for the database to become available
     await check_database_connection()
 
-    # 3. Verify Alembic migrations are current
+    # 2. Verify Alembic migrations are current (sync psycopg2 engine)
     cfg = Config("alembic.ini")
     db_url = settings.DATABASE_URL.replace(
         "postgresql+asyncpg://", "postgresql+psycopg2://"
     )
     cfg.set_main_option("sqlalchemy.url", db_url)
     engine = create_engine(db_url, echo=False)
-    if not check_current_head(cfg, engine):
-        raise Exception(
-            "Database is not up to date. Please run `uv run alembic upgrade head`"
-        )
-    engine.dispose()
+    try:
+        if not check_current_head(cfg, engine):
+            raise Exception(
+                "Database is not up to date. Please run `uv run alembic upgrade head`"
+            )
+    finally:
+        engine.dispose()
 
-    # 4. Initialise pgvector store
-    vector_store = await get_vector_store_singleton()
-    vector_store = cast(CustomPGVectorStore, vector_store)
+    # 3. Initialise pgvector store: CREATE EXTENSION + ensure tables exist.
+    #    Idempotent DDL, so once per deploy is sufficient.
+    vector_store = cast(CustomPGVectorStore, await get_vector_store_singleton())
     await vector_store.run_setup()
 
-    # 5. Pre-download NLTK sentence tokenizer data
+    # 4. Pre-download NLTK sentence tokenizer data (cached on shared disk)
     try:
         split_by_sentence_tokenizer()
     except FileExistsError:
         logger.info("NLTK tokenizer files already present.")
+
+    if release_connections:
+        # The parent process does not serve requests: release its DB
+        # connections (each uvicorn worker creates its own engines).
+        await vector_store.close()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Deploy-time bootstrap: skip when start() already ran it (uvicorn workers
+    # inherit FINCITE_BOOTSTRAP_DONE from the parent's environment).
+    if os.environ.get(_BOOTSTRAP_DONE_ENV_VAR) != "1":
+        await _bootstrap()
+
+    # 1. Configure LlamaIndex (Gemini LLM + embeddings) — per process. The
+    #    Gemini constructor makes a blocking network call (model metadata
+    #    lookup), so keep it off the event loop.
+    await asyncio.to_thread(_setup_llama_index_settings)
+
+    # 2. Create this process's vector store engines (no DDL).
+    vector_store = cast(CustomPGVectorStore, await get_vector_store_singleton())
+    await vector_store.ensure_initialized()
 
     yield
 
@@ -133,10 +167,17 @@ def start() -> None:
     _setup_logging(settings.LOG_LEVEL)
     _setup_sentry()
     logger.info("Starting %s", settings.PROJECT_NAME)
+
+    # Run the deploy-time bootstrap once here instead of in every uvicorn
+    # worker (DB wait, migration check, pgvector setup, NLTK data). Workers
+    # inherit FINCITE_BOOTSTRAP_DONE and skip it in their lifespan.
+    asyncio.run(_bootstrap(release_connections=True))
+    os.environ[_BOOTSTRAP_DONE_ENV_VAR] = "1"
+
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=8000,
         reload=settings.LOG_LEVEL == "DEBUG",
-        workers=4,
+        workers=settings.BACKEND_WORKERS,
     )
