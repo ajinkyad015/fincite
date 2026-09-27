@@ -180,4 +180,10 @@ def start() -> None:
         port=8000,
         reload=settings.LOG_LEVEL == "DEBUG",
         workers=settings.BACKEND_WORKERS,
+        # Keep SSE connections alive for 75 s — long enough for multi-doc RAG
+        # queries (60–120 s) while staying within most cloud proxy defaults.
+        timeout_keep_alive=75,
+        # Give workers 30 s to finish in-flight requests on SIGTERM so SSE
+        # streams are not hard-killed during rolling deploys.
+        timeout_graceful_shutdown=30,
     )

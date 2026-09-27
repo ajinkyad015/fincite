@@ -116,7 +116,10 @@ async def test_pdf_ingestion_flow(mock_storage_context, mock_vector_index, mock_
     doc_schema = schema.Document(
         id=uuid4(),
         url="http://supabase/pdf",
-        metadata_map={}
+        metadata_map={},
+        filename="test.pdf",
+        status="ready",
+        progress=100,
     )
     
     vector_store = MagicMock()
@@ -157,8 +160,17 @@ async def test_upload_document_endpoint_success(
                 "document_type": "annual_report",
                 "financial_year": "2024",
                 "exchange": "NSE",
+                "original_filename": "tcs_report.pdf",
             }
-        }
+        },
+        filename="tcs_report.pdf",
+        status="ready",
+        progress=100,
+        company_name="TCS",
+        company_symbol="TCS",
+        document_type="annual_report",
+        financial_year="2024",
+        exchange="NSE",
     )
     mock_crud.fetch_document_by_content_hash = AsyncMock(return_value=None)
     mock_crud.create_document = AsyncMock(return_value=mock_db_doc)
@@ -182,10 +194,14 @@ async def test_upload_document_endpoint_success(
         db=db_session
     )
     
-    assert response.id == doc_id
-    assert response.status == "indexed"
-    assert response.url == mock_db_doc.url
-    
+    # New response shape: { document: FinDocumentSchema }
+    assert response.document is not None
+    assert str(response.document.id) == str(doc_id)
+    assert response.document.status == "ready"
+    assert response.document.filename == "tcs_report.pdf"
+    assert response.document.metadata.company_name == "TCS"
+    assert response.document.progress == 100
+
     mock_upload.assert_called_once()
     mock_crud.create_document.assert_called_once()
     mock_ingest.assert_called_once_with(mock_db_doc, mock_get_vector_store.return_value)

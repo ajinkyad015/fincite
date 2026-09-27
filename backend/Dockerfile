@@ -23,6 +23,9 @@ RUN .venv/bin/python -m nltk.downloader punkt punkt_tab
 COPY . ./
 RUN uv sync --frozen --no-dev
 
-# Run the venv entrypoint directly: `uv run start` would re-sync the
-# environment (dev group included by default) on every container start.
-CMD ["/app/.venv/bin/start"]
+# Entrypoint: runs `alembic upgrade head` then starts the server.
+# Using ENTRYPOINT + CMD so the command can still be overridden in compose.
+COPY scripts/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

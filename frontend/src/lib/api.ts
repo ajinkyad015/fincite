@@ -29,7 +29,7 @@ import type {
 import { ANSWER_BANK, FALLBACK_EXCERPT, SEED_DOCUMENTS, type CannedAnswer } from "./mockData";
 import { nowIso, uid } from "./format";
 
-export const USE_MOCK = true;
+export const USE_MOCK = false;
 export const BASE_URL: string =
   (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_URL ??
   "http://localhost:8000";
@@ -310,9 +310,8 @@ class MockTransport {
       .map((d, i) => {
         const f = FALLBACK_EXCERPT[d.id];
         return f
-          ? `${d.metadata.company_name} states in its ${d.metadata.fiscal_year} ${
-              d.metadata.document_type === "annual_report" ? "annual report" : "filing"
-            } that “${f.excerpt.split(". ")[0]}.” [${i + 1}]`
+          ? `${d.metadata.company_name} states in its ${d.metadata.fiscal_year} ${d.metadata.document_type === "annual_report" ? "annual report" : "filing"
+          } that “${f.excerpt.split(". ")[0]}.” [${i + 1}]`
           : "";
       })
       .filter(Boolean)
@@ -390,9 +389,17 @@ class RealTransport {
     const promise = new Promise<DocumentUploadResponse>((resolve, reject) => {
       xhr.open("POST", `${BASE_URL}/api/document/upload`);
       xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100));
-      xhr.onload = () => resolve(JSON.parse(xhr.responseText));
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(JSON.parse(xhr.responseText) as DocumentUploadResponse);
+        } else {
+          reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`));
+        }
+      };
       xhr.onerror = () => reject(new Error("Upload failed"));
-      xhr.send(Object.assign(new FormData(), { file }));
+      const fd = new FormData();
+      fd.append("file", file);
+      xhr.send(fd);
     });
     return { promise, cancel: () => xhr.abort() };
   }
@@ -400,7 +407,10 @@ class RealTransport {
     const res = await fetch(`${BASE_URL}/api/conversation/`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        title: body.title,
+        document_scope: body.document_scope ?? [],
+      }),
     });
     return res.json();
   }

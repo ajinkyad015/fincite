@@ -6,9 +6,9 @@ from app.core.config import settings
 engine = create_async_engine(
     settings.DATABASE_URL,
     pool_pre_ping=True,
-    pool_size=4,  # Number of connections to keep open in the pool
-    max_overflow=4,  # Number of connections that can be opened beyond the pool_size
-    pool_recycle=3600,  # Recycle connections after 1 hour
-    pool_timeout=120,  # Raise an exception after 2 minutes if no connection is available from the pool
+    pool_size=2,       # 2 connections per worker; ×4 workers = 8 steady-state connections
+    max_overflow=2,    # Allow up to 4 connections per worker under burst; 16 total
+    pool_recycle=3600, # Recycle connections after 1 hour to avoid stale sockets
+    pool_timeout=30,   # Fail fast (30 s) rather than hanging for 2 min → prevents 504
 )
 SessionLocal = async_sessionmaker(autocommit=False, autoflush=False, bind=engine)

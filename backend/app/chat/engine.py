@@ -22,6 +22,7 @@ Flow:
     ReActAgent (streaming, powered by Gemini)
 """
 from typing import Dict, List
+import asyncio
 import logging
 from datetime import datetime
 from tempfile import TemporaryDirectory
@@ -88,7 +89,7 @@ def fetch_and_read_document(
                 "Falling back to HTTP GET of document URL.",
                 document.id,
             )
-            with requests.get(document.url, stream=True) as r:
+            with requests.get(document.url, stream=True, timeout=60) as r:  # timeout prevents indefinite hang → 504
                 r.raise_for_status()
                 with open(temp_file_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
@@ -138,7 +139,9 @@ async def build_doc_id_to_index_map(
                 "Re-indexing from storage.",
                 doc_id,
             )
-            llama_docs = fetch_and_read_document(doc)
+            # fetch_and_read_document is synchronous (blocking disk + HTTP I/O).
+            # Running it directly would freeze the event loop → silent 504 at proxy.
+            llama_docs = await asyncio.to_thread(fetch_and_read_document, doc)
             index = VectorStoreIndex.from_documents(
                 llama_docs,
                 storage_context=storage_context,
@@ -219,6 +222,7 @@ async def get_chat_engine(
     chat_llm = Gemini(
         model=settings.GEMINI_CHAT_LLM_NAME,
         api_key=settings.GOOGLE_API_KEY,
+        timeout=120,  # Bound runaway Gemini calls; prevents silent 504s
     )
     question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)
 

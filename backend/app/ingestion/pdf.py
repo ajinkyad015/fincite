@@ -15,6 +15,7 @@ Flow:
           ↓
     Supabase PostgreSQL + pgvector
 """
+import asyncio
 import logging
 import tempfile
 import os
@@ -85,12 +86,12 @@ async def ingest_document(
     document_id = str(document.id)
     logger.info("Starting ingestion for document %s", document_id)
 
-    # 1. Download PDF bytes from Supabase Storage
-    pdf_bytes = download_document(document_id)
+    # 1. Download PDF bytes from Supabase Storage (sync SDK — offload to thread)
+    pdf_bytes = await asyncio.to_thread(download_document, document_id)
 
-    # 2. Parse PDF into LlamaIndex documents
+    # 2. Parse PDF into LlamaIndex documents (sync file I/O — offload to thread)
     logger.info("PDF parsing started for document %s", document_id)
-    llama_docs = load_pdf_from_bytes(pdf_bytes, document_id)
+    llama_docs = await asyncio.to_thread(load_pdf_from_bytes, pdf_bytes, document_id)
 
     if not llama_docs:
         raise ValueError(
@@ -101,15 +102,21 @@ async def ingest_document(
     # 3. Build storage context backed by pgvector
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
-    # 4. Index — this calls Gemini embeddings and writes to pgvector
+    # 4. Index — this calls Gemini embeddings and writes to pgvector.
+    #    VectorStoreIndex.from_documents has a synchronous code path; run in a
+    #    thread so embedding API calls don’t block the event loop.
     logger.info("Document indexing started for document %s", document_id)
     km = {"callback_manager": callback_manager} if callback_manager else {}
-    index = VectorStoreIndex.from_documents(
-        llama_docs,
-        storage_context=storage_context,
-        show_progress=True,
-        **km,
-    )
+
+    def _build_index() -> VectorStoreIndex:
+        return VectorStoreIndex.from_documents(
+            llama_docs,
+            storage_context=storage_context,
+            show_progress=True,
+            **km,
+        )
+
+    index = await asyncio.to_thread(_build_index)
     index.set_index_id(document_id)
     logger.info("Document indexing completed for document %s", document_id)
 

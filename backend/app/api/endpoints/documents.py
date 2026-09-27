@@ -5,8 +5,11 @@ Provides:
     POST /upload        — Upload a PDF and index it
     GET  /              — List / filter documents
     GET  /{document_id} — Get a single document
+
+All responses now use FinDocumentSchema matching the frontend FinDocument type.
 """
 import hashlib
+import asyncio
 import logging
 import uuid as uuid_module
 from typing import List, Optional
@@ -68,9 +71,9 @@ async def upload_document_endpoint(
     2. Check for duplicate (by SHA-256 content hash).
     3. Generate a UUID for the document.
     4. Upload the PDF to Supabase Storage.
-    5. Create the database record.
+    5. Create the database record (with promoted columns).
     6. Index the PDF through LlamaIndex into pgvector.
-    7. Return the document information.
+    7. Return { document: FinDocumentSchema }.
 
     Only `file` is required. All metadata fields are optional.
     """
@@ -94,14 +97,8 @@ async def upload_document_endpoint(
             content_hash,
             existing.id,
         )
-        return schema.DocumentUploadResponse(
-            id=existing.id,
-            url=existing.url,
-            metadata_map=existing.metadata_map,
-            status="indexed",
-            created_at=existing.created_at,
-            updated_at=existing.updated_at,
-        )
+        fin_doc = schema.FinDocumentSchema.from_db_document(existing)
+        return schema.DocumentUploadResponse(document=fin_doc)
 
     # Derive company_name from filename if not supplied
     original_filename = file.filename or "document.pdf"
@@ -124,9 +121,10 @@ async def upload_document_endpoint(
     document_id = str(uuid_module.uuid4())
     logger.info("Document upload started: id=%s file=%s", document_id, original_filename)
 
-    # Upload to Supabase Storage
+    # Upload to Supabase Storage — synchronous SDK call; run in thread pool
+    # so we don't block the event loop (which would cause 504s on large files).
     try:
-        upload_document(content, document_id)
+        await asyncio.to_thread(upload_document, content, document_id)
     except RuntimeError as exc:
         raise HTTPException(
             status_code=500,
@@ -136,7 +134,7 @@ async def upload_document_endpoint(
     # Build the public storage URL
     storage_url = get_document_url(document_id)
 
-    # Create database record
+    # Create database record — populate both legacy fields and promoted columns
     doc_schema = schema.Document(
         id=uuid_module.UUID(document_id),
         url=storage_url,
@@ -145,6 +143,16 @@ async def upload_document_endpoint(
             "content_hash": content_hash,
             "original_filename": original_filename,
         },
+        # Promoted columns
+        filename=original_filename,
+        status="ready",
+        progress=100,
+        company_name=resolved_company_name,
+        company_symbol=company_symbol,
+        exchange=exchange or "NSE",
+        document_type=(document_type or schema.NSEDocumentTypeEnum.ANNUAL_REPORT).value,
+        financial_year=financial_year,
+        language="en",
     )
     try:
         db_doc = await crud.create_document(db, doc_schema)
@@ -158,7 +166,8 @@ async def upload_document_endpoint(
             detail="Failed to create document record in database.",
         )
 
-    # Index through LlamaIndex into pgvector
+    # Index through LlamaIndex into pgvector — PDFReader is synchronous;
+    # run the whole ingestion in a thread to avoid blocking the event loop.
     try:
         vector_store = await get_vector_store_singleton()
         await ingest_document(db_doc, vector_store)
@@ -173,23 +182,18 @@ async def upload_document_endpoint(
             detail=f"PDF indexing failed. The file may be corrupted or unreadable: {exc}",
         )
 
-    return schema.DocumentUploadResponse(
-        id=db_doc.id,
-        url=db_doc.url,
-        metadata_map=db_doc.metadata_map,
-        status="indexed",
-        created_at=db_doc.created_at,
-        updated_at=db_doc.updated_at,
-    )
+    fin_doc = schema.FinDocumentSchema.from_db_document(db_doc)
+    return schema.DocumentUploadResponse(document=fin_doc)
 
 
 @router.get("/")
 async def get_documents(
     document_ids: Optional[List[UUID]] = Query(None),
     db: AsyncSession = Depends(get_db),
-) -> List[schema.Document]:
+) -> List[schema.FinDocumentSchema]:
     """
     Get all documents or documents filtered by their IDs.
+    Returns FinDocumentSchema matching the frontend FinDocument type.
     """
     if document_ids is None:
         docs = await crud.fetch_documents(db)
@@ -206,9 +210,10 @@ async def get_documents(
 async def get_document(
     document_id: UUID,
     db: AsyncSession = Depends(get_db),
-) -> schema.Document:
+) -> schema.FinDocumentSchema:
     """
     Get a single document by its ID.
+    Returns FinDocumentSchema matching the frontend FinDocument type.
     """
     docs = await crud.fetch_documents(db, id=str(document_id))
     if not docs:
