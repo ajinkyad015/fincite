@@ -86,10 +86,10 @@ export default function ChatView() {
       <div className="shrink-0 border-t border-line bg-gradient-to-b from-bone to-faint/60 px-4 pb-4 pt-3 md:px-6">
         <div className="mx-auto max-w-[780px]">
           <Composer />
-          <p className="mt-2 text-center font-mono text-[9px] text-moss/70">
+          {/* <p className="mt-2 text-center font-mono text-[9px] text-moss/70">
             Prototype data · answers are grounded mock generation · streams from GET
             /api/conversation/{"{id}"}/message
-          </p>
+          </p> */}
         </div>
       </div>
     </div>
@@ -130,7 +130,7 @@ function Hero({
         <h2 className="mt-5 font-display text-[42px] font-medium leading-[1.04] tracking-[-0.015em] text-ink sm:text-[58px] md:text-[64px]">
           Interrogate the filings.
           <br />
-          <span className="italic text-accent">Every claim, pinned to a page.</span>
+          <span className="italic text-accent">Your Docs are heard.</span>
         </h2>
 
         <p className="tnum mt-6 max-w-xl font-mono text-[11px] leading-relaxed text-moss">
@@ -293,10 +293,10 @@ function ScopePicker() {
                   );
                 })}
               </div>
-              <div className="border-t border-line bg-faint/60 px-3.5 py-2 font-mono text-[9px] leading-relaxed text-moss">
+              {/* <div className="border-t border-line bg-faint/60 px-3.5 py-2 font-mono text-[9px] leading-relaxed text-moss">
                 Unchecked mixture = whole corpus. Selecting filings narrows retrieval for this
                 thread only.
-              </div>
+              </div> */}
             </motion.div>
           </>
         )}
