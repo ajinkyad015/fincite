@@ -5,6 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
+../frontend/temp/
 
 # Distribution / packaging
 .Python
@@ -31,7 +32,8 @@ frontend/temp/
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
-
+frontend/temp/
+frontend/node_modules/
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt

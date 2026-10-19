@@ -79,9 +79,9 @@ export default function LibraryView() {
       {/* header */}
       <header className="flex h-14 shrink-0 items-center gap-3 border-b border-line bg-bone/85 px-4 backdrop-blur-sm md:px-6">
         <h1 className="font-display text-[17px] font-semibold text-ink">Filing library</h1>
-        <span className="tnum hidden font-mono text-[9.5px] text-moss sm:inline">
+        {/* <span className="tnum hidden font-mono text-[9.5px] text-moss sm:inline">
           GET /api/document/
-        </span>
+        </span> */}
         <button
           type="button"
           onClick={() => setUploadOpen(true)}

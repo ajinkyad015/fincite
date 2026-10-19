@@ -42,15 +42,15 @@ export default function Sidebar() {
           </span>
           <div className="leading-none">
             <div className="font-display text-[21px] font-semibold tracking-tight text-bone">
-              Fincite
+              Fin-Cite
             </div>
             <div className="mt-1 font-mono text-[9px] uppercase tracking-[0.22em] text-bone/40">
               Ask the filings
             </div>
           </div>
-          <span className="ml-auto border border-line-dark px-1.5 py-0.5 font-mono text-[9px] text-bone/45">
+          {/* <span className="ml-auto border border-line-dark px-1.5 py-0.5 font-mono text-[9px] text-bone/45">
             v0.1.0
-          </span>
+          </span> */}
         </div>
       </div>
 
@@ -67,7 +67,7 @@ export default function Sidebar() {
           active={view === "chat"}
           onClick={() => nav("chat")}
           icon={<MessagesSquare size={14} />}
-          label="Research chats"
+          label="chats"
           meta={`${conversations.length}`}
         />
       </nav>
@@ -188,17 +188,17 @@ export default function Sidebar() {
                     : "bg-amber-400"
             }`}
           />
-          <span className="font-mono text-[10px] uppercase tracking-[0.16em] text-bone/50">
+          {/* <span className="font-mono text-[10px] uppercase tracking-[0.16em] text-bone/50">
             <Activity size={10} className="mr-1 inline -translate-y-px" />
             fincite API
-          </span>
-          <span className="ml-auto tnum font-mono text-[10px] text-bone/60">
+          </span> */}
+          {/* <span className="ml-auto tnum font-mono text-[10px] text-bone/60">
             {health ? (health.status === "down" ? "unreachable" : `${health.latency}ms`) : "…"}
-          </span>
+          </span> */}
         </div>
-        <div className="mt-2 truncate font-mono text-[9.5px] text-bone/30">
+        {/* <div className="mt-2 truncate font-mono text-[9.5px] text-bone/30">
           POST /api/conversation · GET /api/document
-        </div>
+        </div> */}
       </div>
     </div>
   );
