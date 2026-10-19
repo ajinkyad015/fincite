@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Menu } from "lucide-react";
+import { Analytics } from "@vercel/analytics/react";
 import { StoreProvider, useStore } from "./store";
 import Ticker from "./components/Ticker";
 import Sidebar from "./components/Sidebar";
@@ -173,6 +174,7 @@ export default function App() {
   return (
     <StoreProvider>
       <Shell />
+      <Analytics />
     </StoreProvider>
   );
 }
