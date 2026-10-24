@@ -29,7 +29,7 @@ import type {
 import { ANSWER_BANK, FALLBACK_EXCERPT, SEED_DOCUMENTS, type CannedAnswer } from "./mockData";
 import { nowIso, uid } from "./format";
 
-export const USE_MOCK = true;
+export const USE_MOCK = false;
 export const BASE_URL: string =
   (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_URL ??
   "http://localhost:8000";

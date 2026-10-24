@@ -1,0 +1,3230 @@
+diff --git a/AGENTS.md b/AGENTS.md
+new file mode 100644
+index 0000000..3af8c85
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,915 @@
++# AGENTS.md — fincitee
++
++> **Read this first, every session.** It is the map of this repository: what it is, how the
++> pieces connect, what is verified working, and what is broken. Everything below was checked
++> against the code at commit `3b43329` (branch `arena/81e80233-fincitee`) on 2026-10-24.
++> Where documentation (root `README.md`) disagrees with the code, **the code wins** — see §14.
++
++**Repo:** `shinosuke0103/fincitee` · **License:** MIT · **Size:** 83 tracked files, ~7,350 lines of
++application source (45 Python · 14 TSX · 6 TS · 1 CSS) plus committed lockfiles and a 493-line README.
++
++---
++
++## Extended Documentation
++
++For deep dives, read the relevant file in `docs/agents/` before working on that module.
++Do NOT read all of them — only what's relevant.
++
++| File | Read it when you are… |
++|---|---|
++| `docs/agents/ARCHITECTURE.md` | changing the RAG harness, process model, or cross-cutting wiring |
++| `docs/agents/DATA_MODELS.md` | touching SQLAlchemy models, Pydantic schemas, Alembic, or frontend types |
++| `docs/agents/API_REFERENCE.md` | adding/altering endpoints or the SSE contract |
++| `docs/agents/WORKFLOWS.md` | tracing upload, chat, streaming, or bootstrap end to end |
++| `docs/agents/DEVELOPMENT.md` | setting up, running, building, testing, or debugging locally |
++| `docs/agents/modules/backend-api.md` | endpoints, CRUD, DB session, settings |
++| `docs/agents/modules/rag-engine.md` | `app/chat/**` — agent, prompts, vector store |
++| `docs/agents/modules/ingestion-storage.md` | `app/ingestion/**`, `app/storage/**`, bootstrap/DDL |
++| `docs/agents/modules/streaming.md` | `messaging.py`, the SSE endpoint, frontend transport |
++| `docs/agents/modules/frontend.md` | `frontend/src/**` — store, components, design system, mock transport |
++
++---
++
++## 1. PROJECT OVERVIEW
++
++**fincite / "Fin-Cite"** — an AI research terminal for **Indian / NSE company filings**
++(annual reports, financial results, investor presentations, concall transcripts).
++
++Two deliverables in one repo, deployable independently:
++
++1. **`backend/`** — FastAPI + LlamaIndex RAG service. Upload a PDF → it is stored in Supabase
++   Storage, parsed page-by-page, chunked, embedded with Google Gemini, and written into
++   PostgreSQL/pgvector. Users then open a *conversation* scoped to 1..n documents and ask
++   questions; answers stream over **SSE** as complete `Message` snapshots, with page-level
++   citations and a persisted reasoning trace ("research trail").
++2. **`frontend/`** — React 19 SPA ("research terminal"): thread rail, chat view, filing
++   library with drag-and-drop upload, a live research-trail panel, clickable `[n]` citation
++   chips and a source drawer. **It currently runs against an in-memory mock transport, not the
++   backend** — see §14.B.
++
++**Lineage.** The backend is a fork of a LlamaIndex + FastAPI "chat with documents" template
++(originally SEC-focused) re-skinned for NSE filings. Fossils of the original: the default DB
++name `llama_app_db` in `backend/alembic.ini:75`, "Upserts a single SEC document" in
++`backend/scripts/upsert_document.py:9`, and the `CONSTRUCTED_QUERY_ENGINE` / `SUB_QUESTIONS`
++sub-process enum values.
++
++**Product invariants the prompts enforce** (`backend/app/chat/constants.py:3` `SYSTEM_MESSAGE`,
++`backend/app/chat/qa_response_synth.py`): always call tools before answering; preserve units
++exactly (₹ Crore / ₹ Lakh / USD Million); always name the financial year; cite page numbers;
++never fabricate figures.
++
++**What this project is NOT (yet):** no authentication, no multi-tenancy, no document
++deletion, no background job queue, no CI, no frontend tests.
++
++---
++
++## 2. TECH STACK (exact versions)
++
++### Backend — `backend/pyproject.toml` (resolved in `backend/uv.lock`, `requires-python = "==3.11.*"`)
++
++| Package | Version | Role |
++|---|---|---|
++| `fastapi` | 0.115.11 | HTTP + OpenAPI |
++| `pydantic` | 2.9.2 | API schemas (v2 API throughout) |
++| `pydantic-settings` | 2.8.1 | `Settings` from env / `.env` |
++| `uvicorn` | 0.22.0 | ASGI server (`workers=`, `reload=`) |
++| `sse-starlette` | 1.6.5 | `EventSourceResponse` |
++| `anyio` | 3.7.1 | in-memory object streams (`create_memory_object_stream`) |
++| `sqlalchemy[asyncio]` | 2.0.19 | ORM, async engine/session |
++| `asyncpg` | 0.29.0 | async PG driver |
++| `psycopg2-binary` | 2.9.10 | sync engine for the Alembic head check |
++| `psycopg[binary]` | 3.3.4 | (transitive / alternate PG driver) |
++| `alembic` | 1.11.2 | migrations |
++| `pgvector` | 0.3.6 | vector column type |
++| `llama-index-core` | 0.12.23 | agent, query engines, callbacks |
++| `llama-index-vector-stores-postgres` | 0.4.2 | `PGVectorStore` |
++| `llama-index-readers-file` | 0.4.6 | `PDFReader` |
++| `llama-index-llms-gemini` | 0.5.0 | `Gemini` LLM |
++| `llama-index-embeddings-gemini` | 0.3.2 | `GeminiEmbedding` |
++| `supabase` | 2.16.0 | Storage client |
++| `nltk` | 3.9.1 | sentence tokenizer data |
++| `nest-asyncio` | 1.6.0 | re-entrant loop patch (imported in `chat/engine.py:64`) |
++| `python-multipart` | 0.0.9 | multipart upload parsing |
++| `requests` | 2.32.3 | HTTP fallback download |
++| `sentry-sdk[fastapi]` | 1.29.2 | optional error tracking |
++| `pypdf` | 5.3.1 | PDF backend |
++| `greenlet` | 2.0.2 | SQLAlchemy async requirement |
++| `mako` | ≥1.4.1 | Alembic templates |
++
++**Dev group:** `pytest` 7.4.0, `pytest-asyncio` 0.23.8, `httpx` 0.27.2, `sseclient-py` 1.7.2,
++`pylint` 2.17.5. Build backend: `hatchling`; env manager: **uv** (lockfile committed).
++
++### Frontend — `frontend/package.json` (versions in parentheses = installed/resolved)
++
++| Package | Spec | Installed |
++|---|---|---|
++| `react`, `react-dom` | 19.2.6 | 19.2.6 |
++| `typescript` | 5.9.3 | 5.9.3 |
++| `vite` | 7.3.2 | 7.3.2 |
++| `@vitejs/plugin-react` | 5.1.1 | 5.1.1 |
++| `@tailwindcss/vite` + `tailwindcss` | 4.1.17 | 4.1.17 |
++| `vite-plugin-singlefile` | 2.3.0 | single-file `dist/index.html` build |
++| `framer-motion` | ^13.4.0 | 13.4.0 |
++| `lucide-react` | ^1.47.0 | 1.47.0 |
++| `react-markdown` | ^10.1.0 | 10.1.0 |
++| `remark-gfm` | ^4.0.1 | 4.0.1 |
++| `clsx` / `tailwind-merge` | 2.1.1 / 3.4.0 | `cn()` helper (**unused**, see §14) |
++| `@vercel/analytics` | ^2.0.1 | `<Analytics />` in `App.tsx` |
++| `@types/node` / `@types/react` / `@types/react-dom` | 22.19.17 / 19.2.7 / 19.2.3 | types |
++
++### Infrastructure
++
++- **PostgreSQL + pgvector** — Supabase in prod; `ankane/pgvector:v0.5.0` locally.
++- **Supabase Storage** — bucket from `SUPABASE_STORAGE_BUCKET` (default `annual-reports`),
++  object path `documents/{document_id}/original.pdf`.
++- **Google AI (Gemini)** — chat `models/gemini-1.5-flash`, embeddings
++  `models/gemini-embedding-001` (3072 dims).
++- **Docker** — `backend/Dockerfile` (`python:3.11.3-slim-bullseye` + `uv sync --frozen`),
++  `backend/docker-compose.yml` (backend + local pgvector).
++
++---
++
++## 3. ANNOTATED DIRECTORY STRUCTURE
++
++```
++fincitee/
++├── AGENTS.md                      # ← you are here (agent entry point)
++├── README.md                      # 493-line product/architecture doc (partly aspirational, §14)
++├── LICENSE                        # MIT © 2026 Ajinkya Datir
++├── .gitignore                     # ignores .env*, .venv, node_modules, dist, skills-lock.json
++│
++├── backend/
++│   ├── pyproject.toml             # deps, dev group, `start` console script
++│   ├── uv.lock                    # pinned lockfile (Python 3.11.*)
++│   ├── Dockerfile                 # uv-based image; pre-downloads NLTK punkt; CMD .venv/bin/start
++│   ├── docker-compose.yml         # backend + ankane/pgvector (see §14 for the broken port map)
++│   ├── .dockerignore              # excludes tests/, .env, CONTEXT.md
++│   ├── .env.example               # every env var, documented in sections
++│   ├── alembic.ini                # script_location=alembic; stale default url (overridden by env.py)
++│   ├── README.md                  # 3-line stub pointing at a non-existent CONTEXT.md
++│   │
++│   ├── app/
++│   │   ├── main.py                # FastAPI app, lifespan, _bootstrap(), `start()` entrypoint
++│   │   ├── schema.py              # ALL Pydantic API schemas (incl. NSE metadata, Citation)
++│   │   ├── llama_index_settings.py# global LlamaIndex Settings: Gemini LLM, embeddings, splitter
++│   │   ├── core/config.py         # pydantic-settings `Settings` + URL/CORS/LOG_LEVEL validators
++│   │   ├── db/
++│   │   │   ├── session.py         # async engine + async_sessionmaker (pool 4 / overflow 4)
++│   │   │   ├── base.py            # imports models for Alembic autogenerate
++│   │   │   └── wait_for_db.py     # 30× SELECT 1 retry loop
++│   │   ├── models/
++│   │   │   ├── base.py            # DeclarativeBase: uuid id + created_at/updated_at + auto __tablename__
++│   │   │   └── db.py              # Conversation, Message, MessageSubProcess, Document, ConversationDocument + PG enums
++│   │   ├── api/
++│   │   │   ├── api.py             # router registry (also mounts /docs, /redoc, /openapi.json under /api)
++│   │   │   ├── deps.py            # get_db() dependency
++│   │   │   ├── crud.py            # all data access (9 async functions)
++│   │   │   └── endpoints/
++│   │   │       ├── conversation.py# create/get/delete + SSE /message + /test_message
++│   │   │       ├── documents.py   # POST /upload (validate→dedupe→store→index), GET list/one
++│   │   │       └── health.py      # GET / → {"status": "alive"}
++│   │   ├── chat/
++│   │   │   ├── engine.py          # 3-tier harness: ReActAgent → SubQuestionEngine → per-doc tools
++│   │   │   ├── messaging.py       # ChatCallbackHandler → anyio channel; handle_chat_message()
++│   │   │   ├── pg_vector.py       # CustomPGVectorStore singleton sharing the app's async pool
++│   │   │   ├── qa_response_synth.py# custom QA + Refine prompts (units, FY, no fabrication)
++│   │   │   ├── constants.py       # DB_DOC_ID_KEY, SYSTEM_MESSAGE, chunk 512 / overlap 10
++│   │   │   └── utils.py           # build_title_for_document / build_description_for_document
++│   │   ├── ingestion/pdf.py       # PDF bytes → PDFReader → VectorStoreIndex → pgvector
++│   │   └── storage/supabase.py    # upload/download/delete/get_public_url + client singleton
++│   │
++│   ├── alembic/
++│   │   ├── env.py                 # async migrations; overrides url from settings.DATABASE_URL
++│   │   └── versions/              # 6 migrations, single head `663b3fea3024`
++│   │       ├── 477cee72edc4_init_tables.py
++│   │       ├── c008bb4f3f48_update_sub_process_columns.py
++│   │       ├── 90a1d6a26343_create_doc_tables.py
++│   │       ├── 1b0b616e08c6_replace_value_within_.py
++│   │       ├── 873c0c4616ea_add_foreign_key_indices.py
++│   │       └── 663b3fea3024_update_sub_process_columns.py   # HEAD
++│   │
++│   ├── scripts/                   # ⚠ all four import `fire`, which is NOT a dependency (§14)
++│   │   ├── chat_llama.py          # interactive CLI over the SSE API (uses sseclient-py)
++│   │   ├── build_vector_tables.py # run_setup() DDL by hand
++│   │   ├── dedupe_vector_store.py # SQL dedupe of data_pg_vector_store
++│   │   └── upsert_document.py     # insert a Document row by URL
++│   │
++│   └── tests/
++│       ├── conftest.py            # sets dummy DATABASE_URL / GOOGLE_API_KEY / SUPABASE_* before import
++│       ├── app/chat/test_engine.py# 8 tests: singleton embed_dim + get_chat_history matrix
++│       └── app/test_refactored.py # 7 tests: NSE metadata, storage, ingestion, upload, health
++│
++└── frontend/
++    ├── index.html                 # Google Fonts (Fraunces / Space Grotesk / IBM Plex Mono) + #root
++    ├── package.json               # scripts: dev, build, preview ONLY
++    ├── vite.config.ts             # react + tailwind + singlefile; alias `@` → src; NO dev proxy
++    ├── tsconfig.json              # strict, noUnusedLocals/Parameters, noEmit, jsx react-jsx
++    └── src/
++        ├── main.tsx               # createRoot + StrictMode
++        ├── App.tsx                # Shell: Ticker / Sidebar / view switch / drawers / splash / Analytics
++        ├── store.tsx              # the single React-context store (documents, threads, streaming, health, toasts)
++        ├── index.css              # Tailwind v4 @theme design tokens + grain, scrollbars, markdown tables
++        ├── lib/
++        │   ├── api.ts             # api facade + MockTransport (active) + RealTransport (incomplete)
++        │   ├── types.ts           # domain types (⚠ first 22 lines swallowed by an unterminated comment)
++        │   ├── mockData.ts        # 5 seeded filings, 4 canned Q&A banks, ticker data, suggestions
++        │   └── format.ts          # labels, dates, byte formatting, uid/nowIso helpers
++        ├── utils/cn.ts            # clsx + twMerge (dead code)
++        └── components/
++            ├── ChatView.tsx       # header, hero empty state, message list, scope picker, composer slot
++            ├── LibraryView.tsx    # table, search, drag-drop, UploadDrawer, DocDetailDrawer
++            ├── MessageItem.tsx    # user/assistant bubbles, research trail, sources grid, copy
++            ├── ResearchTrail.tsx  # collapsible sub-process timeline
++            ├── CiteMarkdown.tsx   # `[n]` → clickable citation chip + prose styles
++            ├── SourceDrawer.tsx   # right-hand passage viewer ("open in library")
++            ├── Composer.tsx       # auto-grow textarea, ⌘K focus, Enter/⇧↵, stop button
++            ├── Sidebar.tsx        # brand, nav, thread list with inline delete confirm, health dot
++            ├── Toasts.tsx         # bottom-right toast stack
++            ├── Ticker.tsx         # marquee market strip
++            └── Monogram.tsx       # coloured 2-letter company tile
++```
++
++---
++
++## 4. ARCHITECTURE & DESIGN PATTERNS
++
++### 4.1 Shape
++
++```
++Browser (React 19 SPA, mock transport today)
++   │  fetch / EventSource        (target: /api/**)
++   ▼
++FastAPI (uvicorn, N workers)  ──►  PostgreSQL  (relational: conversation/message/document)
++   │        │                  ──►  pgvector    (table data_pg_vector_store, 3072-d)
++   │        └──► Supabase Storage (documents/{id}/original.pdf)
++   └──► Google Gemini (chat + embeddings)
++```
++
++**One database for both relational state and vectors.** There is no separate vector DB, no
++cache, no queue. A single uvicorn process pool serves everything; heavyweight indexing happens
++**inside the upload request** (synchronously).
++
++### 4.2 The three-tier RAG harness (`backend/app/chat/engine.py:181` `get_chat_engine`)
++
++```
++Tier 1  ReActAgent (Gemini, max_iterations=6, SYSTEM_MESSAGE context)
++        │  exactly ONE tool: `document_question_engine`
++Tier 2  SubQuestionQueryEngine (LLMQuestionGenerator, use_async=True, custom response synth)
++        │  one QueryEngineTool per document, each ExactMatchFilter(db_document_id=…)
++Tier 3  VectorStoreIndex.as_query_engine(similarity_top_k=3, filters=…)
++        │
++        └── pgvector (single shared table, cosine)
++```
++
++### 4.3 Patterns inventory (and where they live)
++
++| Pattern | Implementation |
++|---|---|
++| **Repository / data-access module** | `app/api/crud.py` — the only place mixing SQLAlchemy; endpoints stay thin |
++| **Dependency injection** | `Depends(get_db)` (`app/api/deps.py:6`) yields one `AsyncSession` per request |
++| **Module-level singletons** | `pg_vector.singleton_instance` (`pg_vector.py:10,66`), `storage.supabase._supabase_client` (`supabase.py:20`) |
++| **Lazy initialisation** | Supabase client created on first use; vector store created on first `get_vector_store_singleton()` |
++| **Idempotent bootstrap + env handoff** | `app/main.py:47` `FINCITE_BOOTSTRAP_DONE`; parent runs `_bootstrap()` once, workers inherit the flag |
++| **Observer / callback bus** | LlamaIndex `BaseCallbackHandler` → `ChatCallbackHandler` (`chat/messaging.py:33`) → `anyio` memory channel |
++| **Producer/consumer streaming** | task runs `handle_chat_message`, coroutine `event_publisher` drains the channel (`endpoints/conversation.py:110-178`) |
++| **Full-state snapshots over deltas** | every SSE frame is a serialized `schema.Message` (content + sub_processes grow monotonically) |
++| **Compensating transaction** | upload rolls back Storage object **and** DB row when indexing fails (`documents.py:149-174`) |
++| **Transport facade / strategy** | `frontend/src/lib/api.ts` `USE_MOCK` switch between `MockTransport` and `RealTransport`, same method surface |
++| **Context store (no Redux/router)** | `frontend/src/store.tsx` — one `createContext`, ~30 fields, all mutations via `patchConversation` |
++| **Schema-first API** | Pydantic v2 models in `app/schema.py` used as `response_model` / annotations |
++| **Derived-state components** | `ResearchTrail` auto-collapses when all steps finish; ChatView sticks to bottom unless user scrolls up |
++
++### 4.4 Invariants — break these and the product silently degrades
++
++1. **Every vector node carries `db_document_id`** (`DB_DOC_ID_KEY`, `chat/constants.py:1`).
++   Without it, per-document filtering and citations both fail.
++2. **Node metadata must include `page_label`** — `Citation.from_node` does
++   `int(node.source_node.metadata["page_label"])` (`schema.py:49`). Missing key ⇒ KeyError.
++3. **`VECTOR_STORE_EMBED_DIM` must equal the embedding model's dimension (3072).** Vectors of a
++   different width cannot share the table.
++4. **pgvector table name** is `data_` + `VECTOR_STORE_TABLE_NAME` (LlamaIndex convention) ⇒
++   `data_pg_vector_store`.
++5. **Alembic must be at head before the app boots** or `_bootstrap()` raises
++   (`main.py:95-98`).
++6. **`alembic.ini` is resolved relative to CWD** ⇒ commands must run from `backend/`.
++
++---
++
++## 5. COMPONENT INTERCONNECTIONS (who calls whom)
++
++### 5.1 Backend call graph
++
++```
++app/main.py
++  ├─ core/config.py            settings = Settings()   (import-time; validates env)
++  ├─ api/api.py                api_router → endpoints/{conversation,documents,health}
++  ├─ db/wait_for_db.py         check_database_connection()      ← _bootstrap()
++  ├─ chat/pg_vector.py         get_vector_store_singleton()     ← _bootstrap(), lifespan, upload, engine
++  ├─ llama_index_settings.py   _setup_llama_index_settings()    ← lifespan (in asyncio.to_thread)
++  └─ alembic (Config("alembic.ini"), psycopg2 engine)           ← _bootstrap()
++
++endpoints/documents.py: upload_document_endpoint
++  ├─ api/crud.py                     fetch_document_by_content_hash, create_document, delete_document_by_id
++  ├─ storage/supabase.py             upload_document, get_document_url, delete_document
++  ├─ ingestion/pdf.py                ingest_document
++  │    ├─ storage/supabase.py          download_document
++  │    ├─ llama_index PDFReader        (page-level Documents + extra_info{db_document_id})
++  │    └─ llama_index VectorStoreIndex.from_documents → pgvector
++  └─ chat/pg_vector.py               get_vector_store_singleton
++
++endpoints/conversation.py: message_conversation (SSE)
++  ├─ api/crud.py                     fetch_conversation_with_messages, fetch_message_with_sub_processes
++  ├─ chat/messaging.py               handle_chat_message, StreamedMessage, StreamedMessageSubProcess
++  │    └─ chat/engine.py               get_chat_engine
++  │         ├─ chat/pg_vector.py         get_vector_store_singleton
++  │         ├─ chat/utils.py             build_title/description_for_document
++  │         ├─ chat/qa_response_synth.py get_custom_response_synth
++  │         ├─ storage/supabase.py       download_document  (only on re-index fallback)
++  │         ├─ chat/constants.py         DB_DOC_ID_KEY, SYSTEM_MESSAGE
++  │         └─ llama_index ReActAgent / SubQuestionQueryEngine / Gemini
++  └─ chat/messaging.py:ChatCallbackHandler → anyio send_chan → event_publisher → EventSourceResponse
++```
++
++### 5.2 Frontend call graph
++
++```
++main.tsx → App.tsx (StoreProvider)
++  ├─ Shell: boot() (store) + 25 s health poll (store.checkHealth → api.health)
++  ├─ Ticker            (lib/mockData TICKS)
++  ├─ Sidebar           (store: view, conversations, documents, health, deleteConversation)
++  ├─ ChatView          (store: active, documents, send, setView)
++  │   ├─ Hero          (lib/mockData SUGGESTIONS)
++  │   ├─ ScopePicker   (store.setScope)
++  │   ├─ MessageItem ──► CiteMarkdown (onCite → store.openSource)
++  │   │              └─ ResearchTrail (message.sub_processes)
++  │   └─ Composer      (store.send / stopStreaming)
++  ├─ LibraryView       (store: documents, uploadFiles, refreshDocuments, setLibraryOpenDocId)
++  │   ├─ DocRow → StatusPill
++  │   ├─ UploadDrawer  (store.uploadFiles)
++  │   └─ DocDetailDrawer (store.startScopedChat, uploadFiles)
++  ├─ SourceDrawer      (store.selectedSource → setLibraryOpenDocId + setView("library"))
++  └─ Toasts            (store.toasts)
++```
++
++`store.send()` is the hub: it creates a conversation if needed, then calls
++`api.streamMessage(id, q, handlers)` and patches the conversation from `onUserMessage` /
++`onAssistantCreated` / `onSubProcess` / `onToken` / `onDone` / `onError`.
++
++---
++
++## 6. KEY ENTRY POINTS & STARTUP SEQUENCE
++
++### 6.1 Backend — `app.main:start` (console script `start`, `pyproject.toml:45`)
++
++`start()` at `main.py:165`:
++
++1. `_setup_logging(settings.LOG_LEVEL)` — root logger to stdout,
++   `"%(asctime)s [%(threadName)] [%(levelname)] %(message)s"`.
++2. `_setup_sentry()` — only if `SENTRY_DSN` is set (`traces_sample_rate=0.1`).
++3. `asyncio.run(_bootstrap(release_connections=True))` (`main.py:81`):
++   - `check_database_connection()` — up to 30 attempts, 1 s apart;
++   - Alembic head check: `Config("alembic.ini")`, URL rewritten
++     `postgresql+asyncpg://` → `postgresql+psycopg2://`, `create_engine(...)`, compare
++     `MigrationContext.get_current_heads()` with `ScriptDirectory.get_heads()`;
++   - `(await get_vector_store_singleton()).run_setup()` — `CREATE EXTENSION IF NOT EXISTS vector`
++     + `base.metadata.create_all` for the vector tables (guarded by module global `did_run_setup`);
++   - `split_by_sentence_tokenizer()` — warms the NLTK punkt download;
++   - `vector_store.close()` — parent releases connections.
++4. `os.environ["FINCITE_BOOTSTRAP_DONE"] = "1"`.
++5. `uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=LOG_LEVEL=="DEBUG",
++   workers=BACKEND_WORKERS)` — **reload ignores workers** (uvicorn behaviour).
++
++### 6.2 Per-worker lifespan (`main.py:119`)
++
++1. Run `_bootstrap()` **only if** `FINCITE_BOOTSTRAP_DONE != "1"` (i.e. when launched with
++   `uvicorn app.main:app` directly).
++2. `await asyncio.to_thread(_setup_llama_index_settings)` — Gemini constructor performs a
++   blocking model-metadata lookup, so it must not run on the event loop.
++3. `(await get_vector_store_singleton()).ensure_initialized()` — creates this process's engines,
++   **no DDL**.
++4. `yield` → serve; on shutdown `vector_store.close()` disposes the shared engine.
++
++### 6.3 App object
++
++`app = FastAPI(title=settings.PROJECT_NAME, ...)` at `main.py:141`:
++docs at `/api/docs`, ReDoc at `/api/redoc`, OpenAPI at `/api/openapi.json`; CORS middleware only
++when `BACKEND_CORS_ORIGINS` is non-empty; `app.include_router(api_router, prefix="/api")`.
++
++### 6.4 Other entry points
++
++| Entry point | Command |
++|---|---|
++| Alternate server launch | `uvicorn app.main:app --host 0.0.0.0 --port 8000` (CWD `backend/`) |
++| Migrations | `uv run alembic upgrade head` (CWD `backend/`) |
++| Migrations (async env) | `alembic/env.py:92` → `asyncio.run(run_async_migrations())` |
++| SSE CLI | `uv run python scripts/chat_llama.py --base_url http://localhost:8000` (needs only `requests` + `sseclient-py`; this script does **not** need `fire`) |
++| Vector DDL / dedupe / upsert | `scripts/{build_vector_tables,dedupe_vector_store,upsert_document}.py` — all require `fire` (§14) |
++| Frontend | `index.html` → `src/main.tsx` → `createRoot(<StrictMode><App/></StrictMode>)` |
++| Frontend build | `npx vite build` → single inlined `dist/index.html` |
++
++---
++
++## 7. DATA MODELS & SCHEMAS
++
++Deep reference: `docs/agents/DATA_MODELS.md`.
++
++### 7.1 Relational tables (`backend/app/models/db.py`, base in `models/base.py`)
++
++All tables inherit `Base` (`models/base.py:6`): `id UUID PK` (default
++`uuid_generate_v4()`), `created_at` / `updated_at` (`server_default now()`, `onupdate`),
++`__tablename__` auto-lowercased class name.
++
++| Table | Columns (beyond base) | Notes |
++|---|---|---|
++| `conversation` | — | container for messages + document scope |
++| `document` | `url String NOT NULL UNIQUE`, `metadata_map JSONB` | `url` = Supabase public URL |
++| `conversationdocument` | `conversation_id FK`, `document_id FK` | M:N join, both indexed |
++| `message` | `conversation_id FK`, `content String`, `role`, `status` | `status` default `PENDING` |
++| `messagesubprocess` | `message_id FK`, `source`, `status`, `metadata_map JSONB` | one row per LlamaIndex callback event |
++
++**Enums** (`models/db.py`): `MessageRoleEnum` = `user|assistant`;
++`MessageStatusEnum` = `PENDING|SUCCESS|ERROR`;
++`MessageSubProcessStatusEnum` = `PENDING|FINISHED`;
++`MessageSubProcessSourceEnum` = every `CBEventType` name **plus**
++`CONSTRUCTED_QUERY_ENGINE` and `SUB_QUESTIONS` (`models/db.py:26-34`). PG type names equal the
++Python enum class names (`to_pg_enum`, `models/db.py:37`).
++
++**`document.metadata_map` shape** (written by `documents.py:143-147`):
++
++```jsonc
++{
++  "nse_document": {              // key = DocumentMetadataKeysEnum.NSE_DOCUMENT
++    "company_name": "Reliance Industries",   // required
++    "company_symbol": "RELIANCE",
++    "document_type": "annual_report",        // annual_report|financial_results|corporate_filing|investor_presentation|other
++    "financial_year": "2025",
++    "report_date": "2025-08-28T12:00:00",
++    "exchange": "NSE",
++    "original_filename": "reliance-ar.pdf"
++  },
++  "content_hash": "<sha256 hex>",           // used for duplicate detection
++  "original_filename": "reliance-ar.pdf"
++}
++```
++
++### 7.2 API schemas (`backend/app/schema.py`)
++
++`Base` (id/created_at/updated_at, `from_attributes=True`) → `Conversation`, `Message`,
++`MessageSubProcess`, `Document`, `DocumentUploadResponse`; plus `ConversationCreate
++{document_ids: List[UUID]}`, `UserMessageCreate {content}`, `NSEDocumentMetadata`,
++`NSEDocumentTypeEnum`, `DocumentMetadataKeysEnum`, `Citation`, `QuestionAnswerPair`,
++`SubProcessMetadataKeysEnum` (= `EventPayload.SUB_QUESTION.value`).
++
++`Citation.from_node` (`schema.py:47`) converts a `NodeWithScore` into
++`{document_id, text, page_number, score}` — this is the only citation source of truth.
++
++### 7.3 Vector store
++
++`data_pg_vector_store` (LlamaIndex-managed, `VECTOR_STORE_TABLE_NAME` + `data_` prefix),
++`embed_dim = VECTOR_STORE_EMBED_DIM` (3072), cosine distance, columns include
++`id, text, metadata_ (JSONB), node_id, embedding`. Every row's `metadata_->>'db_document_id'`
++holds the owning `document.id`; `metadata_->>'page_label'` holds the PDF page.
++
++### 7.4 Frontend domain types (`frontend/src/lib/types.ts`)
++
++`NSEDocumentType`, `DocumentStatus`, `DocumentMetadata`, `FinDocument`, `SubProcessSource`,
++`SubProcessStatus`, `MessageSubProcess`, `MessageRole`, `MessageStatus`, `Source`,
++`ChatMessage`, `Conversation`, `ConversationCreate`, `DocumentUploadResponse`, `HealthResponse`,
++`View`. **These do not match the backend** (see §14.A/§14.K and `DATA_MODELS.md §6`).
++
++---
++
++## 8. API ROUTES / ENDPOINTS
++
++All under `settings.API_PREFIX = "/api"`. Verified route table (enumerated from the live app):
++
++| Method | Path | Handler | Request | Response |
++|---|---|---|---|---|
++| GET | `/api/health/` | `endpoints/health.py:11` | — | `{"status":"alive"}` (runs `SELECT 1`) |
++| POST | `/api/document/upload` | `documents.py:50` | multipart: `file` + optional `company_name`, `company_symbol`, `financial_year`, `document_type`, `exchange` | **201** `DocumentUploadResponse {id,url,metadata_map,status:"indexed",created_at,updated_at}` |
++| GET | `/api/document/` | `documents.py:186` | `?document_ids=<uuid>&document_ids=<uuid>` (repeatable) | `List[Document]`; **404 if empty** |
++| GET | `/api/document/{document_id}` | `documents.py:205` | path UUID | `Document` or 404 |
++| POST | `/api/conversation/` | `conversation.py:31` | `{"document_ids": ["<uuid>", …]}` | `Conversation` (with `messages`, `documents`); 404 if any id missing |
++| GET | `/api/conversation/{conversation_id}` | `conversation.py:53` | path UUID | `Conversation` or 404 |
++| DELETE | `/api/conversation/{conversation_id}` | `conversation.py:66` | path UUID | **204**; 404 if absent (⚠ 500 with messages, §14.E) |
++| GET | `/api/conversation/{conversation_id}/message` | `conversation.py:81` | **query** `user_message=<text>` | `text/event-stream` of JSON `Message` snapshots |
++| GET | `/api/conversation/{conversation_id}/test_message` | `conversation.py:181` | **query** `user_message=<text>` | single final `Message` (drains the SSE stream) |
++| GET | `/api/docs` · `/api/redoc` · `/api/openapi.json` | FastAPI | — | Swagger / ReDoc / spec |
++
++**Error conventions:** 400 invalid PDF/empty file; 404 missing conversation/document (and empty
++document list); 422 indexing failed (file corrupt/unreadable) — the DB row and stored object are
++deleted first; 500 storage upload or DB insert failure.
++
++**SSE payload** — unnamed events, each frame is one complete serialized `schema.Message`:
++
++```jsonc
++{"id":"…","conversation_id":"…","role":"assistant","status":"PENDING",
++ "sub_processes":[{"message_id":"…","source":"SUB_QUESTION","status":"FINISHED",
++                   "metadata_map":{"sub_question":{"question":"…","answer":"…","citations":[…]}}}],
++ "content":"partial answer text…","created_at":"…","updated_at":"…"}
++```
++
++Last two frames: the final `Message` with `status: "SUCCESS"` (or `ERROR`). The backend also
++persists the user message and the assistant message (with all sub-processes) at the end.
++
++Deep reference: `docs/agents/API_REFERENCE.md`.
++
++---
++
++## 9. CORE WORKFLOWS
++
++Detailed traces: `docs/agents/WORKFLOWS.md`.
++
++### W1 — Upload & index a filing (`POST /api/document/upload`)
++
++1. `_validate_pdf` — content-type must be `application/pdf` (or absent) and bytes must start
++   with `%PDF` (`documents.py:32`).
++2. `hashlib.sha256(content)` → `crud.fetch_document_by_content_hash` (`documents.py:89`);
++   a hit returns the **existing** document with `status: "indexed"` (idempotent, 201).
++3. Derive `company_name` from the filename when not supplied; build `NSEDocumentMetadata`.
++4. `uuid4()` → `storage.upload_document(content, id)` → `documents/{id}/original.pdf`.
++5. `get_document_url(id)` → `crud.create_document` (DB row with `metadata_map`).
++6. `ingest_document(db_doc, vector_store)`:
++   `download_document` → temp file → `PDFReader.load_data(extra_info={db_document_id})` →
++   `StorageContext(vector_store)` → `VectorStoreIndex.from_documents(show_progress=True)` →
++   `index.set_index_id(document_id)`.
++7. Failure handling: DB-insert failure deletes the storage object; indexing failure deletes both
++   the DB row and the object, then raises **422**.
++
++### W2 — Create a conversation (`POST /api/conversation/`)
++
++1. Validate every `document_id` exists via `crud.fetch_documents(ids=…)`; missing ⇒ 404 with the
++   list of missing ids (`conversation.py:39-48`).
++2. `crud.create_conversation` inserts `conversation` + one `conversationdocument` row per doc,
++   commits, refreshes, then re-reads with `joinedload(messages).subqueryload(sub_processes)` and
++   `conversation_documents → document`.
++
++### W3 — Ask a question (SSE) (`GET /api/conversation/{id}/message?user_message=`)
++
++1. Load the conversation **before** the user message is persisted (so history excludes it).
++2. Build an ephemeral user `Message`; create `anyio.create_memory_object_stream(100)`.
++3. `event_publisher` starts `handle_chat_message` as an `asyncio` task and consumes
++   `recv_chan`, maintaining an `OrderedDict[event_id → MessageSubProcess]` so start/end events
++   merge into one row; yields a serialized `Message` snapshot per event.
++4. `handle_chat_message` (`messaging.py:128`): build the engine (loads/creates a
++   `VectorStoreIndex` per document, one tool per doc, SubQuestion engine, custom synth, ReAct
++   agent with history + system prompt), emit `CONSTRUCTED_QUERY_ENGINE`, prepend the nudge
++   `"Remember - if I have asked a relevant financial question, use your tools."`, then
++   `astream_chat(templated_message)` and stream cumulative `content`.
++5. `ChatCallbackHandler` converts every LlamaIndex `CBEventType` start/end into
++   `StreamedMessageSubProcess` with `has_ended`, `event_id` and (for `SUB_QUESTION`) the
++   `QuestionAnswerPair` (question, answer, citations).
++6. On completion: persist user + assistant messages + sub-processes, then yield the final
++   `Message`; `status` becomes `SUCCESS` or `ERROR`.
++7. Empty answer ⇒ canned apology ("Sorry, I either wasn't able to understand your question…").
++
++### W4 — Frontend question flow (mock)
++
++`Composer.submit` → `store.send(q)` → create conversation if `activeId` is null →
++`api.streamMessage` (mock walks a 4-step plan: Query understanding → Hybrid retrieval → Rerank
++→ Answer synthesis, `lib/mockData.ts:188` `ANSWER_BANK`) → handlers patch the conversation →
++`MessageItem` renders streaming text (`.stream-caret`) → `ResearchTrail` auto-collapses 1.4 s
++after the last step → completion attaches `sources[]` → clicking `[n]` or a source card calls
++`store.openSource` → `SourceDrawer` shows the passage, "open in library" jumps to `LibraryView`.
++
++### W5 — Deploy bootstrap
++
++`uv run start` → logging → Sentry → `_bootstrap` (DB wait → Alembic head check → pgvector DDL →
++NLTK data → close) → flag → uvicorn with `BACKEND_WORKERS` → each worker lifespan configures
++Gemini settings in a thread → opens its own pools → serves.
++
++---
++
++## 10. CONFIGURATION & ENVIRONMENT VARIABLES
++
++`backend/app/core/config.py` (`Settings`, env prefix `""`, reads `.env`). Required: `DATABASE_URL`,
++`GOOGLE_API_KEY`. Everything else has a default.
++
++| Variable | Default | Notes / where used |
++|---|---|---|
++| `DATABASE_URL` | **required** | validator rewrites `postgres://`→`postgresql://`→`postgresql+asyncpg://`; rejects non-postgres (`config.py:54`) |
++| `GOOGLE_API_KEY` | **required** | also exported to `os.environ` at import (`config.py:83`) for the Gemini SDK |
++| `SUPABASE_URL` | `""` | Storage; `RuntimeError` if empty when used |
++| `SUPABASE_SERVICE_ROLE_KEY` | `""` | server-side only, never returned to clients |
++| `SUPABASE_STORAGE_BUCKET` | `annual-reports` | must exist in the Supabase project |
++| `GEMINI_CHAT_LLM_NAME` | `models/gemini-1.5-flash` | LLM for agent, question-gen, synthesis |
++| `GEMINI_EMBEDDING_MODEL_NAME` | `models/gemini-embedding-001` | must be 3072-d |
++| `VECTOR_STORE_TABLE_NAME` | `pg_vector_store` | real table = `data_pg_vector_store` |
++| `VECTOR_STORE_EMBED_DIM` | `3072` | asserted by a test (`test_engine.py:44`) |
++| `PROJECT_NAME` | `fincite` | FastAPI title |
++| `API_PREFIX` | `/api` | all routes + docs |
++| `LOG_LEVEL` | `INFO` | one of DEBUG/INFO/WARNING/ERROR/CRITICAL; `DEBUG` ⇒ uvicorn reload + verbose agent traces |
++| `BACKEND_WORKERS` | `4` | uvicorn workers (ignored when reload) |
++| `BACKEND_CORS_ORIGINS` | `[]` | JSON list or comma-separated; empty ⇒ **no CORS middleware** |
++| `SENTRY_DSN` | unset | enables Sentry |
++| `FINCITE_BOOTSTRAP_DONE` | unset | internal handoff flag (`main.py:47`) |
++
++**Frontend config:** only `VITE_API_URL` (read via `import.meta.env` at `lib/api.ts:34`,
++default `http://localhost:8000`). **`USE_MOCK` is a hardcoded `true` constant** at
++`lib/api.ts:32` — there is no env switch today.
++
++`backend/.env.example` documents every variable; `docker-compose.yml` overrides `DATABASE_URL`
++and `BACKEND_CORS_ORIGINS` for the local pgvector container.
++
++---
++
++## 11. DEVELOPMENT COMMANDS
++
++Legend: ✅ executed in this workspace with the stated result · ❌ currently fails ·
++unmarked commands were **not** run here (no database or Supabase credentials) and are given from
++the code/README contract — treat them as unverified.
++
++### Backend (`cd backend`)
++
++```bash
++uv sync                                  # install from uv.lock incl. dev group  ✅
++cp .env.example .env                     # then fill DATABASE_URL / SUPABASE_* / GOOGLE_API_KEY
++uv run alembic upgrade head              # migrate (CWD must be backend/)
++uv run start                             # bootstrap + uvicorn on 0.0.0.0:8000
++# or: uv run uvicorn app.main:app --port 8000
++uv run pytest -q                         # 15 passed in ~8 s (no DB / API key needed) ✅
++uv run alembic current                   # applied revision
++uv run alembic heads                     # → 663b3fea3024 ✅ (single head)
++docker compose up --build                # backend + ankane/pgvector (⚠ port map bug, §14.F)
++```
++
++### Frontend (`cd frontend`)
++
++```bash
++npm ci                                   # ✅
++npm run dev                              # vite dev server (default :5173) — mock data only
++npm run build                            # ✅ → dist/index.html (622 kB, 189 kB gzip, single file)
++npm run preview                          # serve the build
++npx tsc --noEmit                         # ❌ 5 errors today (§14.A) — fix before claiming "typecheck clean"
++```
++
++### Linting
++
++There is **no configured linter**: `pylint` 2.17.5 is a dev dependency but no `.pylintrc`,
++`setup.cfg`, or `[tool.pylint]` exists; the frontend has no ESLint/Prettier config or script.
++Effectively, `tsc --noEmit` (or `vite build`) is the only static check. Do not add a lint step to
++CI without also adding its config.
++
++### Useful one-offs
++
++```bash
++# peek at the API contract
++curl -s localhost:8000/api/openapi.json | jq '.paths | keys'
++
++# stream an answer
++curl -N "localhost:8000/api/conversation/<ID>/message?user_message=What%20was%20FY2025%20revenue%3F"
++
++# non-streaming answer (Swagger-friendly)
++curl "localhost:8000/api/conversation/<ID>/test_message?user_message=Hello"
++```
++
++---
++
++## 12. CODING CONVENTIONS & PATTERNS
++
++**Python**
++- Absolute imports from `app.` (`from app.api import crud`), no relative imports.
++- Async everywhere on the request path: `async def` endpoints, `AsyncSession`, `await
++  db.execute(select(...))`, explicit `await db.commit()`; no commits inside read helpers.
++- SQLAlchemy **2.0 style**: `select()/delete()`, `result.scalars().first()`,
++  `model_validate(..., from_attributes=True)`; `joinedload`/`subqueryload` for eager loading.
++- Errors: `HTTPException(status_code=…, detail=…)` in endpoints; `RuntimeError` in the storage
++  layer (wrapped by endpoints); broad `except Exception` **only** for index-load fallback and
++  storage cleanup; always `logger.warning/error(..., exc_info=True)` before a 5xx.
++- Logging: module-level `logger = logging.getLogger(__name__)`; `%s` lazy formatting, never
++  f-strings in log calls.
++- Pydantic v2 (`model_validate`, `model_dump(mode="json")`, `field_validator`) — but note
++  `messaging.py:86` still calls the deprecated `.dict()`.
++- Type hints on all public functions; `Optional[...]`/`| None`; `Dict/List` from `typing` in
++  older modules, builtin generics in newer ones (both present — match the file you edit).
++- Docstrings: triple-quoted, often containing an ASCII flow diagram (see `engine.py`,
++  `ingestion/pdf.py`, `storage/supabase.py`). Keep that style when adding modules.
++- Constants live in `chat/constants.py` or module-level `_UPPER` names (e.g. `_ALLOWED_CONTENT_TYPES`).
++- DB naming: singular lowercase table names derived from the class (`messagesubprocess`).
++
++**TypeScript / React**
++- Function components, default export at file end; `memo()` for `MessageItem` and `CiteMarkdown`.
++- No router, no Redux: everything flows through `useStore()`.
++- Local state via `useState`; derived data via `useMemo`; refs for timers/cancellation
++  (`cancelStream`, `pollers`, `dragDepth`).
++- Styling: Tailwind utility classes inline; **design tokens only** (`bg-bone`, `text-ink`,
++  `border-line`, `text-accent`, `bg-soot`, `text-moss`, `bg-pine`, `text-rust`, `font-display`,
++  `font-mono`, `tnum`) defined in `src/index.css` `@theme`. No hex literals in components
++  (except `Monogram`'s company hues from `mockData`).
++- Typography scale is explicit and tiny (`text-[9.5px]`, `text-[13px]`) — copy neighbouring
++  values instead of inventing.
++- Motion: `framer-motion` with the shared easing `[0.22, 1, 0.36, 1]` or `[0.32, 0.72, 0, 1]`.
++- Accessibility: every icon-only button carries `aria-label`.
++- Comments: `/* ---- section ---- */` dividers; disabled UI blocks are left commented out in
++  place — that is intentional (do not "clean up" them without asking).
++
++---
++
++## 13. TESTING STRATEGY
++
++**Framework:** `pytest` 7.4.0 + `pytest-asyncio` 0.23.8, tests under `backend/tests/`, no
++`pytest.ini`/`pyproject` config (strict asyncio mode ⇒ async tests need
++`@pytest.mark.asyncio`). **Verified: `uv run pytest -q` → 15 passed, 4 warnings, ~8 s.**
++
++**`tests/conftest.py`** sets `DATABASE_URL`, `GOOGLE_API_KEY`, `SUPABASE_URL`,
++`SUPABASE_SERVICE_ROLE_KEY` via `os.environ.setdefault` **before** any app import — this is why
++the suite runs with no services. Add any new required setting there.
++
++**Existing coverage (15 tests):**
++
++| File | Tests | What they pin |
++|---|---|---|
++| `tests/app/chat/test_engine.py` | 8 | `get_vector_store_singleton` passes `embed_dim=3072` (monkeypatched `from_params`); `get_chat_history` matrix: happy path, consecutive same-role messages, empty input, ERROR-status user/assistant filtering, blank content stripping, unpaired messages |
++| `tests/app/test_refactored.py` | 7 | `NSEDocumentMetadata` parsing + defaults; Supabase storage helpers with `@patch("app.storage.supabase.create_client")`; `ingest_document` flow (PDFReader/VectorStoreIndex/StorageContext patched); upload endpoint success + invalid file; health endpoint |
++
++**Patterns to reuse**
++- Patch **where the name is used**, not where it is defined:
++  `@patch("app.api.endpoints.documents.upload_document")` (module attribute),
++  `@patch("app.ingestion.pdf.PDFReader")`, `@patch("app.storage.supabase.create_client")`.
++- `AsyncMock(spec=AsyncSession)` for the DB dependency; `AsyncMock(spec=UploadFile)` with
++  `read.return_value = b"%PDF-1.4 …"`.
++- Event-loop bridging in sync tests: `asyncio.run(coro)` (see
++  `test_get_vector_store_singleton_uses_3072_embedding_dimension`).
++- Pydantic message doubles: subclass `schema.Message` with defaults
++  (`class MockMessage(Message): conversation_id: UUID = uuid4(); sub_processes: list = []`).
++- Reset module singletons when a test touches them (`supabase._supabase_client = None`,
++  `pg_vector.singleton_instance`).
++
++**Adding a test:** put it next to the mirrored app path (`tests/app/<pkg>/test_<module>.py`),
++mark async tests, avoid real network/DB, and assert on behaviour + call arguments. There is no
++integration/DB test harness and no frontend test runner — if you need one, propose it explicitly
++rather than silently adding a new framework.
++
++---
++
++## 14. KNOWN ISSUES & TECH DEBT
++
++Ranked by likelihood of biting an agent. Each item was checked against the code in this
++session; re-verify before acting on one you intend to fix.
++
++**A. Frontend does not typecheck (5 errors) — root cause is a broken comment.**
++`frontend/src/lib/types.ts` lines 1-4 open `/**` and never close it before
++`export type NSEDocumentType`. The next `*/` is on line 22, so `NSEDocumentType`,
++`DocumentStatus`, `DocumentMetadata` and `FinDocument` are swallowed by the comment.
++`npx tsc --noEmit` reports:
++`Sidebar.tsx(3,3) TS6133 'Activity' unused`, `format.ts(1,15) TS2305 DocumentStatus`,
++`format.ts(1,31) TS2305 NSEDocumentType`, `types.ts(26,18) TS2552`, `types.ts(38,11) TS2304`.
++`vite build` still **succeeds** (esbuild strips types), which is why this is easy to miss.
++Fix = close the comment (`*/`) and drop the unused `Activity` import.
++
++**B. The frontend is mock-only and its "real" transport does not match the API.**
++`USE_MOCK = true` is a hardcoded const (`lib/api.ts:32`); to hit the backend you must edit source.
++`RealTransport` is stale: it sends `?q=` instead of `?user_message=`
++(`api.ts:417`), listens for `sub_process`/`delta`/`done` events while the backend emits unnamed
++`Message` snapshots (`api.ts:420-433`), and posts `{title, document_scope}` instead of
++`{document_ids}` (`api.ts:399-406`). `EventSource` also cannot set an `Accept` header.
++Expect to rewrite this transport, not patch it.
++
++**C. README drift (root `README.md` describes files/scripts that do not exist).**
++Missing: `frontend/src/lib/backend.ts`, `frontend/README.md`,
++`backend/CONTEXT.md` (referenced by `backend/README.md`), npm scripts `dev:mock`, `typecheck`,
++`check:adapter`, the Vite dev proxy / `VITE_PROXY_TARGET`, the NSE-metadata upload form
++(`UploadDrawer` sends only `{name,size,type}`), thread persistence across reloads
++(conversations live only in React state), and "15 passing backend tests" is correct but
++"`npm run typecheck` zero errors" is false. Trust code and this file.
++
++**D. Streaming concurrency is fragile.** `handle_chat_message` and `event_publisher` both do
++`async with send_chan` on the *same* stream (`messaging.py:133`, `conversation.py:113`) — double
++close; `ChatCallbackHandler.on_event_*` fires `asyncio.create_task` fire-and-forget
++(`messaging.py:51,65`), so sub-process frames can arrive after the channel closes; the code
++inspects the private `send_chan._closed` (`messaging.py:102`, `conversation.py:156`). Any change
++here needs a real end-to-end test.
++
++**E. `DELETE /api/conversation/{id}` fails for non-empty conversations.** `crud.delete_conversation`
++issues a bare `DELETE FROM conversation`; `message.conversation_id` /
++`conversationdocument.*` FKs have **no `ON DELETE CASCADE`** (migration `477cee72edc4`), so
++Postgres raises a FK violation → unhandled 500. The frontend hides it ("local delete anyway",
++`store.tsx:286`). Fix = cascade in the model + migration, or delete children explicitly.
++
++**F. `docker-compose.yml` database port is wrong.** `127.0.0.1:5433:5433` maps host 5433 to
++container 5433, but Postgres listens on **5432** inside the image. Use `5433:5432`. (`version:
++'3'` is also obsolete.) Backend↔db works because the service connects to `db:5432`.
++
++**G. Three of the four `backend/scripts/*.py` are unusable as written.**
++`build_vector_tables.py`, `dedupe_vector_store.py` and `upsert_document.py` import `fire`, which is
++not declared in `pyproject.toml`/`uv.lock` (`import fire` → `ModuleNotFoundError`, verified).
++`chat_llama.py` is fine (it only needs `requests` + `sseclient-py`). Either add `fire` or replace
++the CLI layer with `argparse`.
++
++**H. Index reuse is not actually verified.** `build_doc_id_to_index_map`
++(`engine.py:126-148`) calls `VectorStoreIndex.from_vector_store`, which does not raise for a
++document with zero vectors — so the "re-index from storage" fallback is effectively dead code
++and a document whose vectors are missing yields an empty tool. Do not rely on that except branch.
++
++**I. Indexing runs inside the upload request.** `ingest_document` performs PDF parsing and Gemini
++embedding synchronously in the request handler (blocking the worker for minutes on a 300-page
++report). The roadmap calls for a job queue; until then, large uploads look like timeouts.
++
++**J. No document deletion path.** There is no `DELETE /api/document/{id}` and no cleanup of
++`data_pg_vector_store` rows, so removing a filing requires manual SQL (see
++`scripts/dedupe_vector_store.py` for the table name).
++
++**K. Frontend/backend type drift.** `FinDocument.metadata` uses `nse_symbol`, `fiscal_year`,
++`period`, `pages`, `file_size`; the backend uses `company_symbol`, `financial_year`,
++`original_filename` and no page/size counters. Document-type enums differ
++(`quarterly_results`/`concall_transcript`/`shareholding_pattern`/`corporate_announcement` in the
++UI vs `financial_results`/`corporate_filing`/`investor_presentation`/`other` in the API).
++Sub-process enums differ too (UI: `llm|retrieval|rerank|parser`; API: LlamaIndex
++`CBEventType` names). A mapper layer is required before real mode works.
++
++**L. `GET /api/document/` returns 404 for an empty library** (`documents.py:199`) instead of
++`[]` — hostile to clients that poll.
++
++**M. Import-time side effects.** `chat/engine.py:64` calls `nest_asyncio.apply()` on import;
++`core/config.py:83` writes `os.environ["GOOGLE_API_KEY"]`. Importing `app.main` therefore
++requires `DATABASE_URL` + `GOOGLE_API_KEY` to be set (or the test defaults from `conftest.py`).
++
++**N. `_bootstrap()` depends on CWD.** `Config("alembic.ini")` is relative; running the app from
++outside `backend/` raises. Same for `uv run alembic`.
++
++**O. Stale/incidental values.** `alembic.ini` still points at `llama_app_db`;
++`scripts/upsert_document.py` says "SEC"; `dedupe_vector_store.py` hardcodes
++`data_pg_vector_store` and ignores `VECTOR_STORE_TABLE_NAME`; `Citation.document_id` is typed
++`UUID` but its validator returns `str` (`schema.py:39-44`); `Message.content` is non-optional in
++Pydantic but nullable in the DB; `.dict()` (Pydantic v1 API) in `messaging.py:86` emits
++deprecation warnings; `messagesubprocess.content` exists in the first migration but not in the
++model.
++
++**P. Dead code / unused imports.** `frontend/src/utils/cn.ts` is never imported; `Sidebar.tsx`
++imports `Activity` (TS error); `crud.py` imports `uuid as uuid_module` unused; several
++commented-out UI blocks remain in `Sidebar.tsx`, `ChatView.tsx`, `LibraryView.tsx`.
++
++**Q. No auth, tenancy, rate limiting, or CI.** Every endpoint is public; the Supabase
++service-role key must never leak to the client; there is no `.github/workflows`.
++
++**R. Dependency age.** `sentry-sdk` 1.29.2 and `uvicorn` 0.22.0 are old; the Gemini SDK
++(`google-generativeai`) is end-of-life and emits a `FutureWarning` on every import (visible in
++the pytest output). Not urgent, but a migration to `google-genai` will eventually be required.
++
++---
++
++## 15. AGENT RULES
++
++### ALWAYS
++
++1. **Run backend commands from `backend/`** (`alembic.ini`, `.env`, `.venv` are all CWD-relative).
++   Frontend commands from `frontend/`.
++2. **Keep `db_document_id` on every vector node and `page_label` in metadata.** They are the
++   backbone of per-document filtering and citations (§4.4).
++3. **Mirror the existing layering:** endpoint (HTTP + validation) → `crud.py` (SQL) → model.
++   Never write SQL/ORM queries inside an endpoint or inside `chat/`.
++4. **Keep the SSE contract as full `Message` snapshots**, unnamed events, monotonic
++   `content`/`sub_processes`. The frontend's whole streaming design depends on it.
++5. **Use Pydantic v2 APIs** (`model_validate`, `model_dump`, `field_validator`) in new code and
++   keep `app/schema.py` as the single source of API shapes.
++6. **Add or update a test** for any change to `crud.py`, `ingestion/`, `storage/`, or the upload
++   endpoint, following the patch-where-used + `AsyncMock` patterns in §13.
++7. **Run `uv run pytest -q` (backend) and `npx tsc --noEmit` (frontend) before declaring work
++   done.** Report the *actual* output; typecheck currently fails (§14.A).
++8. **Update `backend/.env.example` when you add a setting**, and `Settings` in
++   `core/config.py` with a sane default so tests keep passing without new env vars.
++9. **New migrations:** `uv run alembic revision --autogenerate -m "…"`, review the diff, keep a
++   single head, and remember `_bootstrap()` refuses to start if the DB is not at head.
++10. **Preserve the domain prompt contract** (tools first, exact units, financial year, page
++    citations, no fabrication) whenever you touch `constants.py` or `qa_response_synth.py`.
++11. **Match the frontend design system** — tokens in `index.css`, tiny mono labels, `aria-label`
++    on icon buttons, framer-motion easings already in use.
++12. **State uncertainty plainly.** If you could not run something, say which command and why.
++
++### NEVER
++
++1. **Never change `VECTOR_STORE_EMBED_DIM` (3072) or the embedding model without recreating the
++   vector table** — rows of mixed dimensionality break similarity search.
++2. **Never send blocking work onto the event loop.** PDF parsing, Gemini model construction, and
++   any `requests` call must be wrapped (`asyncio.to_thread`) or moved to a task.
++3. **Never expose `SUPABASE_SERVICE_ROLE_KEY`, `GOOGLE_API_KEY`, or `DATABASE_URL`** to the
++   client, in logs, or in API responses.
++4. **Never edit `alembic/versions/*.py` that already ran** (or delete rows from
++   `alembic_version`); add a new revision instead.
++5. **Never switch `USE_MOCK` to `false` and call it "connected"** — `RealTransport` does not
++   implement the backend contract (§14.B). Fix the transport first and verify against a live API.
++6. **Never delete the commented-out UI blocks or "unused" helpers as "cleanup"** without asking;
++   they are deliberate parking spots for in-progress UI.
++7. **Never trust `README.md` over the code.** If a doc claim is wrong, fix the doc in the same
++   change (and note it here if it is a repeated trap).
++8. **Never add a new framework** (test runner, linter, state library, router, ORM) without
++   explicit user approval — this repo deliberately keeps a single store, one test framework, and
++   no CSS-in-JS.
++9. **Never commit `.env`, `node_modules/`, `dist/`, `.venv/`, or generated PDFs** (all ignored;
++   keep new artifacts ignored too).
++10. **Never assume the frontend typecheck is green, the delete endpoint works, or the scripts
++    run** — all three are currently broken (§14.A, §14.E, §14.G).
++11. **Never reformat unrelated files.** Diffs should be scoped; this codebase mixes legacy and
++    modern Python styles on purpose.
++
++---
++
++### Quick "is it healthy?" checklist
++
++```bash
++cd backend  && uv run pytest -q                     # expect: 15 passed
++cd backend  && uv run python -c "import app.main"   # needs DATABASE_URL + GOOGLE_API_KEY set
++cd frontend && npx tsc --noEmit                     # expect: FAILS (§14.A) until the comment is fixed
++cd frontend && npm run build                        # expect: single dist/index.html (~622 kB)
++curl -s localhost:8000/api/health/                  # {"status":"alive"} — requires DB + env
++```
+diff --git a/docs/agents/API_REFERENCE.md b/docs/agents/API_REFERENCE.md
+new file mode 100644
+index 0000000..c192359
+--- /dev/null
++++ b/docs/agents/API_REFERENCE.md
+@@ -0,0 +1,307 @@
++# API REFERENCE — fincitee
++
++Base URL: `http://localhost:8000` (dev) · Prefix: **`/api`** (`settings.API_PREFIX`) ·
++Interactive docs: `/api/docs` (Swagger), `/api/redoc`, spec at `/api/openapi.json`.
++
++All handlers are `async def` and take `db: AsyncSession = Depends(get_db)` unless noted.
++Response models come from `app/schema.py`. There is **no authentication** on any route.
++
++Route table verified by enumerating the live `app` object:
++
++```
++GET    /api/openapi.json              GET /api/docs            GET /api/redoc
++POST   /api/conversation/             GET /api/conversation/{conversation_id}
++DELETE /api/conversation/{conversation_id}
++GET    /api/conversation/{conversation_id}/message
++GET    /api/conversation/{conversation_id}/test_message
++POST   /api/document/upload           GET /api/document/       GET /api/document/{document_id}
++GET    /api/health/
++```
++
++Note the **trailing slashes** on collection routes (`/api/conversation/`, `/api/document/`,
++`/api/health/`); FastAPI's default `redirect_slashes` will 307 the slashless variant.
++
++---
++
++## 1. Health
++
++### `GET /api/health/`
++`app/api/endpoints/health.py:11` · no auth · no schema
++
++Executes `SELECT 1` through the request session, then:
++
++```json
++{"status": "alive"}
++```
++
++| Status | When |
++|---|---|
++| 200 | DB reachable |
++| 500 | DB unreachable (the SQLAlchemy exception escapes — no handler) |
++
++The frontend polls this every 25 s (`App.tsx:29`) and renders the dot in `Sidebar`; a failure is
++treated as `{"status":"down"}` client-side. The UI expects a `healthy` value, which this endpoint
++never returns — see `AGENTS.md §14.K`.
++
++---
++
++## 2. Documents
++
++### `POST /api/document/upload` → **201**
++
++`app/api/endpoints/documents.py:50`
++
++**Request** — `multipart/form-data` (`python-multipart`):
++
++| Field | Type | Required | Description |
++|---|---|---|---|
++| `file` | file | **yes** | PDF; validated by content-type (`application/pdf` or absent) **and** `%PDF` magic bytes |
++| `company_name` | str | no | defaults to a title-cased version of the filename |
++| `company_symbol` | str | no | NSE ticker, e.g. `RELIANCE` |
++| `financial_year` | str | no | e.g. `2025` |
++| `document_type` | enum | no | `annual_report` (default) \| `financial_results` \| `corporate_filing` \| `investor_presentation` \| `other` |
++| `exchange` | str | no | default `NSE` |
++
++**Response 201** (`schema.DocumentUploadResponse`):
++
++```json
++{
++  "id": "0f0b6f9e-6f0e-4a3a-9f5e-6d0f3f9a1b2c",
++  "url": "https://<project>.supabase.co/storage/v1/object/public/annual-reports/documents/0f0b…/original.pdf",
++  "metadata_map": {
++    "nse_document": {
++      "company_name": "Reliance Industries Limited",
++      "company_symbol": "RELIANCE",
++      "document_type": "annual_report",
++      "financial_year": "2025",
++      "report_date": null,
++      "exchange": "NSE",
++      "original_filename": "reliance-ar-2025.pdf"
++    },
++    "content_hash": "9f2c…",
++    "original_filename": "reliance-ar-2025.pdf"
++  },
++  "status": "indexed",
++  "created_at": "2026-10-24T12:00:00",
++  "updated_at": "2026-10-24T12:00:00"
++}
++```
++
++**Behaviour**
++
++1. Empty body → `400 {"detail": "The uploaded file is empty."}`
++2. Non-PDF content-type → `400 {"detail": "Only PDF files are accepted. Received content-type: …"}`
++3. No `%PDF` prefix → `400 {"detail": "The uploaded file does not appear to be a valid PDF."}`
++4. **Duplicate (same SHA-256)** → returns the **existing** document with `status: "indexed"`,
++   HTTP **201** (idempotent; no second storage object).
++5. Storage upload failure → `500 {"detail": "Failed to upload file to storage: …"}`
++6. DB insert failure → storage object deleted, `500 {"detail": "Failed to create document record in database."}`
++7. Indexing failure → DB row + storage object deleted, `422 {"detail": "PDF indexing failed. The file may be corrupted or unreadable: …"}`
++
++**Timing** — indexing (parse → chunk → Gemini embeddings → pgvector) happens **inside** this
++request. Multi-hundred-page PDFs can take minutes; there is no progress channel.
++
++**curl**
++
++```bash
++curl -X POST localhost:8000/api/document/upload \
++  -F "file=@reliance-ar-2025.pdf;type=application/pdf" \
++  -F "company_name=Reliance Industries Limited" \
++  -F "company_symbol=RELIANCE" -F "financial_year=2025" -F "document_type=annual_report"
++```
++
++### `GET /api/document/` → `List[Document]`
++
++`documents.py:186` · optional repeatable query `document_ids=<uuid>`
++
++```json
++[{"id":"…","url":"…","metadata_map":{…},"created_at":"…","updated_at":"…"}]
++```
++
++- **404 `{"detail":"Document(s) not found"}` when the result set is empty** (including an empty
++  library). Quirk, see `AGENTS.md §14.L`.
++- No pagination, no filtering by company/symbol/type.
++
++### `GET /api/document/{document_id}` → `Document`
++
++`documents.py:205` · path param is a `UUID` (FastAPI returns 422 for a malformed UUID).
++Returns `docs[0]` from `crud.fetch_documents(id=…)`; `404 {"detail":"Document not found"}` if absent.
++
++---
++
++## 3. Conversations
++
++### `POST /api/conversation/` → `Conversation`
++
++`conversation.py:31`
++
++**Request**
++
++```json
++{"document_ids": ["0f0b6f9e-6f0e-4a3a-9f5e-6d0f3f9a1b2c"]}
++```
++
++**Response** (`schema.Conversation`; `messages` empty on creation)
++
++```json
++{
++  "id": "6d8f…",
++  "created_at": "2026-10-24T12:03:11",
++  "updated_at": "2026-10-24T12:03:11",
++  "messages": [],
++  "documents": [{"id": "0f0b…", "url": "…", "metadata_map": {…}, "created_at": "…", "updated_at": "…"}]
++}
++```
++
++Errors: `404 {"detail":"Documents not found: <id>, <id>"}` when any supplied id is unknown.
++An empty `document_ids` list is allowed and produces a conversation with no scope (the agent then
++has zero document tools — answers will be empty).
++
++`crud.create_conversation` (`crud.py:42`) inserts the conversation plus one
++`conversationdocument` row per id, then re-reads with eager loading.
++
++### `GET /api/conversation/{conversation_id}` → `Conversation`
++
++`conversation.py:53` · includes every message (ordered as the DB returns them) with its full
++`sub_processes` array, plus the linked documents. `404 {"detail":"Conversation not found"}`.
++
++### `DELETE /api/conversation/{conversation_id}` → **204**, empty body
++
++`conversation.py:66` · `404 {"detail":"Conversation not found"}` if the row is absent.
++
++⚠ Does **not** delete child `message` / `messagesubprocess` / `conversationdocument` rows, and the
++FKs have no `ON DELETE CASCADE` ⇒ a conversation with messages raises a FK violation (500). See
++`AGENTS.md §14.E`.
++
++---
++
++## 4. Chat / SSE
++
++### `GET /api/conversation/{conversation_id}/message?user_message=<text>` → `text/event-stream`
++
++`conversation.py:81` · returns `EventSourceResponse(event_publisher())`.
++
++⚠ The message is a **query parameter** (`user_message`), not a body — GET with side effects.
++The user message is persisted only at the end of the stream.
++
++**Protocol**
++
++- Event type: **none** (default `message` event); each frame's `data` is one JSON object.
++- Payload: a complete `schema.Message` snapshot (not a delta). `content` and `sub_processes`
++  grow monotonically across frames.
++- `status` is `PENDING` while generating; the last frame carries `SUCCESS` or `ERROR`.
++- The final frame is re-read from the DB, so it contains the persisted ids/timestamps.
++
++Frame shape:
++
++```jsonc
++{
++  "id": "b1e0…",                       // assistant message id (uuid4 generated up-front)
++  "conversation_id": "6d8f…",
++  "content": "Reliance's FY2025 consolidated revenue was …",   // cumulative
++  "role": "assistant",
++  "status": "PENDING",
++  "sub_processes": [
++    {
++      "id": null,
++      "message_id": "b1e0…",
++      "source": "SUB_QUESTION",
++      "status": "FINISHED",
++      "metadata_map": {
++        "sub_question": {
++          "question": "What was Reliance's FY2025 consolidated revenue?",
++          "answer": "₹ 10,71,774 crore",
++          "citations": [
++            {"document_id": "0f0b…", "text": "…consolidated revenue…", "page_number": 112, "score": 0.83}
++          ]
++        }
++      }
++    }
++  ],
++  "created_at": "2026-10-24T12:05:01",
++  "updated_at": null
++}
++```
++
++Sub-process semantics (produced by `ChatCallbackHandler`, `chat/messaging.py`):
++
++| Field | Meaning |
++|---|---|
++| `source` | `MessageSubProcessSourceEnum[event_type.name]` — e.g. `LLM`, `RETRIEVE`, `SYNTHESIZE`, `SUB_QUESTION`, `AGENT_STEP`, plus synthetic `CONSTRUCTED_QUERY_ENGINE` (engine built) |
++| `status` | `PENDING` on the start event, `FINISHED` on the end event of the same `event_id` |
++| `metadata_map.sub_question` | only for `SUB_QUESTION`: question, answer, citations |
++
++The **first** frame after the engine is built is always
++`{source: "CONSTRUCTED_QUERY_ENGINE", status: "FINISHED"}`.
++
++Persistence & edge cases:
++
++- On success, the user message and the assistant message (with all sub-processes) are committed
++  and the final snapshot is emitted.
++- On exception: assistant `status="ERROR"`, both messages still committed, no 5xx (the response
++  has already started).
++- If the model produced no text, the stream contains the canned apology
++  `"Sorry, I either wasn't able to understand your question or I don't have an answer for it."`
++- Client disconnect closes the anyio send channel; the producer keeps running until it notices
++  `send_chan._closed`.
++
++**curl**
++
++```bash
++curl -N "localhost:8000/api/conversation/<ID>/message?user_message=What%20was%20FY2025%20revenue%3F"
++```
++
++### `GET /api/conversation/{conversation_id}/test_message?user_message=<text>` → `Message`
++
++`conversation.py:181` — calls `message_conversation(...)`, drains `response.body_iterator`, and
++returns the **last** frame parsed as `schema.Message`. Useful in Swagger (which cannot render SSE).
++Because `sse-starlette` 1.6.5 sets `body_iterator` to the raw async generator, the yielded values
++are the JSON strings themselves. On an unexpected empty stream it raises `500`.
++
++---
++
++## 5. Error summary
++
++| Code | Sources |
++|---|---|
++| 400 | empty upload, wrong content-type, missing `%PDF` magic |
++| 404 | conversation not found, document not found, **document list empty**, unknown `document_ids` on create |
++| 422 | FastAPI validation (bad UUID, missing required form field), PDF indexing failure |
++| 500 | storage upload failure, DB insert failure, `test_message` empty stream, unhandled FK violation on conversation delete, DB errors |
++
++Error body is always FastAPI's default `{"detail": "<message>"}`. There is no error code
++namespace and no structured error envelope.
++
++---
++
++## 6. Contract expected by the frontend (currently unmet)
++
++`frontend/src/lib/api.ts` `RealTransport` is a stub that disagrees with the server:
++
++| Client does | Server expects |
++|---|---|
++| `GET /api/conversation/{id}/message?q=<text>` | `?user_message=<text>` |
++| Listens for named SSE events `sub_process`, `delta`, `done` | unnamed frames, each a full `Message` |
++| `POST /api/conversation/ {title, document_scope}` | `{document_ids}` |
++| `DocumentUploadResponse {document: FinDocument}` | `{id,url,metadata_map,status,…}` (flat) |
++| `FinDocument` fields (`nse_symbol`, `fiscal_year`, `pages`) | `metadata_map.nse_document.*` |
++| Plain `EventSource` (no headers) | works, but no `Accept` control; errors surface as `onerror` |
++
++Also, `GET /api/document/` 404s on an empty library, which `listDocuments()` would surface as a
++JSON parse/`Error` — the transport has no status checking at all (`res.json()` on every response).
++
++If you implement the adapter: map wire→domain in one place, convert the snapshot stream into the
++store's `onSubProcess`/`onToken`/`onDone` callbacks (diff `content` to produce tokens), and derive
++`Source.index` from citation order within a message.
++
++---
++
++## 7. OpenAPI
++
++- Spec: `GET /api/openapi.json`; UI: `/api/docs`; ReDoc: `/api/redoc`.
++- Title `fincite` (`settings.PROJECT_NAME`), description mentions "AI financial research backend
++  for Indian / NSE company annual reports and filings".
++- Operations are tagged `conversation`, `document`, `health` (`api/api.py:6-10`).
++- The SSE endpoint appears as a normal `GET` returning `text/event-stream`; Swagger cannot render
++  it — use `curl -N` or the browser `EventSource`.
++- No security schemes are declared.
+diff --git a/docs/agents/ARCHITECTURE.md b/docs/agents/ARCHITECTURE.md
+new file mode 100644
+index 0000000..e9f641c
+--- /dev/null
++++ b/docs/agents/ARCHITECTURE.md
+@@ -0,0 +1,337 @@
++# ARCHITECTURE — fincitee
++
++Deep dive for anyone changing the RAG harness, the process model, or cross-cutting wiring.
++Companion files: `../DATA_MODELS.md`, `../WORKFLOWS.md`, `../modules/rag-engine.md`,
++`../modules/streaming.md`.
++
++---
++
++## 1. System context
++
++```
++┌──────────────────────────────────────────────────────────────────────────────┐
++│ Browser                                                                      │
++│   React 19 SPA (Vite 7, Tailwind v4, framer-motion)                          │
++│   frontend/src/store.tsx  ──►  frontend/src/lib/api.ts                       │
++│                                  ├── MockTransport  (ACTIVE, USE_MOCK=true)  │
++│                                  └── RealTransport  (incomplete, see API_REF) │
++└───────────────────────────┬──────────────────────────────────────────────────┘
++                            │ target: fetch + EventSource to /api/**
++┌───────────────────────────▼──────────────────────────────────────────────────┐
++│ FastAPI (uvicorn, BACKEND_WORKERS=4)                                         │
++│   app/main.py  ── lifespan ──► settings, vector store pools                  │
++│   app/api/endpoints/{health,documents,conversation}.py                       │
++│        │                     │                                               │
++│        │                     └─ SSE (sse-starlette EventSourceResponse)      │
++│        ▼                                                                     │
++│   app/api/crud.py  ──►  SQLAlchemy 2 async  ──►  PostgreSQL                  │
++│   app/ingestion/pdf.py ─┐                                                    │
++│   app/chat/engine.py  ──┼──►  LlamaIndex  ──►  pgvector (data_pg_vector_store)│
++│   app/chat/pg_vector.py ┘        │                                           │
++│                                  └──► Google Gemini (LLM + 3072-d embeddings)│
++│   app/storage/supabase.py  ──►  Supabase Storage (documents/{id}/original.pdf)│
++└──────────────────────────────────────────────────────────────────────────────┘
++```
++
++Everything is **one deployable service + one static SPA**. There is no cache tier, no message
++broker, no vector DB, and no auth service.
++
++---
++
++## 2. Process & deployment model
++
++### 2.1 Boot phases (`app/main.py`)
++
++| Phase | Where | Runs | Work |
++|---|---|---|---|
++| Deploy bootstrap | `start()` → `_bootstrap(release_connections=True)` | **once**, parent process | DB wait, Alembic head check, pgvector extension + DDL, NLTK punkt warm-up, release parent pools |
++| Handoff | `os.environ["FINCITE_BOOTSTRAP_DONE"]="1"` | once | children inherit env ⇒ skip bootstrap |
++| Worker lifespan (setup) | `lifespan()` before `yield` | per worker | `_setup_llama_index_settings()` in a thread; `vector_store.ensure_initialized()` (no DDL) |
++| Serving | uvicorn | per worker | stateless request handling |
++| Worker lifespan (teardown) | after `yield` | per worker | `vector_store.close()` |
++
++`uvicorn.run(..., reload=LOG_LEVEL=="DEBUG", workers=BACKEND_WORKERS)`: when reload is on,
++uvicorn **ignores** `workers` and runs a single reloading process. `reload` also means the
++module-level app is re-imported, so `nest_asyncio.apply()` and `Settings()` run again — harmless
++but noisy.
++
++If the app is started with `uvicorn app.main:app` instead of `start()`, the flag is absent and
++**each worker** runs `_bootstrap()`; the steps are idempotent (`did_run_setup`, `drop/create`
++guards, `CREATE EXTENSION IF NOT EXISTS`), but the Alembic check runs N times.
++
++### 2.2 Connection pools
++
++- `app/db/session.py:6` — one async engine per process: `pool_size=4`, `max_overflow=4`,
++  `pool_recycle=3600`, `pool_timeout=120`, `pool_pre_ping=True`.
++- `CustomPGVectorStore._connect()` (`chat/pg_vector.py:19`) **replaces** LlamaIndex's own async
++  engine/session with `app.db.session.engine` / `SessionLocal`, so a worker holds **one** pool,
++  not two. It still builds a small **sync** engine (psycopg2-style) for the base class's sync
++  paths.
++- `close()` (`pg_vector.py:27`) closes the sync session/engine and disposes the shared async
++  engine. Because the engine is shared, `close()` in one place affects the whole process — only
++  called at shutdown and in the parent's `_bootstrap(release_connections=True)`.
++
++### 2.3 DDL ownership
++
++| Object | Created by | Where |
++|---|---|---|
++| `uuid-ossp` extension | Alembic first migration | `alembic/versions/477cee72edc4_init_tables.py:21` |
++| relational tables + PG enums | Alembic | six migrations (single head `663b3fea3024`) |
++| `vector` extension | `run_setup()` | `chat/pg_vector.py:46` |
++| `data_pg_vector_store` (+ `data_pg_vector_store_metadata_col`) | `run_setup()` → `self._base.metadata.create_all` | `chat/pg_vector.py:53` |
++| Alembic freshness check | `check_current_head()` | `main.py:50` |
++
++`_create_tables_if_not_exists()` and `_create_extension()` are intentionally overridden to
++no-ops so LlamaIndex's lazy `_initialize()` never issues DDL from a worker.
++
++---
++
++## 3. Backend module layers
++
++```
++HTTP layer        app/api/endpoints/*.py      validation, HTTP codes, response models
++      │
++Data access       app/api/crud.py             the ONLY module with SQLAlchemy queries
++      │
++ORM               app/models/db.py            tables, PG enums
++      │
++Domain services   app/chat/*, app/ingestion/*, app/storage/*, app/llama_index_settings.py
++      │
++Infrastructure    app/db/*, app/core/config.py
++```
++
++Dependency rules that hold today (keep them):
++
++- `endpoints → crud → models`; endpoints never build queries.
++- `chat/*` never imports `endpoints/*`; it consumes **Pydantic schemas** (`app.schema`) so the
++  engine is testable without a DB session.
++- `models/*` imports nothing from `chat/*` except `CBEventType` (`models/db.py:5`) used to
++  generate the sub-process enum.
++- `schema.py` imports `chat/constants.py` (`DB_DOC_ID_KEY`) and model enums — a deliberate
++  small cycle in the "types" direction.
++- `storage/supabase.py` is a leaf (only `core/config.py`).
++
++### Notable coupling to be aware of
++
++| Coupling | Consequence |
++|---|---|
++| `chat/pg_vector.py` reaches into `db/session.py` | vector store shares the app pool; closing one affects the other |
++| `core/config.py:83` mutates `os.environ` at import | importing the app has a global side effect on the Gemini SDK |
++| `chat/engine.py:64` calls `nest_asyncio.apply()` at import | re-entrant loops; masks sync/async mistakes (e.g. `VectorStoreIndex.from_documents` inside an async handler) |
++| `models/db.py` derives enum values from LlamaIndex's `CBEventType` | upgrading `llama-index-core` can add enum values the DB type doesn't have ⇒ need a migration |
++
++---
++
++## 4. The RAG harness (`app/chat/engine.py`)
++
++### 4.1 Tier 1 — `ReActAgent`
++
++```python
++chat_llm = Gemini(model=settings.GEMINI_CHAT_LLM_NAME, api_key=settings.GOOGLE_API_KEY)   # :219
++question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)                           # :223
++document_question_engine = SubQuestionQueryEngine.from_defaults(...)                      # :225
++top_level_tools = [QueryEngineTool(document_question_engine, "document_question_engine")] # :233
++chat_engine = ReActAgent.from_tools(tools=top_level_tools, llm=chat_llm,
++                                    chat_history=chat_history, verbose=LOG_LEVEL=="DEBUG",
++                                    context=SYSTEM_MESSAGE.format(...), max_iterations=6) # :260
++```
++
++Exactly **one** top-level tool, described as an engine that answers *all* questions about the
++selected Indian financial documents. `context` carries the doc titles for the current
++conversation and today's date; the agent must consult tools before answering.
++
++### 4.2 Tier 2 — `SubQuestionQueryEngine`
++
++- `use_async=True` ⇒ sub-questions fan out concurrently.
++- `response_synthesizer=get_custom_response_synth(...)` — Refine + QA prompts that restate:
++  selected documents, preserve units, name the financial year, do not fabricate
++  (`qa_response_synth.py:16-66`).
++- `question_gen` reuses the same Gemini model, so one conversation makes many LLM calls
++  (question generation + N sub-answers + synthesis + ReAct steps).
++
++### 4.3 Tier 3 — per-document tools
++
++```python
++MetadataFilters([ExactMatchFilter(key=DB_DOC_ID_KEY, value=doc_id)])
++index.as_query_engine(similarity_top_k=3, filters=filters)   # engine.py:104-109
++```
++
++One tool per document, named by the **document UUID** and described by
++`build_description_for_document` (e.g. *"Annual report for Reliance Industries (RELIANCE),
++financial year 2025 (exchange: NSE)."*). The description is the routing signal — improve metadata
++before you touch retrieval parameters.
++
++### 4.4 Index acquisition
++
++`build_doc_id_to_index_map` (`engine.py:112`) iterates `conversation.documents`:
++
++```
++VectorStoreIndex.from_vector_store(vector_store, callback_manager)   # "load" attempt
++    on exception → fetch_and_read_document(doc) → VectorStoreIndex.from_documents(...)
++```
++
++⚠ The first call does not verify that vectors exist for that `doc_id` and does not raise for an
++empty document — see `AGENTS.md §14.H`. `fetch_and_read_document` downloads from Supabase
++Storage and falls back to `requests.get(document.url, stream=True)` inside a `TemporaryDirectory`.
++
++### 4.5 Chat history
++
++`get_chat_history` (`engine.py:153`) drops empty-content and non-`SUCCESS` messages, sorts by
++`created_at`, maps `MessageRoleEnum` → LlamaIndex `MessageRole`, and passes the list to
++`ReActAgent.from_tools(chat_history=...)`. The pending assistant message is never included
++because the conversation is loaded *before* the user message is inserted.
++
++---
++
++## 5. Observability bus (LlamaIndex callbacks → SSE)
++
++```
++LlamaIndex internals
++   │ CBEventType.{LLM, RETRIEVE, SYNTHESIZE, SUB_QUESTION, AGENT_STEP, …}
++   ▼
++ChatCallbackHandler (chat/messaging.py:33)
++   │ on_event_start / on_event_end → asyncio.create_task(async_on_event)
++   │ get_metadata_from_event: SUB_QUESTION → schema.QuestionAnswerPair (Q, A, citations)
++   ▼
++StreamedMessageSubProcess{source, has_ended, event_id, metadata_map}
++   ▼
++anyio MemoryObjectSendStream (capacity 100, endpoints/conversation.py:110)
++   ▼
++event_publisher: OrderedDict[event_id → MessageSubProcess]
++   │ start event creates a PENDING row; end event sets FINISHED and keeps created_at
++   ▼
++schema.Message.model_validate(message).model_dump_json()  → one SSE frame per event
++```
++
++Design consequence: **the client never assembles deltas** — every frame is a complete snapshot,
++so reconnection/resume is trivial and the same data shape is persisted at the end.
++
++The `source` value is `MessageSubProcessSourceEnum[event_type.name]`; because the enum is built
++from `CBEventType` plus `CONSTRUCTED_QUERY_ENGINE`/`SUB_QUESTIONS`, an unknown event name raises
++`KeyError` (and the task dies silently — see `AGENTS.md §14.D`).
++
++---
++
++## 6. Ingestion architecture
++
++```
++POST multipart
++   ├── _validate_pdf            content-type + %PDF magic bytes          documents.py:32
++   ├── sha256 + dedupe lookup   metadata_map->>'content_hash'            crud.py:155
++   ├── storage.upload_document  documents/{uuid}/original.pdf            supabase.py:44
++   ├── crud.create_document     Document(url, metadata_map)              crud.py:108
++   └── ingest_document          pdf.py:70
++         ├── storage.download_document(id)      → bytes
++         ├── load_pdf_from_bytes                → temp file → PDFReader.load_data(extra_info={db_document_id})
++         │                                        one LlamaIndex Document per PDF page, metadata.page_label
++         ├── StorageContext.from_defaults(vector_store=…)
++         ├── VectorStoreIndex.from_documents(show_progress=True)
++         │     SentenceSplitter(chunk_size=512, chunk_overlap=10)  (llama_index_settings.py:22)
++         │     GeminiEmbedding(3072-d) → INSERT into data_pg_vector_store
++         └── index.set_index_id(document_id)
++```
++
++Rollback matrix:
++
++| Failure point | Cleanup |
++|---|---|
++| storage upload | nothing persisted |
++| DB insert | `delete_document(id)` (storage) |
++| indexing | `crud.delete_document_by_id` + `delete_document(id)` → HTTP 422 |
++
++Note the rollback does **not** delete partially written vector rows. If `from_documents` fails
++mid-batch, orphan vectors can remain (they are harmless — filtered by a `db_document_id` that no
++longer has a `Document` row — but they cost storage).
++
++---
++
++## 7. Frontend architecture
++
++### 7.1 Layers
++
++```
++index.html
++  └─ src/main.tsx (StrictMode)
++       └─ App.tsx
++            ├─ StoreProvider (store.tsx)             ← all app state
++            └─ Shell
++                 ├─ Ticker (static mock data)
++                 ├─ Sidebar (conversations, docs count, health dot)
++                 ├─ view switch: ChatView | LibraryView   (animated with AnimatePresence)
++                 ├─ SourceDrawer / Toasts / Splash   (global overlays)
++                 └─ <Analytics/> (@vercel/analytics)
++```
++
++There is **no router**: `view: "chat" | "library"` in the store drives the screen. Overlays
++(`SourceDrawer`, `UploadDrawer`, `DocDetailDrawer`, mobile nav) are controlled by store fields or
++local `useState`, never by URLs.
++
++### 7.2 Store design (`store.tsx`)
++
++One context, ~30 fields, three concerns:
++
++| Concern | State | Notable functions |
++|---|---|---|
++| Documents | `documents`, `uploading`, `libraryOpenDocId` | `refreshDocuments`, `uploadFiles`, `watchDocument` (900 ms polling until `ready`/`failed`) |
++| Conversations | `conversations`, `activeId`, `active`, `streaming` | `send`, `selectConversation`, `newChat`, `deleteConversation`, `setScope`, `startScopedChat`, `stopStreaming` |
++| Chrome | `view`, `mobileNav`, `health`, `selectedSource`, `toasts`, `booted` | `boot`, `checkHealth`, `pushToast`, `openSource`, `closeSource` |
++
++`patchConversation(id, fn)` is the single mutation primitive for a thread; it re-sorts threads by
++`updated_at` descending. Streaming patches the **last** assistant message by index and role.
++`send()` guards with `streaming` (one in-flight answer per tab).
++
++### 7.3 Transport facade (`lib/api.ts`)
++
++`export const api = { … }` exposes 7 methods. Each is `USE_MOCK ? mock.x() : new RealTransport().x()`.
++`MockTransport` simulates: upload progress ticks → 4-stage indexing pipeline (`STAGE_MS`) →
++`ready`; canned answer selection by regex (`ANSWER_BANK`) → timed sub-process plan → token
++stream (~12-26 ms per 1-2 chars) → `onDone` with sources. `RealTransport` is a partial stub (see
++`AGENTS.md §14.B`).
++
++### 7.4 Design system
++
++`src/index.css` `@theme` defines: colours (`bone paper faint line line-dark ink soot soot-2 moss
++accent accent-deep accent-soft pine pine-soft rust rust-soft gold`), fonts (`font-display` =
++Fraunces, `font-sans` = Space Grotesk, `font-mono` = IBM Plex Mono), animations (`animate-marquee`,
++`animate-pulse-dot`) and utilities (`.tnum` tabular numerals, `.stream-caret`, `.dark-scroll`,
++`.md-table`). Body has an SVG-noise grain overlay; scrollbars are thin.
++
++Aesthetic rules in practice: sharp corners (no border radius), hairline borders, uppercase
++9-10 px mono labels with wide tracking, serif display headings, one orange accent, motion used
++only for entrance and panel slides.
++
++### 7.5 Build
++
++`vite.config.ts`: `react()` + `tailwindcss()` + `viteSingleFile()`, alias `@ → src` (defined in
++both Vite and `tsconfig.json`). `vite build` emits **one** `dist/index.html` (~622 kB, ~189 kB
++gzip) — no code splitting, everything inlined, fonts still fetched from Google Fonts CDN.
++
++---
++
++## 8. Extension points (where to add things)
++
++| Goal | Touch these files |
++|---|---|
++| New endpoint | `api/endpoints/<area>.py` → register in `api/api.py`; add schema in `schema.py`; SQL in `crud.py`; test in `tests/app/…` |
++| New document metadata field | `schema.NSEDocumentMetadata` → `documents.py` form param → `chat/utils.py` (title/description) → frontend `types.ts` + drawers |
++| Change chunking/embeddings | `chat/constants.py` (chunk), `llama_index_settings.py`, **plus a migration/reindex** if `VECTOR_STORE_EMBED_DIM` changes |
++| New agent tool | `chat/engine.py` (`top_level_tools`) + tool description in `chat/utils.py`/constants |
++| New streamed UI metric | `chat/messaging.py` (`get_metadata_from_event`) + `schema.SubProcessMetadataKeysEnum` + `ResearchTrail`/`types.ts` |
++| Swap LLM provider | `llama_index_settings.py` + `engine.py:219` (both construct `Gemini` explicitly) + `core/config.py` |
++| Real backend mode | `lib/api.ts` (`USE_MOCK`, `RealTransport`), plus a wire⇄domain mapper module that does not exist yet |
++| Background indexing | new queue module + `documents.py` (return 202) + progress endpoint + `store.watchDocument` |
++
++---
++
++## 9. Failure modes & resilience
++
++| Symptom | Likely cause | Where |
++|---|---|---|
++| App exits at boot: "Database is not up to date" | migrations behind head | `main.py:95` |
++| 500 on first upload | Supabase env missing (`RuntimeError`) | `storage/supabase.py:28` |
++| Empty answers, no citations | documents have no vectors (reuse "worked") | `engine.py:126` |
++| SSE hangs forever | callback task raised (e.g. `KeyError` on unknown `CBEventType`) and the channel never closed | `messaging.py:101` |
++| 500 deleting a thread | FK violation, no cascade | `crud.py:57` |
++| Frontend shows stale data | `RealTransport` mismatch / poller stopped | `api.ts`, `store.tsx:108` |
++| `ModuleNotFoundError: fire` | running any `scripts/*.py` | `pyproject.toml` |
++| Long upload timeouts | synchronous embedding inside the request | `ingestion/pdf.py:107` |
+diff --git a/docs/agents/DATA_MODELS.md b/docs/agents/DATA_MODELS.md
+new file mode 100644
+index 0000000..e98c740
+--- /dev/null
++++ b/docs/agents/DATA_MODELS.md
+@@ -0,0 +1,281 @@
++# DATA MODELS — fincitee
++
++Everything persisted or transmitted, with the exact Python/TypeScript shapes and the places that
++produce them. Migration chain: `477cee72edc4` → `c008bb4f3f48` → `90a1d6a26343` →
++`1b0b616e08c6` → `873c0c4616ea` → `663b3fea3024` (**head**, single head).
++
++---
++
++## 1. Conventions
++
++`app/models/base.py:6`
++
++```python
++class Base(DeclarativeBase):
++    id = Column(UUID, primary_key=True, index=True, default=func.uuid_generate_v4())
++    created_at = Column(DateTime, server_default=func.now(), nullable=False)
++    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
++
++    @declared_attr
++    def __tablename__(cls) -> str:
++        return cls.__name__.lower()
++```
++
++- `id` is a **DB-side** default (`uuid_generate_v4()`), so a flushed row has an id but a
++  transient one does not. Requires the `uuid-ossp` extension (created in migration #1).
++- Table names are the lowercased class name: `messagesubprocess`, `conversationdocument`.
++- Timestamps are naive UTC (`DateTime`), set by the server; `updated_at` is maintained by
++  SQLAlchemy `onupdate` (not a DB trigger).
++- Two different `UUID` types are in play: generic `sqlalchemy.UUID` in `models/base.py`,
++  dialect `postgresql.UUID(as_uuid=True)` for FKs in `models/db.py`.
++
++---
++
++## 2. ER diagram
++
++```
++CONVERSATION 1───* MESSAGE 1───* MESSAGESUBPROCESS
++      │
++      └──1──* CONVERSATIONDOCUMENT *──1── DOCUMENT
++                                             │
++                                             └──(metadata_.db_document_id)── data_pg_vector_store
++```
++
++There is **no FK** between `DOCUMENT` and the vector table — the link is the JSONB key
++`db_document_id` inside each vector row's `metadata_`.
++
++---
++
++## 3. Tables
++
++### 3.1 `conversation` (`models/db.py:52`)
++
++| Column | Type | Null | Notes |
++|---|---|---|---|
++| id | UUID | no | PK, default `uuid_generate_v4()`, indexed (`ix_conversation_id`) |
++| created_at | timestamp | no | `now()` |
++| updated_at | timestamp | no | `now()` + ORM onupdate |
++
++Relationships: `messages` → `Message.conversation`; `conversation_documents` →
++`ConversationDocument.conversation`. No cascade configured.
++
++### 3.2 `document` (`models/db.py:41`)
++
++| Column | Type | Null | Notes |
++|---|---|---|---|
++| id | UUID | no | PK |
++| url | varchar | **no** | **UNIQUE** — Supabase public URL of the PDF |
++| metadata_map | JSONB | yes | NSE metadata + content hash (below) |
++| created_at / updated_at | timestamp | no | |
++
++Created in migration `90a1d6a26343`. `crud.upsert_document_by_url` uses
++`INSERT … ON CONFLICT (url) DO UPDATE SET metadata_map = …` (Postgres dialect insert).
++
++`metadata_map` (written at `api/endpoints/documents.py:143`):
++
++```jsonc
++{
++  "nse_document": {
++    "company_name": "Reliance Industries Limited",   // required
++    "company_symbol": "RELIANCE",                    // optional
++    "document_type": "annual_report",                 // enum, default annual_report
++    "financial_year": "2025",                         // string, not int
++    "report_date": "2025-08-28T12:00:00",             // ISO datetime or null
++    "exchange": "NSE",                                // default "NSE"
++    "original_filename": "reliance-ar.pdf"
++  },
++  "content_hash": "<sha256 hex>",                     // duplicate detection key
++  "original_filename": "reliance-ar.pdf"              // duplicated at top level
++}
++```
++
++Lookup helper: `crud.fetch_document_by_content_hash` uses
++`Document.metadata_map["content_hash"].astext == content_hash` (`crud.py:162`).
++
++### 3.3 `conversationdocument` (`models/db.py:63`)
++
++| Column | Type | Null | Notes |
++|---|---|---|---|
++| id | UUID | no | PK |
++| conversation_id | UUID | yes | FK → `conversation.id`, indexed |
++| document_id | UUID | yes | FK → `document.id`, indexed |
++| created_at / updated_at | timestamp | no | |
++
++Created in `90a1d6a26343`; indexes added in `873c0c4616ea`. No unique constraint on
++`(conversation_id, document_id)` — the same document can be linked twice if the API is called
++with duplicates.
++
++### 3.4 `message` (`models/db.py:76`)
++
++| Column | Type | Null | Notes |
++|---|---|---|---|
++| id | UUID | no | PK |
++| conversation_id | UUID | yes | FK → `conversation.id`, indexed |
++| content | varchar | yes (DB) | **but `schema.Message.content: str` is required** |
++| role | `MessageRoleEnum` | yes | `user` / `assistant` |
++| status | `MessageStatusEnum` | yes | default in ORM: `PENDING` |
++
++### 3.5 `messagesubprocess` (`models/db.py:91`)
++
++| Column | Type | Null | Notes |
++|---|---|---|---|
++| id | UUID | no | PK |
++| message_id | UUID | yes | FK → `message.id`, indexed |
++| source | `MessageSubProcessSourceEnum` | yes | LlamaIndex event name |
++| status | `MessageSubProcessStatusEnum` | **no** | default `FINISHED` |
++| metadata_map | JSONB | yes | e.g. `{"sub_question": {...}}` |
++
++`schema.MessageSubProcess.metadata_map` is keyed by `SubProcessMetadataKeysEnum.SUB_QUESTION`
++(= LlamaIndex `EventPayload.SUB_QUESTION.value`, i.e. `"sub_question"`).
++
++```jsonc
++{"sub_question": {
++   "question": "What was Reliance's FY2025 consolidated revenue?",
++   "answer": "₹ 10,71,774 crore …",
++   "citations": [{"document_id":"<uuid>","text":"…","page_number":112,"score":0.83}]
++}}
++```
++
++Migration history for this table: created with a `content` varchar (`477cee72edc4`), then
++`content` dropped and `status` + `metadata_map` added (`c008bb4f3f48`).
++
++---
++
++## 4. PostgreSQL enums
++
++| Enum (PG type name) | Values | Created / extended by |
++|---|---|---|
++| `MessageRoleEnum` | `user`, `assistant` | `477cee72edc4` |
++| `MessageStatusEnum` | `PENDING`, `SUCCESS`, `ERROR` | `477cee72edc4` |
++| `MessageSubProcessStatusEnum` | `PENDING`, `FINISHED` | `c008bb4f3f48` |
++| `MessageSubProcessSourceEnum` | every `CBEventType` name + `CONSTRUCTED_QUERY_ENGINE`, `SUB_QUESTIONS` | `477cee72edc4` → +`SUB_QUESTIONS` (`c008bb4f3f48`) → +`SUB_QUESTION` (`1b0b616e08c6`) → +`AGENT_STEP`, `TEMPLATING`, `FUNCTION_CALL`, `RERANKING`, `EXCEPTION` (`663b3fea3024`) |
++
++The source enum is **generated at import time** from LlamaIndex:
++
++```python
++MessageSubProcessSourceEnum = Enum(
++    "MessageSubProcessSourceEnum",
++    [(e.name, e.value) for e in CBEventType] + [("CONSTRUCTED_QUERY_ENGINE", …), ("SUB_QUESTIONS", …)],
++)
++```
++
++Adding values requires the rename→create→alter→drop dance used by every "update sub process
++columns" migration (`replace_enum_values`), because Postgres cannot drop enum values in place.
++
++---
++
++## 5. Vector store
++
++Managed entirely by `llama_index.vector_stores.postgres.PGVectorStore`
++(`app/chat/pg_vector.py:71`):
++
++```python
++CustomPGVectorStore.from_params(
++    url.host, url.port or 5432, url.database, url.username, url.password,
++    settings.VECTOR_STORE_TABLE_NAME,          # "pg_vector_store"
++    embed_dim=settings.VECTOR_STORE_EMBED_DIM, # 3072
++)
++```
++
++| Property | Value |
++|---|---|
++| Data table | `data_pg_vector_store` (`data_` + table name) |
++| Metadata table | `data_pg_vector_store_metadata_col` |
++| Vector type | `vector(3072)` (pgvector), cosine distance |
++| Columns | `id`, `node_id`, `text`, `metadata_` (JSONB), `embedding` |
++| Per-doc key | `metadata_->>'db_document_id'` = `document.id` (constant `DB_DOC_ID_KEY`) |
++| Page key | `metadata_->>'page_label'` (string; `Citation.from_node` casts to `int`) |
++| Index id | `index.set_index_id(document_id)` (ingestion) — informational |
++| Created by | `CustomPGVectorStore.run_setup()` (extension + `create_all`), once per deploy |
++
++Chunking settings that determine table content: `SentenceSplitter(chunk_size=512,
++chunk_overlap=10)` (`chat/constants.py:25`, applied in `llama_index_settings.py:22`).
++
++> Changing `VECTOR_STORE_EMBED_DIM` or the embedding model requires dropping/recreating
++> `data_pg_vector_store*` and re-indexing every document.
++
++---
++
++## 6. Pydantic API schemas (`app/schema.py`)
++
++| Model | Fields | Notes |
++|---|---|---|
++| `Base` | `id: UUID?`, `created_at: datetime?`, `updated_at: datetime?` | `from_attributes=True` |
++| `BaseMetadataObject` | — | `from_attributes=True` |
++| `Citation` | `document_id: UUID`, `text: str`, `page_number: int`, `score: float?` | `from_node()` builds it from a `NodeWithScore`; validator returns `str` for `document_id` |
++| `QuestionAnswerPair` | `question: str`, `answer: str?`, `citations: List[Citation]?` | `from_sub_question_answer_pair()` |
++| `SubProcessMetadataKeysEnum` | `SUB_QUESTION = "sub_question"` | |
++| `MessageSubProcess` | `message_id: UUID`, `source`, `status`, `metadata_map: dict?` | |
++| `Message` | `conversation_id: UUID`, `content: str`, `role`, `status`, `sub_processes: List[MessageSubProcess]` | `sub_processes` is **required** |
++| `UserMessageCreate` | `content: str` | declared but unused by endpoints (they take a query param) |
++| `DocumentMetadataKeysEnum` | `NSE_DOCUMENT = "nse_document"` | |
++| `NSEDocumentTypeEnum` | `annual_report`, `financial_results`, `corporate_filing`, `investor_presentation`, `other` | |
++| `NSEDocumentMetadata` | `company_name` (required), `company_symbol?`, `document_type=annual_report`, `financial_year?`, `report_date?`, `exchange="NSE"`, `original_filename?` | |
++| `Document` | `url: str`, `metadata_map: dict?` | |
++| `DocumentUploadResponse` | + `url`, `metadata_map`, `status="indexed"` | 201 body |
++| `Conversation` | `messages: List[Message]`, `documents: List[Document]` | |
++| `ConversationCreate` | `document_ids: List[UUID]` | 404 if any id is unknown |
++
++`schema.py` imports `DB_DOC_ID_KEY` from `chat/constants.py` and the four enums from
++`models/db.py` — it is the junction between the ORM and the HTTP contract.
++
++---
++
++## 7. Frontend domain types (`frontend/src/lib/types.ts`)
++
++⚠ Lines 1-4 open a `/**` comment that is only closed on line 22, so the first four exported
++types are commented out and do not exist at runtime/typecheck
++(see `AGENTS.md §14.A`).
++
++| Type | Shape |
++|---|---|
++| `NSEDocumentType` | `annual_report \| quarterly_results \| concall_transcript \| investor_presentation \| shareholding_pattern \| corporate_announcement` |
++| `DocumentStatus` | `uploading \| parsing \| chunking \| embedding \| indexing \| ready \| failed` |
++| `DocumentMetadata` | `company_name, nse_symbol, document_type, fiscal_year, period, pages, file_size, language` |
++| `FinDocument` | `id, filename, status, progress, metadata, uploaded_at` |
++| `SubProcessSource` | `llm \| retrieval \| rerank \| parser` |
++| `SubProcessStatus` | `pending \| running \| completed \| failed` |
++| `MessageSubProcess` | `id, name, source, status, detail?, duration_ms?` |
++| `MessageRole` / `MessageStatus` | `user\|assistant` / `pending\|processing\|streaming\|completed\|failed` |
++| `Source` | `index, document_id, page, excerpt, score` |
++| `ChatMessage` | `id, conversation_id, role, content, status, sub_processes, sources, created_at` |
++| `Conversation` | `id, title, document_scope[], messages[], created_at, updated_at` |
++| `ConversationCreate` | `title, document_scope?` |
++| `DocumentUploadResponse` | `{ document: FinDocument }` |
++| `HealthResponse` | `status: healthy \| degraded \| down` |
++| `View` | `chat \| library` |
++
++### 7.1 Backend ⇄ frontend mismatch matrix (must be bridged before real mode)
++
++| Concept | Backend | Frontend |
++|---|---|---|
++| Document id field | `Document.id` (UUID) | `FinDocument.id` (string, often `doc_*` mock ids) |
++| Filename | `metadata_map.original_filename` | `FinDocument.filename` |
++| Company ticker | `nse_document.company_symbol` | `metadata.nse_symbol` |
++| Financial year | `nse_document.financial_year` | `metadata.fiscal_year` (e.g. `"FY2023-24"`) |
++| Document type values | `financial_results`, `corporate_filing`, `investor_presentation`, `other` | `quarterly_results`, `concall_transcript`, `shareholding_pattern`, `corporate_announcement` |
++| Page count / file size / period | not stored | `metadata.pages`, `metadata.file_size`, `metadata.period` |
++| Indexing status | implicit (`status:"indexed"` on upload; no polling endpoint) | 7-state `DocumentStatus` driven by the mock pipeline |
++| Message status | `PENDING \| SUCCESS \| ERROR` | `pending \| processing \| streaming \| completed \| failed` |
++| Sub-process shape | `{message_id, source: CBEventType, status: PENDING\|FINISHED, metadata_map}` | `{id, name, source: llm\|retrieval\|rerank\|parser, status: pending\|running\|completed\|failed, detail?, duration_ms?}` |
++| Citations | `metadata.sub_question.citations[{document_id,text,page_number,score}]` | top-level `ChatMessage.sources[{index,document_id,page,excerpt,score}]` |
++| Conversation create | `{document_ids: [uuid]}` | `{title, document_scope: [id]}` |
++| Conversation title | not persisted | client-side only |
++| SSE frames | unnamed events, full `Message` JSON | expects `sub_process` / `delta` / `done` events |
++
++A mapper module is required (the README's `lib/backend.ts` does not exist).
++
++---
++
++## 8. Schema change playbook
++
++1. Edit `app/models/db.py` (and/or enums). If you add an enum **value**, you also need the
++   rename/recreate dance (see §4) — Alembic autogenerate will not do it.
++2. `cd backend && uv run alembic revision --autogenerate -m "…"` — review the generated file:
++   enum changes and `server_default` edits are frequently missed.
++3. `uv run alembic upgrade head`; `uv run alembic heads` must show exactly one head.
++4. Update `app/schema.py` if the API shape changes; update `frontend/src/lib/types.ts` to match.
++5. Update `docs/agents/DATA_MODELS.md` (this file) in the same commit.
++6. If the change affects vector metadata (`db_document_id`, `page_label`), plan a re-index.
++7. Remember `_bootstrap()` refuses to start when the DB is not at head — deploy migrations
++   before the new image.
+diff --git a/docs/agents/DEVELOPMENT.md b/docs/agents/DEVELOPMENT.md
+new file mode 100644
+index 0000000..94626f8
+--- /dev/null
++++ b/docs/agents/DEVELOPMENT.md
+@@ -0,0 +1,228 @@
++# DEVELOPMENT — fincitee
++
++Setup, run, build, test, and troubleshoot. Verified commands are marked ✅ with the observed
++output; ❌ marks commands that currently fail (see `AGENTS.md §14`).
++
++---
++
++## 1. Prerequisites
++
++| Requirement | Version | Notes |
++|---|---|---|
++| Python | **3.11.x** (`>=3.11,<3.12`; lock is `==3.11.*`) | 3.12 will not resolve `uv.lock` |
++| uv | any recent | installs from `backend/uv.lock` |
++| Node + npm | Node 20+ | frontend only |
++| PostgreSQL + pgvector | 14+ | Supabase project **or** `ankane/pgvector` via compose |
++| Supabase project | — | Storage bucket (default `annual-reports`) + service-role key |
++| Google AI key | — | https://aistudio.google.com/apikey |
++
++There is no `Makefile`, no `justfile`, no CI workflow, and no task runner.
++
++---
++
++## 2. Backend setup
++
++```bash
++cd backend
++cp .env.example .env          # then edit
++uv sync                       # ✅ installs runtime + dev group from uv.lock
++uv run alembic upgrade head    # ✅ single head: 663b3fea3024
++uv run start                  # bootstrap + uvicorn on 0.0.0.0:8000
++```
++
++Minimum `.env` to boot:
++
++```dotenv
++DATABASE_URL=postgresql://postgres:<pw>@<host>:5432/postgres
++GOOGLE_API_KEY=<key>
++# required for anything that touches Storage (i.e. all uploads):
++SUPABASE_URL=https://<project>.supabase.co
++SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
++SUPABASE_STORAGE_BUCKET=annual-reports
++```
++
++`DATABASE_URL` may be written as `postgres://…`, `postgresql://…` or
++`postgresql+asyncpg://…`; `core/config.py:54` normalises it to asyncpg form. The sync head-check
++engine rewrites it back to `psycopg2`.
++
++**Supabase storage layout:** bucket `SUPABASE_STORAGE_BUCKET`, object key
++`documents/{document_id}/original.pdf`. Create the bucket before the first upload.
++
++**Local DB instead of Supabase:**
++
++```bash
++cd backend && docker compose up -d db       # ankane/pgvector on the compose network
++# ⚠ compose maps 127.0.0.1:5433:5433 but Postgres listens on 5432 — see AGENTS.md §14.F
++docker compose exec db psql -U user -d fincite_db -c 'CREATE EXTENSION IF NOT EXISTS vector;'
++```
++
++The backend container gets `DATABASE_URL=postgresql://user:password@db:5432/fincite_db`. Storage
++still requires real Supabase credentials even in local mode.
++
++---
++
++## 3. Frontend setup
++
++```bash
++cd frontend
++npm ci          # ✅ 6-7 s
++npm run dev     # vite dev server (default http://localhost:5173)
++npm run build   # ✅ single-file dist/index.html (~622 kB, ~189 kB gzip)
++npm run preview # serve the built file
++```
++
++Only three scripts exist (`dev`, `build`, `preview`). The README mentions `dev:mock`,
++`typecheck` and `check:adapter` — **they do not exist**.
++
++**Current mode:** `frontend/src/lib/api.ts:32` `export const USE_MOCK = true;` — the UI runs
++entirely on `lib/mockData.ts` (5 seeded filings, 4 canned Q&A banks). No backend is contacted, so
++`npm run dev` alone gives a fully interactive demo. Flipping the constant to `false` exposes an
++incomplete `RealTransport` (§`API_REFERENCE.md §6`) — do not ship that.
++
++**If you need a live dev proxy** (it does not exist yet), add to `vite.config.ts`:
++
++```ts
++server: { proxy: { "/api": { target: "http://localhost:8000", changeOrigin: true } } }
++```
++
++and then switch `BASE_URL` to `""`/relative so the browser calls the same origin.
++
++---
++
++## 4. Tests
++
++```bash
++cd backend && uv run pytest -q
++```
++
++✅ Observed: **15 passed, 4 warnings in ~8 s**. No database, no API key, no network — `conftest.py`
++injects dummy env vars before import and every external boundary is patched.
++
++Warnings you will see (all third-party, ignore): `supabase`/`gotrue`/`supafunc` deprecations,
++`google.generativeai` end-of-life, `google.api_core` Python-version notice.
++
++```bash
++cd frontend && npx tsc --noEmit
++```
++
++❌ Observed: **5 errors** — `types.ts` has an unterminated leading comment (swallows four type
++exports) plus one unused import in `Sidebar.tsx`. Fix those two files before trusting typecheck.
++
++There is **no** frontend test runner, no integration test, no evaluation harness for answer
++quality (the README lists the latter as roadmap).
++
++---
++
++## 5. Linting / formatting
++
++None configured.
++
++- `pylint==2.17.5` is a dev dependency but there is no `.pylintrc` / `[tool.pylint]`; a bare run
++  will produce mostly style noise.
++- No ESLint, Prettier, or Biome config; no `format` script.
++- The de-facto checks are `uv run pytest`, `npx tsc --noEmit`, and `npm run build`.
++
++Do not add a linter to the repo without asking (see `AGENTS.md §15`).
++
++---
++
++## 6. Database & migrations
++
++```bash
++cd backend
++uv run alembic current          # applied revision
++uv run alembic heads            # 663b3fea3024 (head) — must be exactly one
++uv run alembic upgrade head
++uv run alembic revision --autogenerate -m "add x"
++uv run alembic downgrade -1     # review before use: enum downgrades are lossy
++```
++
++- `alembic/env.py` overrides `sqlalchemy.url` with `settings.DATABASE_URL` (printed on every run),
++  so `alembic.ini`'s `llama_app_db` default is dead weight.
++- Migrations run on an **async** engine (`asyncio.run(run_async_migrations())`).
++- The app refuses to boot when the DB is not at head (`main.py:95`).
++- Enum changes require the manual rename/create/alter/drop pattern (`replace_enum_values`) used in
++  `c008bb4f3f48`, `1b0b616e08c6`, `663b3fea3024`.
++- Vector tables are **not** managed by Alembic — `CustomPGVectorStore.run_setup()` creates them
++  at deploy time (`chat/pg_vector.py:39`). Recreating them means re-indexing every document.
++
++Inspect state:
++
++```sql
++SELECT version_num FROM alembic_version;
++SELECT id, metadata_map->'nse_document'->>'company_name' AS company FROM document;
++SELECT count(*), metadata_->>'db_document_id' FROM data_pg_vector_store GROUP BY 2;
++```
++
++---
++
++## 7. Scripts (`backend/scripts/`)
++
++| Script | Purpose | Status |
++|---|---|---|
++| `chat_llama.py` | interactive CLI over the SSE API (`fetch`, `select`, `create`, `message`); needs `requests` + `sseclient-py` | works (no `fire` import) |
++| `build_vector_tables.py` | manual `run_setup()` | ❌ `import fire` — not a dependency |
++| `dedupe_vector_store.py` | dedupe rows in `data_pg_vector_store` (interactive confirm) | ❌ `import fire` |
++| `upsert_document.py` | insert a `Document` row by URL | ❌ `import fire` |
++
++Run the CLI:
++
++```bash
++cd backend && uv run python scripts/chat_llama.py --base_url http://localhost:8000
++(Pick📄) fetch ⏎  select 0 ⏎  finish ⏎
++(Chat🦙) create ⏎  message What was FY2025 revenue? ⏎
++```
++
++---
++
++## 8. Docker
++
++```bash
++cd backend
++docker compose up --build          # backend + db
++```
++
++`Dockerfile` (python:3.11.3-slim-bullseye): copies `uv`, runs
++`uv sync --frozen --no-dev --no-install-project`, pre-downloads NLTK `punkt`/`punkt_tab`, copies
++source, `uv sync --frozen --no-dev`, then `CMD ["/app/.venv/bin/start"]` (avoids re-syncing the
++dev group at start). Workdir `/app` = `backend/`, so `alembic.ini` resolves.
++
++Compose caveats: `.env` is loaded via `env_file`; `DATABASE_URL` and `BACKEND_CORS_ORIGINS` are
++overridden; the DB port mapping is wrong (`5433:5433`) and `version: '3'` is obsolete; the backend
++port is published on `127.0.0.1:8000` only.
++
++---
++
++## 9. Environment recipes
++
++**Backend only, no frontend** — Swagger at `http://localhost:8000/api/docs`; use
++`/test_message` (SSE is not rendered) or `curl -N` on `/message`.
++
++**Frontend only, no backend** — `npm run dev`; everything is mock (`USE_MOCK = true`), including
++uploads (simulated 4-stage pipeline) and health (`healthy`).
++
++**Full stack with a remote DB** — set `.env` to the Supabase pooled connection string, run
++`uv run alembic upgrade head` once, `uv run start`, then either fix `RealTransport` or keep using
++the mock UI for screenshots.
++
++**Preview build** — `npm run build` produces one self-contained `dist/index.html` you can serve
++from any static host. Fonts are still loaded from `fonts.googleapis.com` (`index.html`), so an
++offline environment falls back to Georgia/system fonts.
++
++---
++
++## 10. Troubleshooting
++
++| Symptom | Likely cause | Fix |
++|---|---|---|
++| `ModuleNotFoundError: fire` running a script | `fire` not declared | add dependency or use `argparse` |
++| `pytest` can't import `app` | run from repo root | `cd backend` first |
++| `Settings` validation error on import | `DATABASE_URL` / `GOOGLE_API_KEY` unset | export both (or rely on `conftest.py` in tests) |
++| Boot: "Database is not up to date" | migrations behind | `uv run alembic upgrade head` |
++| Upload 500 "must be set to use Supabase Storage" | missing `SUPABASE_*` | set them; restart |
++| Upload 422 | unreadable/corrupt PDF, or embeddings failed | check logs with `LOG_LEVEL=DEBUG`, retry smaller file |
++| Answers have no citations | nodes missing `db_document_id`/`page_label`, or doc not indexed | re-upload; verify with the SQL above |
++| Deleting a thread 500s | FK violation (no cascade) | see `AGENTS.md §14.E` |
++| `tsc` errors about `FinDocument` | broken comment in `types.ts` | close the `/**` on line 1-4 |
++| Frontend shows data that does not exist in the DB | mock transport | expected (`USE_MOCK = true`) |
++| Vite build enormous | `viteSingleFile()` inlines everything | expected by design |
+diff --git a/docs/agents/WORKFLOWS.md b/docs/agents/WORKFLOWS.md
+new file mode 100644
+index 0000000..d99c287
+--- /dev/null
++++ b/docs/agents/WORKFLOWS.md
+@@ -0,0 +1,316 @@
++# WORKFLOWS — fincitee
++
++End-to-end traces for the five flows that matter. Line references are to the current tree; read
++`../ARCHITECTURE.md` first if you need the layering context.
++
++| # | Flow | Entry point | Exit |
++|---|---|---|---|
++| W1 | Upload & index a filing | `POST /api/document/upload` | 201 `DocumentUploadResponse` |
++| W2 | Create a scoped conversation | `POST /api/conversation/` | `Conversation` with linked documents |
++| W3 | Ask a question (streamed RAG) | `GET /api/conversation/{id}/message` | SSE frames → persisted messages |
++| W4 | Frontend question (mock transport) | `Composer.submit` | rendered answer + research trail + sources |
++| W5 | Deploy bootstrap | `uv run start` | uvicorn serving N workers |
++
++---
++
++## W1 — Upload & index a filing
++
++**Call path:** `api/endpoints/documents.py:50 upload_document_endpoint`
++→ `crud` / `storage.supabase` / `ingestion.pdf` → `pgvector`
++
++```
++1  client            multipart POST /api/document/upload
++2  handler           read file → `content = await file.read()`                documents.py:81
++3  handler           empty? → 400                                              :82
++4  handler           _validate_pdf(file, content)                              :86 → :32
++                       content_type.split(";")[0] in {"application/pdf"} (or "")
++                       content.startswith(b"%PDF")
++5  handler           content_hash = sha256(content).hexdigest()                :89
++6  crud              fetch_document_by_content_hash(db, hash)                  :90
++                       → SELECT … WHERE metadata_map->>'content_hash' = hash
++                       HIT ⇒ return existing doc, status "indexed", 201        :97-104
++7  handler           resolved_company_name = company_name or title(filename)   :108
++8  handler           NSEDocumentMetadata(...)                                  :115
++9  handler           document_id = uuid4()                                     :124
++10 storage           upload_document(content, document_id)                     :129
++                       → storage.from_(bucket).upload("documents/{id}/original.pdf",
++                            file_options={"content-type":"application/pdf","upsert":"false"})
++                       raises RuntimeError ⇒ 500                               :130-134
++11 storage           get_document_url(document_id) → public URL                :137
++12 handler           schema.Document(id, url, metadata_map={nse_document,      :140-148
++                       content_hash, original_filename})
++13 crud              create_document(db, doc_schema) → INSERT + commit         :150
++                       exception ⇒ delete_document(id) → 500                   :152-159
++14 handler           vector_store = await get_vector_store_singleton()         :163
++15 ingestion         ingest_document(db_doc, vector_store)                     :164 → pdf.py:70
++       15a           download_document(document_id) → bytes                   pdf.py:89
++       15b           load_pdf_from_bytes(bytes, id)                           pdf.py:37
++                       TemporaryDirectory → write {id}.pdf
++                       PDFReader().load_data(path, extra_info={db_document_id: id})
++                       → one LlamaIndex Document per page, metadata.page_label
++                       empty result ⇒ ValueError "PDFReader produced no documents"
++       15c           StorageContext.from_defaults(vector_store=…)             pdf.py:102
++       15d           VectorStoreIndex.from_documents(llama_docs, show_progress=True)
++                       SentenceSplitter(512/10) → GeminiEmbedding(3072) → INSERT
++       15e           index.set_index_id(document_id)                          pdf.py:113
++16 handler           failure ⇒ crud.delete_document_by_id + delete_document    :166-174
++                       → 422 "PDF indexing failed…"
++17 handler           return DocumentUploadResponse(status="indexed")           :176
++```
++
++**Why the order matters.** Storage first, then DB, then vectors: each later step can be undone
++using the earlier artifacts (the rollback needs `document_id` to locate the object). The reverse
++order would leave orphan vectors with no `Document` row to filter against.
++
++**Observability.** `logger.info` at upload start, DB record created, indexing start/complete;
++`logger.error(..., exc_info=True)` before every 5xx.
++
++**Failure matrix**
++
++| Stage | Side effects | Recovery |
++|---|---|---|
++| validation | none | client error 400 |
++| dedupe hit | none | returns existing doc (no re-index!) |
++| storage upload | none (Supabase rejects) | 500 |
++| DB insert | storage object | object deleted, 500 |
++| PDF parse | storage + DB row | both deleted, 422 |
++| embeddings (mid-batch) | storage + DB row + **partial vectors** | row + object deleted; partial vectors are orphaned (harmless, never queried) |
++
++**Debugging**
++
++```sql
++SELECT id, metadata_map->>'content_hash' FROM document ORDER BY created_at DESC LIMIT 5;
++SELECT count(*) FROM data_pg_vector_store
++ WHERE metadata_->>'db_document_id' = '<document_id>';
++```
++
++If vectors exist but queries return nothing, check that `db_document_id` is present (it is a
++string, not a number) and that the dimension matches `VECTOR_STORE_EMBED_DIM`.
++
++---
++
++## W2 — Create a conversation
++
++```
++1  handler     ConversationCreate{document_ids}                          conversation.py:31
++2  handler     if payload.document_ids:
++                 found = crud.fetch_documents(db, ids=[str(x) …])      :41
++                 missing = supplied - found ⇒ 404 "Documents not found: …"   :44-48
++3  crud        conversation = Conversation()                            crud.py:45
++               ConversationDocument(document_id=…, conversation=…)     per id
++               db.add / add_all → commit → refresh                     :50-53
++4  crud        fetch_conversation_with_messages(db, conversation.id)    :54 → :11
++                 select(Conversation)
++                   .options(joinedload(messages).subqueryload(sub_processes))
++                   .options(joinedload(conversation_documents)
++                            .subqueryload(document))
++               → builds {"documents": [cd.document …]} then
++                 schema.Conversation(**convo_dict)
++5  returns     Conversation{messages: [], documents: [...]}
++```
++
++**Notes**
++
++- Document order is DB order, not request order.
++- Duplicate ids create duplicate join rows (no unique constraint).
++- The conversation "title" the UI shows is **client-side only** — no `title` column exists.
++- `schema.Conversation(**convo_dict)` relies on `conversation.__dict__` plus the synthesized
++  `documents` key; adding a field to the Pydantic model that is not an ORM attribute requires
++  updating this function.
++
++---
++
++## W3 — Ask a question (streamed RAG)
++
++This is the core flow. Two coroutines share one `anyio` channel.
++
++```
++client ──GET /message?user_message=…──►  message_conversation
++                                             │
++                              conversation = crud.fetch_conversation_with_messages   (:97)
++                              (loaded BEFORE the new user message is persisted)
++                              user_msg_obj = Message(role=user, status=SUCCESS)       (:101)
++                              send_chan, recv_chan = anyio.create_memory_object_stream(100)  (:110)
++                                             │
++                              return EventSourceResponse(event_publisher())           (:178)
++
++event_publisher (consumer)                                    handle_chat_message (producer)
++──────────────────────────                                    ────────────────────────────
++task = create_task(handle_chat_message(convo, user_msg, send_chan))
++message = Message(id=uuid4(), role=assistant, status=PENDING, sub_processes=[])
++event_id_to_sub_process = OrderedDict()
++async for msg in recv_chan:
++  StreamedMessage           → message.content = msg.content
++  StreamedMessageSubProcess → upsert row keyed by event_id
++                               (PENDING / FINISHED, keep original created_at)
++  yield schema.Message.model_validate(message).model_dump_json()
++|
++await task; if task.exception(): raise
++final_status = SUCCESS
++|
++db.add(user_msg_obj); db.add(message); await db.commit()
++final = crud.fetch_message_with_sub_processes(db, message_id)
++yield final.model_dump_json()
++
++                                                             async with send_chan:
++                                                               engine = await get_chat_engine(
++                                                                   ChatCallbackHandler(send_chan), convo)
++                                                               send CONSTRUCTED_QUERY_ENGINE (has_ended=True)
++                                                               resp = await engine.astream_chat(
++                                                                   "Remember - if I have asked a relevant
++                                                                    financial question, use your tools.\n\n" + q)
++                                                               async for text in resp.async_response_gen():
++                                                                   response_str += text
++                                                                   send StreamedMessage(content=response_str)
++                                                               if empty: send apology
++```
++
++### `get_chat_engine` internals (`chat/engine.py:181`)
++
++```
++callback_manager = CallbackManager([handler])
++doc_id_to_index = build_doc_id_to_index_map(callback_manager, conversation.documents)
++    per doc: VectorStoreIndex.from_vector_store(vector_store, callback_manager)
++             (fallback on exception: fetch_and_read_document → from_documents → set_index_id)
++id_to_doc = {str(doc.id): doc}
++tools = [QueryEngineTool(index_to_query_engine(doc_id, index),
++                         ToolMetadata(name=doc_id,
++                                      description=build_description_for_document(doc)))
++         for doc_id, index in doc_id_to_index.items()]
++response_synth = get_custom_response_synth(callback_manager, conversation.documents)
++chat_llm = Gemini(model=GEMINI_CHAT_LLM_NAME)
++question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)
++sub_q_engine = SubQuestionQueryEngine.from_defaults(tools, question_gen, response_synth,
++                                                    use_async=True, verbose=DEBUG)
++chat_history = get_chat_history(conversation.messages)
++context = SYSTEM_MESSAGE.format(doc_titles=…, curr_date=utcnow %Y-%m-%d)
++return ReActAgent.from_tools([document_question_engine], llm=chat_llm,
++                             chat_history=…, context=…, max_iterations=6)
++```
++
++### What the user sees per phase
++
++| Phase | SSE evidence | UI |
++|---|---|---|
++| engine built | `CONSTRUCTED_QUERY_ENGINE` (synthetic) | trail appears |
++| agent thinking | `LLM` / `AGENT_STEP` events | trail rows appear/complete |
++| sub-questions | one `SUB_QUESTION` per doc with Q/A/citations | trail shows questions, citations captured |
++| retrieval | `RETRIEVE` (top-3 per doc) | trail |
++| synthesis | `SYNTHESIZE` | trail |
++| tokens | `content` grows in each snapshot | streaming text with caret |
++| done | final frame `status: SUCCESS` + `sub_processes[].metadata_map` | citations grid, copy button |
++
++### Concurrency hazards (present today)
++
++1. `handle_chat_message` and `event_publisher` both enter `async with send_chan` — the stream is
++   closed twice.
++2. `on_event_start/end` schedule `asyncio.create_task(...)` and return immediately, so events may
++   be delivered after the producer finished and closed the channel; the handler checks
++   `send_chan._closed` then swallows `ClosedResourceError`.
++3. If the callback task raises (e.g. `KeyError` on an enum value not in
++   `MessageSubProcessSourceEnum`), nothing surfaces it: `event_publisher` just waits for the
++   channel to close. The request appears to hang.
++4. Client disconnect sets `_closed`; the producer stops sending tokens and returns without
++   persisting anything (`response_str` partial → messages are still committed by the consumer if
++   it is still running, but its `await task` may be cancelled).
++
++**Debugging a stuck stream**
++
++```bash
++# watch raw frames
++curl -N "localhost:8000/api/conversation/<ID>/message?user_message=hello"
++# then inspect persisted state
++curl localhost:8000/api/conversation/<ID> | jq '.messages[] | {role,status,sub:(.sub_processes|length)}'
++```
++
++Set `LOG_LEVEL=DEBUG` to get `verbose=True` on the agent/sub-question engine (very chatty) and
++uvicorn reload.
++
++---
++
++## W4 — Frontend question flow (mock transport)
++
++```
++Composer.submit                                              Composer.tsx:36
++  └─ store.send(q)                                           store.tsx:175
++       ├─ guard: q non-empty && !streaming
++       ├─ setStreaming(true); setView("chat"); setSelectedSource(null)
++       ├─ if no activeId: api.createConversation({title: first 46 chars})
++       │     → prepend to conversations, setActiveId
++       └─ api.streamMessage(cid, q, handlers)                lib/api.ts:195
++            MockTransport.streamMessage:
++              pickAnswer(q, scopedDocs)   ← ANSWER_BANK regex match or generic fallback
++              after(0)    onUserMessage
++              after(240)  onAssistantCreated (4-step plan, all "pending")
++              per step:   onSubProcess running → onSubProcess completed(+detail,duration)
++              then tokens (~12-26 ms, 1-2 chars each) → onToken
++              final:      onSubProcess last step completed → onDone({content, sources})
++```
++
++Store reactions:
++
++| Handler | Effect |
++|---|---|
++| `onUserMessage` | append user message, bump `updated_at` |
++| `onAssistantCreated` | append assistant placeholder (`status: processing`) |
++| `onSubProcess` | find the message owning `stepId`, merge patch into that step |
++| `onToken` | patch the **last** assistant message: `status: "streaming"`, `content += token` |
++| `onDone` | set `status: "completed"`, replace content, attach `sources`, `setStreaming(false)` |
++| `onError` | `status: "failed"`, toast "Answer interrupted" |
++
++Rendering:
++
++1. `MessageItem` (`components/MessageItem.tsx:11`) — user bubble right-aligned; assistant block
++   with brand row, `ResearchTrail` (while steps exist), streaming text (`.stream-caret`) or
++   `CiteMarkdown`, then the "Grounded sources" grid, then copy-answer.
++2. `CiteMarkdown` rewrites `[1]` → `[1](#cite-1)` and renders `#cite-*` links as buttons calling
++   `openSource`.
++3. `SourceDrawer` shows the cited passage, document monogram, page and score; "open in library"
++   sets `libraryOpenDocId` and switches view, where `DocDetailDrawer` opens automatically.
++4. `ResearchTrail` auto-collapses 1.4 s after the last step completes (`ResearchTrail.tsx:43`).
++
++**Stop button:** `store.stopStreaming()` calls the cancel closure returned by
++`api.streamMessage`, clears `streaming`, leaves the partial message in place.
++
++---
++
++## W5 — Deploy bootstrap
++
++```
++uv run start  (console script `start = "app.main:start"`)
++ └─ start()                                                      main.py:165
++     ├─ _setup_logging(LOG_LEVEL)                                :167 → :57
++     ├─ _setup_sentry()                                          :168 → :70
++     ├─ asyncio.run(_bootstrap(release_connections=True))        :174 → :81
++     │    ├─ check_database_connection()  30 × 1 s               wait_for_db.py:6
++     │    ├─ Alembic head check                                   main.py:88-100
++     │    │    Config("alembic.ini")  ← CWD-relative!
++     │    │    url.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
++     │    │    create_engine(url); MigrationContext.get_current_heads() vs ScriptDirectory.get_heads()
++     │    │    mismatch ⇒ Exception("Database is not up to date…")
++     │    ├─ (await get_vector_store_singleton()).run_setup()     pg_vector.py:39
++     │    │    CREATE EXTENSION IF NOT EXISTS vector
++     │    │    base.metadata.create_all  (data_pg_vector_store*)
++     │    │    guarded by module global did_run_setup
++     │    ├─ split_by_sentence_tokenizer()   (NLTK punkt download)
++     │    └─ vector_store.close()            (parent releases pools)
++     ├─ os.environ["FINCITE_BOOTSTRAP_DONE"] = "1"                :175
++     └─ uvicorn.run("app.main:app", 0.0.0.0:8000,
++                    reload=(LOG_LEVEL=="DEBUG"), workers=BACKEND_WORKERS)   :177
++          └─ per worker: lifespan()                              :119
++               ├─ _bootstrap() only if flag != "1"
++               ├─ await asyncio.to_thread(_setup_llama_index_settings)
++               ├─ (await get_vector_store_singleton()).ensure_initialized()
++               ├─ serve …
++               └─ vector_store.close()
++```
++
++**Checklist when the app won't start**
++
++| Message / symptom | Cause |
++|---|---|
++| `Couldn't connect to database after 30 attempts` | `DATABASE_URL` wrong / DB asleep (Supabase free tier pauses) |
++| `Database is not up to date. Please run uv run alembic upgrade head` | migrations behind head |
++| `FileNotFoundError: alembic.ini` | started outside `backend/` |
++| `RuntimeError: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set` | only raised on first storage call, not at boot |
++| Container up but 502 | workers still importing heavy libs (llama-index) — allow ~10-20 s |
+diff --git a/docs/agents/modules/backend-api.md b/docs/agents/modules/backend-api.md
+new file mode 100644
+index 0000000..246b07a
+--- /dev/null
++++ b/docs/agents/modules/backend-api.md
+@@ -0,0 +1,129 @@
++# MODULE — backend HTTP & data layer
++
++`backend/app/api/**`, `backend/app/db/**`, `backend/app/core/config.py`, `backend/app/schema.py`.
++
++---
++
++## 1. Files
++
++| File | Responsibility | Key symbols |
++|---|---|---|
++| `api/api.py` | router registry | `api_router`; mounts `conversation` (`/conversation`), `documents` (`/document`), `health` (`/health`) |
++| `api/deps.py` | request-scoped session | `get_db()` — `async with SessionLocal() as db: yield db` |
++| `api/crud.py` | all SQL | 9 functions, see §3 |
++| `api/endpoints/health.py` | liveness | `health()` |
++| `api/endpoints/documents.py` | upload/list/get | `upload_document_endpoint`, `get_documents`, `get_document`, `_validate_pdf` |
++| `api/endpoints/conversation.py` | CRUD + SSE | `create_conversation`, `get_conversation`, `delete_conversation`, `message_conversation`, `test_message_conversation` |
++| `db/session.py` | engine + sessionmaker | `engine`, `SessionLocal` |
++| `db/base.py` | Alembic metadata | re-exports `Base` + all models |
++| `db/wait_for_db.py` | startup retry | `check_database_connection(max_attempts=30, sleep_interval=1)` |
++| `core/config.py` | settings | `Settings`, `settings` (module singleton) |
++| `schema.py` | API contracts | see `../DATA_MODELS.md §6` |
++
++---
++
++## 2. Layering rules
++
++```
++endpoint (validate, HTTP codes, response_model)
++   └── crud (select/insert/update/delete + commit)
++          └── models (tables)
++```
++
++- Endpoints never import `sqlalchemy` query builders (only `text("SELECT 1")` in `health`).
++- `crud` returns **Pydantic schemas**, not ORM objects (`schema.X.model_validate(obj, from_attributes=True)`).
++- Commits live in `crud` (`create_*`, `delete_*`, SSE persistence) — read helpers never commit.
++- Every endpoint is `async def` and receives `db: AsyncSession = Depends(get_db)`.
++
++---
++
++## 3. `crud.py` function index
++
++| Function | Line | Query shape | Notes |
++|---|---|---|---|
++| `fetch_conversation_with_messages(db, id)` | 11 | `joinedload(messages).subqueryload(sub_processes)` + `joinedload(conversation_documents).subqueryload(document)` | builds `{"documents": [...]}` into `schema.Conversation(**d)`; returns `None` if missing |
++| `create_conversation(db, payload)` | 42 | ORM add of `Conversation` + N `ConversationDocument` | commits, refreshes, re-reads via `fetch_conversation_with_messages` |
++| `delete_conversation(db, id)` | 57 | `delete(Conversation)` | ⚠ no child cleanup — FK violation if messages exist |
++| `fetch_message_with_sub_processes(db, id)` | 64 | `joinedload(sub_processes)` | used for the final SSE frame |
++| `fetch_documents(db, id=None, ids=None, url=None, limit=None)` | 83 | `select(Document)` with optional filters | `id` forces `limit=1`; used by both document endpoints and conversation validation |
++| `create_document(db, document)` | 108 | ORM add | expects `document.id` already set (UUID from the endpoint) |
++| `delete_document_by_id(db, id)` | 125 | `delete(Document)` | rollback path for failed indexing |
++| `upsert_document_by_url(db, document)` | 135 | `insert(...).on_conflict_do_update(index_elements=[Document.url])` | used only by `scripts/upsert_document.py` |
++| `fetch_document_by_content_hash(db, hash)` | 155 | `Document.metadata_map["content_hash"].astext == hash` | duplicate detection |
++
++Gotchas: `crud.py` imports `uuid as uuid_module` without using it; `upsert_document_by_url`
++commits **after** validation of the returned row; the JSONB `astext` filter is unindexed (fine at
++small scale, add a GIN/expression index if the library grows).
++
++---
++
++## 4. Settings (`core/config.py`)
++
++```python
++class Settings(BaseSettings):
++    PROJECT_NAME: str = "fincite"
++    API_PREFIX: str = "/api"
++    DATABASE_URL: str            # required
++    SUPABASE_URL: str = ""
++    SUPABASE_SERVICE_ROLE_KEY: str = ""
++    SUPABASE_STORAGE_BUCKET: str = "annual-reports"
++    GOOGLE_API_KEY: str          # required
++    GEMINI_CHAT_LLM_NAME: str = "models/gemini-1.5-flash"
++    GEMINI_EMBEDDING_MODEL_NAME: str = "models/gemini-embedding-001"
++    VECTOR_STORE_TABLE_NAME: str = "pg_vector_store"
++    VECTOR_STORE_EMBED_DIM: int = 3072
++    LOG_LEVEL: str = "INFO"
++    BACKEND_WORKERS: int = 4
++    BACKEND_CORS_ORIGINS: List[AnyHttpUrl | Literal["*"]] = []
++    SENTRY_DSN: Optional[str] = None
++```
++
++Validators (`mode="before"`):
++
++| Field | Behaviour |
++|---|---|
++| `BACKEND_CORS_ORIGINS` | accepts JSON list string or comma-separated string |
++| `DATABASE_URL` | must start with `postgres`; `postgres://`→`postgresql://`→`postgresql+asyncpg://` (idempotent) |
++| `LOG_LEVEL` | upper-cased; rejects anything outside DEBUG/INFO/WARNING/ERROR/CRITICAL |
++
++`settings` is instantiated at import (`config.py:82`) and immediately does
++`os.environ["GOOGLE_API_KEY"] = settings.GOOGLE_API_KEY` (`:83`) so the Google SDK picks it up.
++Consequence: **importing anything under `app` requires `DATABASE_URL` and `GOOGLE_API_KEY`.**
++
++Env file: `.env` in the CWD (`env_file=".env"`, no prefix). See `backend/.env.example`.
++
++---
++
++## 5. Session & pool (`db/session.py`)
++
++```python
++engine = create_async_engine(settings.DATABASE_URL,
++    pool_pre_ping=True, pool_size=4, max_overflow=4, pool_recycle=3600, pool_timeout=120)
++SessionLocal = async_sessionmaker(autocommit=False, autoflush=False, bind=engine)
++```
++
++`pool_size=4 + max_overflow=4` per process ⇒ with `BACKEND_WORKERS=4` the app can open **32**
++connections. Supabase free/pooler tiers have low limits — lower `BACKEND_WORKERS` if you see
++`TimeoutError: connection pool exhausted` (pool_timeout=120 s).
++
++The same engine is reused by the vector store (`chat/pg_vector.py:24`), so one pool serves both.
++
++---
++
++## 6. Endpoint conventions
++
++- Paths end in `/` for collections; path params typed as `uuid.UUID`.
++- Optional filters via `fastapi.Query`; uploads via `File`/`Form` (`python-multipart`).
++- `response_model=` used only on `/document/upload`; other routes use return annotations.
++- `status_code=201` for upload, `204` + `response_model=None` for delete.
++- Errors are raised as `HTTPException`; nothing is wrapped in a custom exception handler.
++- Long-running work (indexing) is inline — see `AGENTS.md §14.I`.
++
++## 7. Adding an endpoint (checklist)
++
++1. Add/extend a schema in `app/schema.py`.
++2. Add a `crud` function if it touches SQL (keep queries there).
++3. Write `@router.<verb>("…")` in the right `endpoints/*.py`; annotate the return type.
++4. Register a new router (if any) in `api/api.py` with a prefix + tag.
++5. Add a test under `backend/tests/app/…` using `AsyncMock(spec=AsyncSession)`.
++6. Update `docs/agents/API_REFERENCE.md` and, if the shape reaches the UI, `frontend/src/lib/types.ts`.
+diff --git a/docs/agents/modules/frontend.md b/docs/agents/modules/frontend.md
+new file mode 100644
+index 0000000..646d26d
+--- /dev/null
++++ b/docs/agents/modules/frontend.md
+@@ -0,0 +1,147 @@
++# MODULE — frontend (`frontend/src/**`)
++
++React 19 + TypeScript 5.9 (strict) + Vite 7 + Tailwind 4 + framer-motion. No router, no state
++library, no test runner. Builds to a single inlined `dist/index.html` via `vite-plugin-singlefile`.
++
++---
++
++## 1. File map
++
++| File | Lines | Role |
++|---|---|---|
++| `main.tsx` | 10 | `createRoot` + `StrictMode` |
++| `App.tsx` | 180 | `Shell` (layout, boot splash, health polling, mobile nav), `Splash`, `App` (providers) |
++| `store.tsx` | 392 | the entire app state + `useStore()` |
++| `lib/api.ts` | 460 | `USE_MOCK`, `BASE_URL`, `StreamHandlers`, `MockTransport`, `RealTransport`, `api` facade |
++| `lib/mockData.ts` | 395 | `COMPANY_HUE`, `SEED_DOCUMENTS` (5), `FALLBACK_EXCERPT`, `ANSWER_BANK` (4), `TICKS`, `SUGGESTIONS` |
++| `lib/types.ts` | 114 | domain types (⚠ broken leading comment) |
++| `lib/format.ts` | 85 | `initials`, `timeHM`, `shortDate`, `formatFileSize`, label maps, `uid`, `nowIso` |
++| `utils/cn.ts` | 6 | `clsx` + `tailwind-merge` — **unused** |
++| `index.css` | 121 | `@theme` tokens, grain overlay, scrollbars, `.stream-caret`, markdown rules |
++
++Components: `ChatView` (306) with `Hero` (103) and `ScopePicker` (198); `LibraryView` (639) with
++`DocRow` (237), `StatusPill` (289), `UploadDrawer` (317), `DocDetailDrawer` (464); `MessageItem`
++(190, memoized); `ResearchTrail` (147); `CiteMarkdown` (100, memoized); `SourceDrawer` (160);
++`Composer` (111); `Sidebar` (237); `Toasts` (60); `Ticker` (34); `Monogram` (27).
++
++---
++
++## 2. State model (`store.tsx`)
++
++```ts
++interface Store {
++  view; setView; booted; boot;
++  documents; refreshDocuments; uploadFiles; uploading; libraryOpenDocId; setLibraryOpenDocId;
++  conversations; activeId; active; selectConversation; newChat; deleteConversation;
++  setScope; startScopedChat; send; streaming; stopStreaming;
++  health; checkHealth;
++  selectedSource; openSource; closeSource;
++  mobileNav; setMobileNav;
++  toasts; pushToast; dismissToast;
++}
++```
++
++Behaviours worth knowing:
++
++| Function | Detail |
++|---|---|
++| `boot()` | `Promise.all([refreshDocuments(), checkHealth()])`, then `booted = true`; `App` also awaits a 1.5 s minimum splash |
++| `refreshDocuments()` | swallows errors and keeps stale state |
++| `watchDocument(id)` | 900 ms `getDocument` poll until `ready`/`failed`; toast on success; map `pollers` prevents duplicates |
++| `uploadFiles(files)` | sequential per file; optimistic `uploading` entry with progress; on success prepend document + start poller; on error keep the row for 3.2 s with the message |
++| `send(q)` | guards `streaming`; creates a conversation when `activeId` is null (title = first 46 chars + `…`); wires the six stream handlers; stores the cancel closure in a ref |
++| `stopStreaming()` | cancels the transport, clears `streaming` |
++| `deleteConversation(id)` | calls the API, ignores failures ("local delete anyway"), always removes locally |
++| `setScope(id, docIds)` | patches `document_scope` (client-side only; the backend has no scope update endpoint) |
++| `startScopedChat(doc)` | creates a thread titled `SYMBOL · doc type` with `document_scope: [doc.id]`, switches to chat |
++| `checkHealth()` | `api.health()` → `{status, latency}`; catch → `"down"` |
++
++`active` is derived with `useMemo`. Conversations are **not** rehydrated from `GET
++/api/conversation/{id}` anywhere — `api.getConversation` is exported but unused.
++
++---
++
++## 3. Transport (`lib/api.ts`)
++
++```ts
++export const USE_MOCK = true;                                   // hardcoded
++export const BASE_URL = (import.meta as any).env?.VITE_API_URL ?? "http://localhost:8000";
++export const api = { health, listDocuments, getDocument, uploadDocument,
++                     createConversation, getConversation, deleteConversation, streamMessage };
++```
++
++`MockTransport`: `SEED_DOCUMENTS` clone; `STAGE_MS = {parsing:1500, chunking:1700,
++embedding:1600, indexing:1300}`; `refresh()` advances a document based on elapsed wall time;
++`uploadDocument` ticks progress with `setTimeout`; `pickAnswer` regex-matches `ANSWER_BANK`
++(`reliance_revenue`, `it_margins`, `hdfc_asset_quality`, `itc_fmcg`) or builds a grounded-sounding
++fallback from `FALLBACK_EXCERPT`; `streamMessage` emits a 4-step plan then tokens.
++
++`RealTransport`: see `../API_REFERENCE.md §6` — incomplete/mismatched.
++
++**To add a real mode**, prefer a new `lib/wire.ts` mapper module + a rewritten `RealTransport`,
++keeping the `StreamHandlers` interface so `store.tsx` does not change. Do not silently flip
++`USE_MOCK`.
++
++---
++
++## 4. Component contracts
++
++| Component | Props | Reads from store | Emits |
++|---|---|---|---|
++| `ChatView` | — | `active, conversations, documents, send, setView` | `send`, `setView("library")` |
++| `Hero` | `readyCount, companies, pages, indexing, onAsk, onLibrary` | — | `onAsk(question)` |
++| `ScopePicker` | — | `active, documents, setScope, streaming` | `setScope` |
++| `MessageItem` | `message, documents` | `openSource` | `openSource` |
++| `ResearchTrail` | `steps: MessageSubProcess[]` | — | local `open` state; auto-collapse |
++| `CiteMarkdown` | `content, onCite(n)` | — | `onCite` |
++| `SourceDrawer` | — | `selectedSource, documents, closeSource, setView, setLibraryOpenDocId` | view switch |
++| `LibraryView` | — | `documents, uploadFiles, uploading, setLibraryOpenDocId, refreshDocuments` | uploads |
++| `DocRow` / `StatusPill` | `doc` (+`processing`) | — | `onOpen` |
++| `UploadDrawer` | `open, onClose` | `uploadFiles, uploading` | uploads |
++| `DocDetailDrawer` | — | `libraryOpenDocId, documents, startScopedChat, uploadFiles` | scoped chat |
++| `Composer` | `centered?` | `send, streaming, stopStreaming, active, documents` | `send` |
++| `Sidebar` | — | `view, conversations, activeId, documents, health, …` | nav/delete |
++| `Toasts` | — | `toasts, dismissToast` | dismiss |
++| `Ticker` | — | `TICKS` | marquee |
++| `Monogram` | `symbol, size?, className?` | `COMPANY_HUE` | colour tile |
++
++There is no component that receives a `children` render prop; composition is direct.
++
++---
++
++## 5. Design system cheatsheet (`index.css`)
++
++| Token group | Values |
++|---|---|
++| Surfaces | `bone #f3efe4` (page), `paper #faf7ee` (cards), `faint #ece7d6`, `soot #1e1a0f` (sidebar), `soot-2` |
++| Text | `ink #16130b`, `moss #736d55` (secondary) |
++| Lines | `line #e0d9c3`, `line-dark #37321f` |
++| Accent | `accent #e0490b`, `accent-deep #b2380a`, `accent-soft #f7e2d2` |
++| Status | `pine #1f7a4d` / `pine-soft`, `rust #b3261e` / `rust-soft`, `gold` |
++| Type | `font-display` Fraunces, `font-sans` Space Grotesk, `font-mono` IBM Plex Mono; numeric cells use `.tnum` |
++| Motion | `animate-marquee`, `animate-pulse-dot`; framer easings `[0.22,1,0.36,1]`, `[0.32,0.72,0,1]` |
++
++Conventions: square corners, 1 px hairlines, 9-10 px uppercase mono labels with `tracking-[0.18em]`
++or `0.2em`, generous whitespace, one accent colour. Body carries an SVG noise overlay at 0.32
++opacity (multiply). `.stream-caret::after` renders the blinking block cursor while streaming.
++
++---
++
++## 6. Frontend gotchas
++
++1. `lib/types.ts:1-4` — unterminated `/**` swallows four type exports; `tsc` cannot resolve
++   `DocumentStatus`/`NSEDocumentType`/`FinDocument`. Fix before any type-sensitive work.
++2. `vite build` still succeeds (esbuild strips types without checking) — never use it as your only
++   gate.
++3. `Sidebar.tsx:3` imports `Activity` but never uses it (`noUnusedLocals` error).
++4. `active.document_scope` is client-only; the backend never learns about scope changes, so a real
++   transport must create a new conversation when the scope changes.
++5. `UploadDrawer` sends only `{name, size, type}` to `uploadFiles` — even in real mode, no NSE
++   metadata is collected (the README claims a metadata form exists).
++6. `DocDetailDrawer`'s "Re-upload a revision" fabricates a fake file object (`reindexed-…`) rather
++   than reading bytes; harmless only because the mock ignores content.
++7. `SourceDrawer`'s "open in library" assumes the source's `document_id` exists in `documents`.
++8. `Analytics` is mounted unconditionally; it is a no-op outside Vercel.
++9. Fonts load from Google Fonts; the app degrades to Georgia/system serif offline.
++10. No persistence: a refresh loses all threads (mock); the planned real mode must hydrate from
++    `GET /api/conversation/{id}` per thread.
+diff --git a/docs/agents/modules/ingestion-storage.md b/docs/agents/modules/ingestion-storage.md
+new file mode 100644
+index 0000000..9be884c
+--- /dev/null
++++ b/docs/agents/modules/ingestion-storage.md
+@@ -0,0 +1,147 @@
++# MODULE — ingestion, storage & startup DDL
++
++`backend/app/ingestion/**`, `backend/app/storage/**`, and the vector/DB bootstrap in
++`backend/app/main.py` + `backend/app/chat/pg_vector.py`.
++
++---
++
++## 1. Storage abstraction — `app/storage/supabase.py`
++
++| Function | Line | Behaviour |
++|---|---|---|
++| `get_supabase_client()` | 23 | lazy singleton; raises `RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set…")` if either is empty |
++| `_storage_path(document_id)` | 39 | `documents/{document_id}/original.pdf` |
++| `upload_document(bytes, id)` → `str` | 44 | `storage.from_(bucket).upload(path, file, file_options={"content-type":"application/pdf","upsert":"false"})`; raises `RuntimeError` on failure; returns the **path** (not a URL) |
++| `download_document(id)` → `bytes` | 74 | `storage.from_(bucket).download(path)`; raises `RuntimeError` |
++| `delete_document(id)` | 97 | `remove([path])`; **logs a warning instead of raising** so cleanup never cascades |
++| `get_document_url(id)` → `str` | 118 | `get_public_url(path)` |
++
++Notes
++
++- The service-role key is used server-side only; it is never echoed in a response.
++- `upsert: "false"` means a re-upload with the same id would fail — ids are always new UUIDs, so
++  this only matters if you retry the same upload after a partial failure.
++- `get_public_url` assumes a public (or public-read) bucket. Private buckets need
++  `create_signed_url`, otherwise the persisted `Document.url` is not fetchable by clients (the
++  server can still download via the authenticated client, so ingestion works either way).
++- Module global `_supabase_client` is not thread-safe/locked; tests reset it manually.
++
++---
++
++## 2. Ingestion — `app/ingestion/pdf.py`
++
++```
++download_document(document_id)                         :89
++  └─ load_pdf_from_bytes(pdf_bytes, document_id)        :37
++        TemporaryDirectory()/{id}.pdf
++        PDFReader().load_data(tmp_path, extra_info={DB_DOC_ID_KEY: document_id})
++        → List[llama_index.core.schema.Document]  (one per page; metadata.page_label)
++  └─ if not llama_docs: ValueError("PDFReader produced no documents …")
++StorageContext.from_defaults(vector_store=vector_store)  :102
++VectorStoreIndex.from_documents(llama_docs,
++      storage_context=…, show_progress=True,
++      callback_manager=… (optional))                     :107
++index.set_index_id(document_id)                          :113
++return index
++```
++
++- Chunking is **not** done here: `VectorStoreIndex.from_documents` applies the global
++  `Settings.node_parser` configured in `llama_index_settings.py` (`SentenceSplitter(512, 10)`).
++- Embeddings come from `Settings.embed_model` (Gemini, 3072-d).
++- `ingest_document` is `async def` but its body is fully synchronous (parse + embed + insert). It
++  blocks the event loop for the whole request — `AGENTS.md §14.I`.
++- `callback_manager` is optional and only the tests pass one; production upload does not stream
++  ingestion progress to the client.
++
++### Metadata carried onto every node
++
++| Key | Source | Consumers |
++|---|---|---|
++| `db_document_id` (`DB_DOC_ID_KEY`) | `extra_info` at parse time | `ExactMatchFilter` per-document tool, `Citation.from_node` |
++| `page_label` | `PDFReader` | `Citation.from_node` → `page_number` |
++| `file_path`, `file_name`, `file_type`, `page_label`, `total_pages` … | `PDFReader` | informational |
++
++---
++
++## 3. Startup DDL & bootstrap — `app/main.py`
++
++```
++start() → _bootstrap(release_connections=True)                     main.py:81
++  1 check_database_connection()                                    db/wait_for_db.py:6
++      30 attempts × 1 s, asyncpg SELECT 1 via SessionLocal
++  2 Alembic head check                                             main.py:88-100
++      Config("alembic.ini")                     ← CWD relative
++      db_url = settings.DATABASE_URL.replace("postgresql+asyncpg://","postgresql+psycopg2://")
++      engine = create_engine(db_url); check_current_head(cfg, engine)
++      check_current_head = set(MigrationContext.get_current_heads())
++                           == set(ScriptDirectory.get_heads())
++      mismatch ⇒ Exception("Database is not up to date. Please run `uv run alembic upgrade head`")
++  3 vector_store = cast(CustomPGVectorStore, await get_vector_store_singleton())
++      await vector_store.run_setup()                               pg_vector.py:39
++        _initialize()
++        CREATE EXTENSION IF NOT EXISTS vector           (own session, commit)
++        conn.run_sync(base.metadata.create_all)         (data_pg_vector_store*)
++        did_run_setup = True (module global)
++  4 split_by_sentence_tokenizer()   — forces NLTK punkt download; FileExistsError tolerated
++  5 if release_connections: vector_store.close()      (parent only)
++```
++
++Workers (`lifespan`, `main.py:119`) skip everything when `FINCITE_BOOTSTRAP_DONE == "1"`, then:
++
++```python
++await asyncio.to_thread(_setup_llama_index_settings)      # Gemini ctor does blocking I/O
++(await get_vector_store_singleton()).ensure_initialized() # pools only, no DDL
++```
++
++Shutdown calls `vector_store.close()` (disposes the shared async engine for that process).
++
++The Dockerfile also pre-downloads `punkt` and `punkt_tab` at build time so first-request latency
++does not include an NLTK download.
++
++---
++
++## 4. Failure & cleanup semantics
++
++| Scenario | Effect | Code |
++|---|---|---|
++| DB down at boot | retries 30×, then `ValueError` | `wait_for_db.py:16` |
++| Migrations behind | hard failure (no auto-upgrade) | `main.py:95` |
++| `vector` extension not installable | `run_setup` raises → boot fails | `pg_vector.py:46` |
++| NLTK download fails (air-gapped) | `FileExistsError` only is tolerated; other errors propagate | `main.py:108-111` |
++| Upload → DB insert fails | storage object deleted | `documents.py:152-159` |
++| Upload → indexing fails | DB row + storage object deleted → 422 | `documents.py:166-174` |
++| `delete_document` fails during rollback | warning only, original error still raised | `supabase.py:110-115` |
++
++What is **not** cleaned up: partially written vector rows after a mid-batch embedding failure, and
++vectors belonging to a deleted `Document` (nothing deletes documents today).
++
++---
++
++## 5. Operational queries
++
++```sql
++-- objects vs rows vs vectors
++SELECT d.id, d.metadata_map->'nse_document'->>'company_name' AS company,
++       (SELECT count(*) FROM data_pg_vector_store v
++         WHERE v.metadata_->>'db_document_id' = d.id::text) AS vectors
++FROM document d ORDER BY d.created_at DESC;
++
++-- duplicate detection sanity
++SELECT metadata_map->>'content_hash' AS h, count(*) FROM document GROUP BY 1 HAVING count(*) > 1;
++
++-- vector table size
++SELECT count(*) FROM data_pg_vector_store;
++```
++
++Cleanup of a document (manual, since there is no endpoint):
++
++```sql
++DELETE FROM data_pg_vector_store WHERE metadata_->>'db_document_id' = '<doc-uuid>';
++DELETE FROM conversationdocument WHERE document_id = '<doc-uuid>';
++DELETE FROM document WHERE id = '<doc-uuid>';
++-- then remove documents/<doc-uuid>/original.pdf from the Supabase bucket
++```
++
++`scripts/dedupe_vector_store.py` uses the same table name (`data_pg_vector_store`) but is
++currently unrunnable (`fire` missing) and hardcodes the table instead of reading
++`VECTOR_STORE_TABLE_NAME`.
+diff --git a/docs/agents/modules/rag-engine.md b/docs/agents/modules/rag-engine.md
+new file mode 100644
+index 0000000..e024213
+--- /dev/null
++++ b/docs/agents/modules/rag-engine.md
+@@ -0,0 +1,163 @@
++# MODULE — RAG engine (`backend/app/chat/**`, `llama_index_settings.py`)
++
++Everything that turns a question plus a set of documents into a streamed, cited answer.
++
++---
++
++## 1. Files
++
++| File | Responsibility | Key symbols |
++|---|---|---|
++| `chat/engine.py` | build the agent | `get_chat_engine`, `build_doc_id_to_index_map`, `index_to_query_engine`, `fetch_and_read_document`, `get_chat_history` |
++| `chat/messaging.py` | bridge LlamaIndex callbacks → anyio stream | `ChatCallbackHandler`, `handle_chat_message`, `StreamedMessage`, `StreamedMessageSubProcess` |
++| `chat/pg_vector.py` | pool-sharing vector store | `CustomPGVectorStore`, `get_vector_store_singleton` |
++| `chat/qa_response_synth.py` | custom QA/Refine prompts | `get_custom_response_synth` |
++| `chat/constants.py` | prompt + chunking constants | `DB_DOC_ID_KEY`, `SYSTEM_MESSAGE`, `NODE_PARSER_CHUNK_SIZE=512`, `NODE_PARSER_CHUNK_OVERLAP=10` |
++| `chat/utils.py` | human labels for tools/prompts | `build_title_for_document`, `build_description_for_document`, `_fallback_title`, `_fallback_description` |
++| `llama_index_settings.py` | global defaults | `_setup_llama_index_settings()` sets `Settings.llm`, `.embed_model`, `.node_parser` |
++
++Import-time side effects: `chat/engine.py:64` `nest_asyncio.apply()`.
++
++---
++
++## 2. Object graph per conversation
++
++```
++ReActAgent(max_iterations=6, context=SYSTEM_MESSAGE, chat_history)
++└── QueryEngineTool "document_question_engine"
++    └── SubQuestionQueryEngine(use_async=True,
++                               question_gen=LLMQuestionGenerator(Gemini),
++                               response_synthesizer=custom QA/Refine)
++        ├── QueryEngineTool name=<doc A uuid>  desc="Annual report for …"
++        │     └── VectorStoreIndex.as_query_engine(similarity_top_k=3,
++        │              filters=MetadataFilters([ExactMatchFilter(db_document_id=uuid)]))
++        ├── QueryEngineTool name=<doc B uuid> …
++        └── …
++```
++
++All tiers use `settings.GEMINI_CHAT_LLM_NAME`; embeddings are configured globally in
++`llama_index_settings.py` and used by `VectorStoreIndex`.
++
++---
++
++## 3. `get_chat_engine(callback_handler, conversation)` step by step
++
++`chat/engine.py:181`
++
++1. `CallbackManager([callback_handler])` — the manager is threaded into every index/engine so all
++   events reach the SSE handler.
++2. `build_doc_id_to_index_map(...)` (`:112`):
++   - `vector_store = await get_vector_store_singleton()`
++   - `StorageContext.from_defaults(vector_store=vector_store)`
++   - per document: `VectorStoreIndex.from_vector_store(...)`; on exception
++     `fetch_and_read_document(doc)` → `from_documents(...)` → `set_index_id(doc_id)`.
++   - ⚠ does **not** check that vectors exist for the doc (see `AGENTS.md §14.H`).
++3. `id_to_doc = {str(doc.id): doc}`.
++4. one `QueryEngineTool` per doc: `name = doc_id` (the LLM selects tools by name **and**
++   description), `description = build_description_for_document(doc)`.
++5. `response_synth = get_custom_response_synth(callback_manager, conversation.documents)`.
++6. `chat_llm = Gemini(model=…, api_key=settings.GOOGLE_API_KEY)`.
++7. `question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)`.
++8. `SubQuestionQueryEngine.from_defaults(query_engine_tools, question_gen, response_synthesizer,
++   verbose=LOG_LEVEL=="DEBUG", use_async=True)`.
++9. single top-level tool `document_question_engine` with a deliberately broad description.
++10. `chat_history = get_chat_history(conversation.messages)`.
++11. `SYSTEM_MESSAGE.format(doc_titles=…, curr_date=utcnow %Y-%m-%d)`.
++12. `ReActAgent.from_tools(tools, llm, chat_history, verbose, context, callback_manager,
++    max_iterations=6)`.
++
++**Cost per question** (rule of thumb): 1 ReAct planning call + 1 question-generation call + N
++sub-answer calls + 1 synthesis (refine may loop) + N×retrieval embedding calls. A 3-document
++question is easily 6-8 Gemini calls.
++
++---
++
++## 4. Prompts
++
++### `SYSTEM_MESSAGE` (`constants.py:3`)
++Indian-financial-research persona; lists the selected document titles; mandates: always use tools,
++prefer document evidence, preserve units, disambiguate FY, do not fabricate, cite pages, decline
++off-topic questions; injects `{curr_date}`.
++
++### QA + Refine (`qa_response_synth.py:11`)
++Both templates restate the selected document list and the unit/FY/no-fabrication rules. Refine
++keeps the original answer when new context is useless. `structured_answer_filtering=False`.
++If you change chunking or models, re-read these prompts — they are the main defence against
++unit conversion drift.
++
++### `chat/messaging.py` nudge
++Every user question is prefixed with
++`"Remember - if I have asked a relevant financial question, use your tools."` (`messaging.py:145`).
++Removing it increases tool-skipping.
++
++---
++
++## 5. Vector store integration (`pg_vector.py`)
++
++```python
++class CustomPGVectorStore(PGVectorStore):
++    def _connect(self):           # :19
++        self._engine = create_engine(self.connection_string)   # sync engine (base-class paths)
++        self._session = sessionmaker(self._engine)
++        self._async_engine = app_engine                        # SHARED async pool
++        self._async_session = AppSessionLocal
++    async def close(self):        # :27
++        self._session.close_all(); self._engine.dispose(); await self._async_engine.dispose()
++    def _create_tables_if_not_exists(self): pass
++    def _create_extension(self): pass
++    async def run_setup(self):    # :39  CREATE EXTENSION vector + base.metadata.create_all
++    async def ensure_initialized(self): self._initialize()     # no DDL
++```
++
++`get_vector_store_singleton()` (`:66`) builds it once from `settings.DATABASE_URL` via
++`make_url(...)` and `from_params(host, port or 5432, database, user, password, table, embed_dim)`.
++
++Because it is a **module global with no lock**, two concurrent first calls in a worker can create
++two instances (last one wins) — harmless but worth knowing if you add async startup work.
++
++---
++
++## 6. Document titles / descriptions (`utils.py`)
++
++`build_title_for_document` → `"Reliance Industries (RELIANCE) Annual Report FY2025"`; falls back to
++`"Uploaded Document: <filename>"` or `"Uploaded Document"`.
++`build_description_for_document` → `"Annual report for Reliance Industries (RELIANCE), financial
++year 2025 (exchange: NSE)."`; falls back to `"Uploaded financial document: <filename>"`.
++
++Both tolerate missing/garbage metadata (`try/except` around `NSEDocumentMetadata.model_validate`).
++This text feeds the system prompt **and** the ToolMetadata ← the routing quality of the agent
++depends on it.
++
++---
++
++## 7. Callback events → sub-process rows
++
++| LlamaIndex event | Where it comes from | UI effect |
++|---|---|---|
++| `CONSTRUCTED_QUERY_ENGINE` (synthetic) | `messaging.py:137` | "engine built" step |
++| `LLM` | every Gemini call | thinking / synthesis steps |
++| `RETRIEVE` | vector search per doc | retrieval step |
++| `SYNTHESIZE` | response synthesizer | synthesis step |
++| `SUB_QUESTION` | sub-question engine, payload `EventPayload.SUB_QUESTION` = `SubQuestionAnswerPair` | Q/A + citations per document |
++| `AGENT_STEP` | ReAct loop | agent step |
++| `CHUNKING`, `NODE_PARSING` | ingestion | deliberately ignored (`messaging.py:39`) |
++
++`get_metadata_from_event` (`messaging.py:71`) only enriches `SUB_QUESTION`:
++`{"sub_question": QuestionAnswerPair(question, answer, citations).dict()}`.
++
++Adding a new streamed field: extend `get_metadata_from_event` + `schema.SubProcessMetadataKeysEnum`
+++ the frontend's `MessageSubProcess`/`ResearchTrail` rendering.
++
++---
++
++## 8. Changing the model or retrieval
++
++| Change | Files | Caveats |
++|---|---|---|
++| Different Gemini model | `.env GEMINI_CHAT_LLM_NAME`, `engine.py:219` (explicit `Gemini(...)`) | both construct LLMs — keep them in sync |
++| Different provider | `llama_index_settings.py`, `engine.py:219-223`, `core/config.py` | `GOOGLE_API_KEY` env export must go too |
++| Top-k | `index_to_query_engine` (`engine.py:109`, `similarity_top_k=3`) | higher k ⇒ more context tokens, slower |
++| Chunk size | `constants.py:25-26` | requires re-index; no migration needed |
++| Embedding dimension/model | `.env` + `pg_vector.py` + recreate `data_pg_vector_store` | old rows become unusable |
++| New top-level tool | `engine.py:233 top_level_tools` | ReAct will route between tools; give a precise description |
++| More agent iterations | `engine.py:267 max_iterations=6` | latency grows |
+diff --git a/docs/agents/modules/streaming.md b/docs/agents/modules/streaming.md
+new file mode 100644
+index 0000000..350a6e2
+--- /dev/null
++++ b/docs/agents/modules/streaming.md
+@@ -0,0 +1,194 @@
++# MODULE — streaming (SSE) & the client transport
++
++Server: `backend/app/chat/messaging.py` + `backend/app/api/endpoints/conversation.py`.
++Client: `frontend/src/lib/api.ts` + `frontend/src/store.tsx`.
++
++Read `../WORKFLOWS.md §W3` for the full trace; this file is the mechanics.
++
++---
++
++## 1. Server: producer side (`chat/messaging.py`)
++
++```python
++class StreamedMessage(BaseModel):            # :22   cumulative answer text
++    content: str
++
++class StreamedMessageSubProcess(BaseModel):  # :26
++    source: MessageSubProcessSourceEnum
++    has_ended: bool
++    event_id: str
++    metadata_map: Optional[SubProcessMetadataMap] = None
++```
++
++`ChatCallbackHandler(BaseCallbackHandler)`:
++
++- `ignored_events = [CHUNKING, NODE_PARSING]` for both start and end (`:39`).
++- `on_event_start` / `on_event_end` **must be synchronous** (LlamaIndex API) and therefore do
++  `asyncio.create_task(self.async_on_event(..., is_start_event=…))` (`:51`, `:65`) — fire and
++  forget, no backpressure, exceptions are swallowed.
++- `async_on_event` (`:89`): builds `metadata_map`, maps `source = MessageSubProcessSourceEnum[event_type.name]`
++  (⚠ `KeyError` if LlamaIndex adds an event type the enum lacks), checks `self._send_chan._closed`
++  (private!), then `await self._send_chan.send(StreamedMessageSubProcess(...))` with
++  `ClosedResourceError` caught and logged.
++- `start_trace` / `end_trace` are no-ops (`:117`).
++
++`handle_chat_message(conversation, user_message, send_chan)` (`:128`):
++
++```
++async with send_chan:                       # closes the stream on exit
++    engine = await get_chat_engine(ChatCallbackHandler(send_chan), conversation)
++    send CONSTRUCTED_QUERY_ENGINE(has_ended=True, event_id=uuid4())
++    resp = await engine.astream_chat("Remember - …\n\n" + user_message.content)
++    async for text in resp.async_response_gen():
++        response_str += text
++        if send_chan._closed: return        # client gone
++        send StreamedMessage(content=response_str)
++    if response_str.strip() == "": send apology
++```
++
++⚠ `user_message` is a `schema.Message` instance built by the endpoint (not persisted yet);
++`user_message.content` is read directly.
++
++---
++
++## 2. Server: consumer side (`endpoints/conversation.py:112` `event_publisher`)
++
++```python
++send_chan, recv_chan = anyio.create_memory_object_stream(100)     # :110
++async def event_publisher():
++    async with send_chan:                                        # ⚠ second owner
++        task = asyncio.create_task(handle_chat_message(conversation, user_msg_obj, send_chan))
++        message_id = str(uuid4())
++        message = Message(id=message_id, conversation_id=…, content="",
++                          role=assistant, status=PENDING, sub_processes=[])
++        final_status = ERROR
++        event_id_to_sub_process = OrderedDict()
++        try:
++            async for obj in recv_chan:
++                if isinstance(obj, StreamedMessage):          message.content = obj.content
++                elif isinstance(obj, StreamedMessageSubProcess):
++                     # merge start/end on event_id, keep first created_at
++                     sub = MessageSubProcess(message_id=message_id, source=…,
++                                             status=FINISHED if obj.has_ended else PENDING,
++                                             metadata_map=obj.metadata_map)
++                     event_id_to_sub_process[obj.event_id] = sub
++                     message.sub_processes = list(event_id_to_sub_process.values())
++                yield schema.Message.model_validate(message, from_attributes=True).model_dump_json()
++            await task
++            if task.exception(): raise ValueError(...) from task.exception()
++            final_status = SUCCESS
++        except Exception:
++            logger.error("Error in message publisher", exc_info=True)
++            final_status = ERROR
++        message.status = final_status
++        db.add(user_msg_obj); db.add(message); await db.commit()
++        final = await crud.fetch_message_with_sub_processes(db, message_id)
++        yield final.model_dump_json()
++```
++
++Key properties
++
++- Channel capacity 100: if the client stalls, the producer blocks on `send` (backpressure) — no
++  unbounded buffering.
++- `OrderedDict` keyed by `event_id` gives stable ordering and merges start/end pairs.
++- `message.id` is generated by the endpoint (a `str`); SQLAlchemy's UUID type coerces it.
++- The final frame re-reads from the DB so ids/timestamps are real.
++- Nothing is persisted while streaming; only at the end (success **or** error).
++
++---
++
++## 3. Wire format
++
++- `EventSourceResponse` from `sse-starlette==1.6.5`; `sep` defaults to `\r\n`; ping every 15 s
++  (`DEFAULT_PING_INTERVAL`) as `: ping - <ts>` comments.
++- Frames carry **no event name** ⇒ browsers deliver them on the default `message` listener
++  (`es.onmessage` / `addEventListener("message")`).
++- Each frame's `data` is one JSON `schema.Message` (see `../API_REFERENCE.md §4`).
++- Content is cumulative, so a client can drop intermediate frames safely.
++
++Raw example (two frames, truncated):
++
++```
++data: {"id":"b1e0…","conversation_id":"6d8f…","role":"assistant","status":"PENDING","content":"","sub_processes":[{"source":"CONSTRUCTED_QUERY_ENGINE","status":"FINISHED","metadata_map":null,…}],…}
++
++data: {"id":"b1e0…", … "content":"Reliance's FY2025 consolidated revenue was","status":"PENDING", …}
++
++data: {"id":"b1e0…", … "content":"… full answer …","status":"SUCCESS", "sub_processes":[…],"updated_at":"…"}
++```
++
++---
++
++## 4. Client side today
++
++`frontend/src/lib/api.ts` exports:
++
++```ts
++export interface StreamHandlers {
++  onUserMessage, onAssistantCreated, onSubProcess(stepId, patch), onToken(token),
++  onDone({content, sources}), onError(message)
++}
++```
++
++`MockTransport.streamMessage` (`api.ts:195`) synthesizes everything with `setTimeout`s and
++returns a cancel closure. That is the code path in production today (`USE_MOCK = true`).
++
++`RealTransport.streamMessage` (`api.ts:415`) is **wrong for this backend**:
++
++| Issue | Detail |
++|---|---|
++| Query param | sends `?q=` — backend reads `user_message` |
++| Event names | listens for `sub_process` / `delta` / `done`; backend sends unnamed snapshot frames |
++| Snapshot vs delta | expects raw token strings; must diff `content` between snapshots instead |
++| Sources | expects `done.sources`; backend delivers citations inside `sub_processes[].metadata_map.sub_question.citations` |
++| Error handling | `es.onerror` fires the generic "Stream interrupted"; EventSource cannot inspect HTTP status |
++| Transport choice | `EventSource` cannot send `Accept: text/event-stream` or auth headers; a `fetch` + `ReadableStream` reader is more flexible (the README even claims this, but the code does not do it) |
++
++### What a correct adapter must do
++
++1. `fetch(`${BASE_URL}/api/conversation/${id}/message?user_message=${encodeURIComponent(q)}`,
++   { headers: { Accept: "text/event-stream" } })`, then parse `data: ` lines from
++   `response.body.getReader()` (handle `\r\n`, blank-line frame boundaries, `:` comment pings).
++2. Maintain `prevContent`; emit `onToken(snapshot.content.slice(prevContent.length))`.
++3. Map each `sub_processes[]` entry to the UI step model
++   (`source` → `llm|retrieval|rerank|parser`, `status PENDING/FINISHED` → `running/completed`),
++   keying steps by `event_id`, since the backend re-sends the whole array each frame.
++4. Flatten citations from every `sub_question` into `Source[]` with a stable `index` (1-based) and
++   attach them on `onDone`.
++5. Persist nothing locally: after `onDone`, `GET /api/conversation/{id}` gives the canonical,
++   reload-safe thread (the mock store keeps conversations in memory only).
++
++---
++
++## 5. Store integration (`store.tsx`)
++
++| Handler | Mutation |
++|---|---|
++| `onUserMessage` | append `msg`, set conversation `updated_at` |
++| `onAssistantCreated` | append placeholder |
++| `onSubProcess` | find the message containing `stepId`, `{...step, ...patch}` |
++| `onToken` | last assistant message: `status="streaming"`, `content += token` |
++| `onDone` | last assistant message: `status="completed"`, replace content, set `sources`, clear streaming/cancel |
++| `onError` | `status="failed"`, toast, clear streaming/cancel |
++
++`patchConversation` always returns a **new** array sorted by `updated_at` desc. Token patches run
++per chunk (1-2 chars), so this is the hottest React path in the app — keep the reducer shallow.
++
++`stopStreaming()` calls the returned cancel closure and clears `streaming`; the partially rendered
++message stays.
++
++---
++
++## 6. Testing streaming changes
++
++There is no automated SSE test. Manual loop:
++
++```bash
++# 1. backend running with a real conversation
++curl -N "localhost:8000/api/conversation/<ID>/message?user_message=What%20was%20FY2025%20revenue%3F"
++# 2. confirm persistence + status
++curl -s localhost:8000/api/conversation/<ID> | jq '.messages[-1] | {status, len:(.content|length), subs:(.sub_processes|length)}'
++```
++
++If you write a test, drive `handle_chat_message` with an `anyio` stream and a stubbed
++`get_chat_engine` (patch `app.chat.messaging.get_chat_engine`) — that is the cheapest way to pin
++the frame contract without Gemini.
