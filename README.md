@@ -274,7 +274,7 @@ Vectors live alongside in `data_pg_vector_store` (managed by LlamaIndex), linked
 
 ```
 fincitee/
-├── backend/                         # FastAPI + LlamaIndex service  → see backend/README.md
+├── backend/                         # FastAPI + LlamaIndex service
 │   ├── app/
 │   │   ├── main.py                  #   bootstrap, lifespan, uvicorn entrypoint
 │   │   ├── core/config.py           #   pydantic-settings; env validation & URL normalisation
@@ -301,19 +301,18 @@ fincitee/
 │   ├── tests/                       #   15 unit tests, fully mocked (no DB / API key)
 │   ├── Dockerfile · docker-compose.yml · pyproject.toml · uv.lock · .env.example
 │
-├── frontend/                        # React research terminal  → see frontend/README.md
+├── frontend/                        # React research terminal
 │   ├── src/
 │   │   ├── App.tsx                  #   shell: ticker · sidebar · views · drawers · splash
 │   │   ├── store.tsx                #   React-context store: docs, threads, streaming, health
 │   │   ├── lib/
-│   │   │   ├── api.ts               #   API facade: live transport (fetch + SSE) · demo transport
-│   │   │   ├── backend.ts           #   wire ⇄ domain mappers, citation flattening, SSE reader
+│   │   │   ├── api.ts               #   API facade: MockTransport (active) + RealTransport (incomplete)
 │   │   │   ├── types.ts             #   domain types
 │   │   │   ├── format.ts            #   labels, formatters
 │   │   │   └── mockData.ts          #   seeded demo corpus + canned answers
 │   │   └── components/              #   ChatView · LibraryView · MessageItem · ResearchTrail
 │   │                                #   CiteMarkdown · SourceDrawer · Sidebar · Composer …
-│   ├── index.html · vite.config.ts (dev proxy, modes) · tsconfig.json · package.json
+│   ├── index.html · vite.config.ts · tsconfig.json · package.json
 │
 ├── LICENSE                          # MIT
 └── README.md                        # you are here
@@ -347,10 +346,8 @@ By subsystem:
 | | Optional Sentry, configurable CORS, structured logging | ✅ |
 | | OpenAPI / Swagger / ReDoc at `/api/docs`, `/api/redoc` | ✅ |
 | **Frontend** | Research threads, streaming answers, live research trail, citation chips, source drawer | ✅ |
-| | Filing library: drag-and-drop upload with NSE metadata form, search, detail drawer, scoped threads | ✅ |
-| | Live transport over the backend's SSE snapshot protocol (`fetch` streaming, cancellable) with a typed adapter layer | ✅ |
-| | Threads persist across reloads — re-hydrated from the API with history, trail and citations | ✅ |
-| | Demo mode (`--mode mock`): seeded corpus + canned cited answers, no backend required | ✅ |
+| | Filing library: drag-and-drop upload, search, detail drawer, scoped threads | ✅ |
+| | Mock transport: seeded corpus + canned cited answers, no backend required | ✅ |
 | | Single-file production build (`dist/index.html`) | ✅ |
 
 ### Try it in the sandbox
@@ -358,8 +355,8 @@ By subsystem:
 Four ways to exercise the system:
 
 ```bash
-# 0. The research terminal — upload a filing, ask, click a citation
-cd frontend && npm ci && npm run dev          # http://localhost:5173 (proxies /api to :8000)
+# 0. The research terminal (mock mode — no backend required)
+cd frontend && npm ci && npm run dev          # http://localhost:5173
 
 # 1. Swagger UI — interactive, every endpoint (use /test_message for a non-streamed answer)
 open http://localhost:8000/api/docs
@@ -406,20 +403,21 @@ cd backend && docker compose up --build
 ```bash
 cd frontend
 npm ci
-npm run dev                    # http://localhost:5173 — talks to the backend on :8000 through the dev proxy
-npm run dev:mock               # no backend? the same UI on a seeded demo corpus
+npm run dev                    # http://localhost:5173 — runs in mock mode (no backend required)
 npm run build                  # → dist/index.html, a single static file
+npm run preview                # serve the production build
 ```
 
-The dev server proxies `/api/*` to `VITE_PROXY_TARGET` (default `http://localhost:8000`), so no CORS configuration is needed locally. For a split deployment set `VITE_API_URL` at build time and add that origin to the backend's `BACKEND_CORS_ORIGINS`. Details, including how the UI maps the API's protocol, are in the [frontend README](frontend/README.md#6-the-backend-adapter).
+The frontend currently runs against an in-memory mock transport (`USE_MOCK = true` in `src/lib/api.ts`). To connect to the real backend, you would need to edit `src/lib/api.ts` and set `USE_MOCK = false`, but note that the `RealTransport` implementation is incomplete and does not match the backend's SSE contract (see AGENTS.md §14.B).
 
 ### 6.4 Run the tests
 
 ```bash
 cd backend && uv run pytest -q      # 15 passed — no database or API key required
-cd frontend && npm run typecheck    # strict TypeScript, zero errors
-cd frontend && npm run check:adapter   # UI transport vs. a protocol stub of the API (see frontend/README.md § 6)
+cd frontend && npx tsc --noEmit     # TypeScript typecheck (currently 5 errors, see AGENTS.md §14.A)
 ```
+
+There is no `npm run typecheck` or `npm run check:adapter` script; run `npx tsc --noEmit` directly for type checking.
 
 ---
 
@@ -479,8 +477,10 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 | Document | Audience | Contents |
 |---|---|---|
 | **This file** | Everyone | Product, architecture, capabilities, quick start |
+| [`AGENTS.md`](AGENTS.md) | AI agents / contributors | Repo map, verified commands, known issues, coding conventions, agent rules |
 | [`backend/README.md`](backend/README.md) | Backend / ML engineers | Harness internals, SSE protocol, data model, configuration, API reference, ops |
-| [`frontend/README.md`](frontend/README.md) | Frontend engineers / designers | UI anatomy, design system, state & transport layers, the backend adapter, live vs demo mode |
+
+> **Note:** `frontend/README.md` and `backend/CONTEXT.md` do not currently exist. The `docs/agents/` directory with module-level deep dives is referenced in `AGENTS.md` but not yet created.
 
 ---
 
