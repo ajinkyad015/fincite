@@ -902,6 +902,10 @@ the pytest output). Not urgent, but a migration to `google-genai` will eventuall
 11. **Never reformat unrelated files.** Diffs should be scoped; this codebase mixes legacy and
     modern Python styles on purpose.
 
+12. - After completing any task that changes architecture, adds new modules,
+    or modifies data models, you MUST update the relevant sections of
+    AGENTS.md before finishing.
+
 ---
 
 ### Quick "is it healthy?" checklist
