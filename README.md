@@ -331,21 +331,28 @@ By subsystem:
 | | SHA-256 duplicate detection (idempotent re-upload) | ✅ |
 | | Page-labelled parsing → sentence-aware chunking → Gemini embeddings → pgvector | ✅ |
 | | Atomic rollback of Storage + DB on indexing failure | ✅ |
-| **Conversations** | Create / fetch / delete conversations scoped to 1..n documents | ✅ |
+| | **Background indexing** (202 + `status`/`progress`/`error`, polled by the UI) | ✅ |
+| | **Delete a filing** — vectors, stored PDF, links and rows | ✅ |
+| | **Re-index / retry** from the stored PDF | ✅ |
+| | **PDF streaming** through the API (`/file`, `#page=N` ready) | ✅ |
+| **Conversations** | Create / fetch / patch / delete conversations scoped to 0..n documents | ✅ |
+| | **Thread index** — title, message count, preview, last activity | ✅ |
 | | Chat history replay (failed / empty messages filtered out) | ✅ |
 | **Reasoning** | ReAct agent with domain system prompt (units, FY, citations, refusal) | ✅ |
 | | Per-document isolated retrieval (metadata-filtered, top-3) | ✅ |
 | | Multi-document sub-question decomposition with async fan-out | ✅ |
 | | Custom QA / Refine synthesis prompts | ✅ |
 | **Streaming** | SSE token stream with structured sub-process events | ✅ |
-| | Page-level citations with passage text + relevance score | ✅ |
-| | Full reasoning trace persisted per message | ✅ |
+| | **`POST /message`** with the question in the body (GET kept, deprecated) | ✅ |
+| | Page-level citations with passage text + relevance score, **flattened onto the message** | ✅ |
+| | Full reasoning trace persisted per message, with step labels + durations | ✅ |
+| | **Durable partials** — user message + placeholder written first, content flushed mid-stream | ✅ |
 | **Ops** | One-shot deploy bootstrap, multi-worker uvicorn, pooled connections | ✅ |
 | | Alembic migrations with head verification at boot | ✅ |
 | | Docker image + compose with local pgvector | ✅ |
 | | Optional Sentry, configurable CORS, structured logging | ✅ |
 | | OpenAPI / Swagger / ReDoc at `/api/docs`, `/api/redoc` | ✅ |
-| **Frontend** | Research threads, streaming answers, live research trail, citation chips, source drawer | ✅ |
+| **Frontend** | Research threads, streaming answers, live research trail, citation chips, source drawer | ✅ (demo data) |
 | | Filing library: drag-and-drop upload, search, detail drawer, scoped threads | ✅ |
 | | Mock transport: seeded corpus + canned cited answers, no backend required | ✅ |
 | | Single-file production build (`dist/index.html`) | ✅ |
@@ -403,39 +410,68 @@ cd backend && docker compose up --build
 ```bash
 cd frontend
 npm ci
-npm run dev                    # http://localhost:5173 — runs in mock mode (no backend required)
+npm run dev                    # http://localhost:5173 — demo data (mock transport)
+npm run dev:real               # same UI against the backend via the Vite /api proxy
 npm run build                  # → dist/index.html, a single static file
-npm run preview                # serve the production build
+npm run typecheck              # tsc --noEmit (0 errors)
 ```
 
-The frontend currently runs against an in-memory mock transport (`USE_MOCK = true` in `src/lib/api.ts`). To connect to the real backend, you would need to edit `src/lib/api.ts` and set `USE_MOCK = false`, but note that the `RealTransport` implementation is incomplete and does not match the backend's SSE contract (see AGENTS.md §14.B).
+Transport selection is environment-driven — no source edits:
+
+| `VITE_USE_MOCK` | Behaviour |
+|---|---|
+| unset | mock while `vite dev`, real API in a production build |
+| `1` | always mock (demo mode, `npm run dev:mock` / `npm run build:demo`) |
+| `0` | always real (`npm run dev:real`) |
+
+`VITE_API_URL` defaults to `""` (same origin), which is what the Vite dev proxy
+(`server.proxy`, target `VITE_PROXY_TARGET`) and the production reverse proxy expect — so CORS is not
+part of local development. See `frontend/.env.example`.
+
+> **Status:** the backend contract is complete and tested (M1), but the UI's `RealTransport` still
+> speaks the pre-M1 protocol (no `POST /message`, no `sources`, no thread list/status polling).
+> Connecting the two is M2 of [`docs/plans/connect-and-deploy.md`](docs/plans/connect-and-deploy.md);
+> until it lands, treat the frontend as a working demo shell.
 
 ### 6.4 Run the tests
 
 ```bash
-cd backend && uv run pytest -q      # 15 passed — no database or API key required
-cd frontend && npx tsc --noEmit     # TypeScript typecheck (currently 5 errors, see AGENTS.md §14.A)
+cd backend && uv run pytest -q      # 52 passed — no database or API key required
+cd frontend && npm run typecheck     # 0 errors
+cd frontend && npm run build         # single dist/index.html
 ```
 
-There is no `npm run typecheck` or `npm run check:adapter` script; run `npx tsc --noEmit` directly for type checking.
+CI (`.github/workflows/ci.yml`) runs the backend suite, the typecheck, and both the real and demo builds
+on every push, so mock mode cannot rot.
 
 ---
 
 ## 7. API surface
 
-All routes are prefixed with `/api`. Full request/response documentation lives in the [backend README](backend/README.md#8-api-reference) and in the generated OpenAPI spec.
+All routes are prefixed with `/api`. Full request/response documentation lives in
+[`docs/agents/API_REFERENCE.md`](docs/agents/API_REFERENCE.md) and in the generated OpenAPI spec.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health/` | Liveness probe — runs `SELECT 1` |
-| `POST` | `/document/upload` | Multipart PDF upload + synchronous indexing → `201 { status: "indexed" }` |
-| `GET` | `/document/` | List documents (optionally `?document_ids=…`) |
-| `GET` | `/document/{id}` | Fetch one document with its NSE metadata |
-| `POST` | `/conversation/` | Create a conversation over `document_ids[]` |
-| `GET` | `/conversation/{id}` | Conversation + messages + sub-process trace |
-| `DELETE` | `/conversation/{id}` | Delete a conversation → `204` |
-| `GET` | `/conversation/{id}/message?user_message=` | **SSE** — streamed assistant answer with research trail |
+| `GET` | `/health/` | Liveness + readiness → `{status, db, version, uptime_s}` (never 5xx) |
+| `GET` | `/config/` | Public runtime config: upload limit, accepted types, `auth_enabled`, `demo_mode` |
+| `POST` | `/document/upload` | Multipart PDF upload → **202** `{status:"uploaded"}`; indexing runs in the background |
+| `GET` | `/document/` | List documents (`?status=&q=&limit=&offset=`) → `[]` when empty |
+| `GET` | `/document/{id}` | One document incl. `status` / `progress` / `error` |
+| `GET` | `/document/{id}/file` | Streams the original PDF (citation viewer, `#page=N`) |
+| `POST` | `/document/{id}/reindex` | Re-run ingestion from the stored PDF (retry) |
+| `DELETE` | `/document/{id}` | Delete vectors + stored PDF + rows → `204` |
+| `POST` | `/conversation/` | Create a thread over `document_ids[]` (optional) + `title` |
+| `GET` | `/conversation/` | Thread index: title, message count, preview, last activity |
+| `GET` | `/conversation/{id}` | Thread + messages + research trail + citations |
+| `PATCH` | `/conversation/{id}` | Rename and/or replace the document scope |
+| `DELETE` | `/conversation/{id}` | Delete a thread → `204` |
+| `POST` | `/conversation/{id}/message` | **SSE** — `{"content": "…"}` → streamed answer with trail + citations |
+| `GET` | `/conversation/{id}/message?user_message=` | Same stream (deprecated, kept for `curl`) |
 | `GET` | `/conversation/{id}/test_message?user_message=` | Same, non-streamed (handy in Swagger) |
+
+Full request/response documentation: [`docs/agents/API_REFERENCE.md`](docs/agents/API_REFERENCE.md) and
+the generated OpenAPI spec at `/api/docs`.
 
 ---
 
@@ -452,6 +488,10 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 | `GEMINI_CHAT_LLM_NAME` | `models/gemini-1.5-flash` | Reasoning / synthesis model |
 | `GEMINI_EMBEDDING_MODEL_NAME` | `models/gemini-embedding-001` | Embedding model |
 | `VECTOR_STORE_TABLE_NAME` / `VECTOR_STORE_EMBED_DIM` | `pg_vector_store` / `3072` | pgvector table & dimension (must match the embedding model) |
+| `MAX_UPLOAD_MB` | `50` | Upload size ceiling (413 above it) |
+| `INGESTION_ENABLED` | `true` | `false` accepts uploads without indexing them |
+| `AUTH_ENABLED` | `false` | Reserved for M4 (Supabase JWT); endpoints are public while false |
+| `DEMO_MODE` | `false` | Labels a seeded/demo deployment |
 | `BACKEND_WORKERS` | `4` | uvicorn worker processes |
 | `BACKEND_CORS_ORIGINS` | `[]` | JSON list or comma-separated origins |
 | `LOG_LEVEL` | `INFO` | `DEBUG` also enables uvicorn reload + verbose agent traces |
@@ -461,12 +501,15 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 
 ## 9. Roadmap
 
-- [ ] **Background indexing** — move embedding to a job queue with progress events for 300-page filings.
+- [x] **Background indexing** — uploads return 202 and a job reports `status`/`progress`/`error`
+      (process-local scheduler; a durable queue is the follow-up).
 - [ ] **Authentication & tenancy** — per-user libraries and threads.
 - [ ] **Hybrid retrieval + reranking** — BM25 fusion and a cross-encoder stage ahead of synthesis.
-- [ ] **In-app PDF viewer** — jump from a citation chip to the highlighted page.
+- [ ] **In-app PDF viewer** — backend half is done (`GET /api/document/{id}/file` streams the PDF);
+      the UI viewer is M3.
 - [ ] **Richer NSE metadata** — quarterly results, concall transcripts, shareholding patterns as first-class document types (the UI already labels them).
-- [ ] **Conversation listing** — a server-side thread index so libraries follow the user across devices.
+- [x] **Conversation listing** — `GET /api/conversation/` returns the sidebar index (title, preview,
+      message count, last activity).
 - [ ] **Evaluation harness** — golden Q&A set over public filings for regression-testing answer faithfulness.
 - [ ] **Model abstraction** — swap Gemini for other providers via LlamaIndex settings.
 
@@ -480,7 +523,9 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 | [`AGENTS.md`](AGENTS.md) | AI agents / contributors | Repo map, verified commands, known issues, coding conventions, agent rules |
 | [`backend/README.md`](backend/README.md) | Backend / ML engineers | Harness internals, SSE protocol, data model, configuration, API reference, ops |
 
-> **Note:** `frontend/README.md` and `backend/CONTEXT.md` do not currently exist. The `docs/agents/` directory with module-level deep dives is referenced in `AGENTS.md` but not yet created.
+> **Note:** `frontend/README.md` and `backend/CONTEXT.md` do not exist. `docs/agents/` holds the
+> module-level deep dives, and [`docs/plans/connect-and-deploy.md`](docs/plans/connect-and-deploy.md)
+> is the roadmap for connecting the frontend to the backend and deploying them.
 
 ---
 

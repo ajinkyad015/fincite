@@ -1,307 +1,237 @@
 # API REFERENCE — fincitee
 
-Base URL: `http://localhost:8000` (dev) · Prefix: **`/api`** (`settings.API_PREFIX`) ·
-Interactive docs: `/api/docs` (Swagger), `/api/redoc`, spec at `/api/openapi.json`.
+Everything the frontend is allowed to rely on. Base path: `settings.API_PREFIX` (`/api`).
+Shapes are defined in [`backend/app/schema.py`](../../backend/app/schema.py); OpenAPI is served at
+`/api/openapi.json`, Swagger at `/api/docs`, ReDoc at `/api/redoc`.
 
-All handlers are `async def` and take `db: AsyncSession = Depends(get_db)` unless noted.
-Response models come from `app/schema.py`. There is **no authentication** on any route.
-
-Route table verified by enumerating the live `app` object:
-
-```
-GET    /api/openapi.json              GET /api/docs            GET /api/redoc
-POST   /api/conversation/             GET /api/conversation/{conversation_id}
-DELETE /api/conversation/{conversation_id}
-GET    /api/conversation/{conversation_id}/message
-GET    /api/conversation/{conversation_id}/test_message
-POST   /api/document/upload           GET /api/document/       GET /api/document/{document_id}
-GET    /api/health/
-```
-
-Note the **trailing slashes** on collection routes (`/api/conversation/`, `/api/document/`,
-`/api/health/`); FastAPI's default `redirect_slashes` will 307 the slashless variant.
+> **Status:** updated for the M1 contract (async ingestion, thread index, message-level citations,
+> `POST` streaming). See `docs/plans/connect-and-deploy.md`.
 
 ---
 
-## 1. Health
+## 0. Conventions
 
-### `GET /api/health/`
-`app/api/endpoints/health.py:11` · no auth · no schema
+| Topic | Rule |
+|---|---|
+| IDs | UUID strings |
+| Timestamps | ISO-8601 UTC (`created_at`, `updated_at`) |
+| Enum casing | lowercase values (`document.status = "ready"`, `document_type = "annual_report"`); message/sub-process statuses stay upper-case (`PENDING`, `SUCCESS`, `ERROR`, `FINISHED`) for backwards compatibility |
+| Empty result | `200` + `[]` — never 404 for "nothing yet" |
+| Errors | `{"detail": "…"}`; 400 bad input, 404 missing, 409 conflict (e.g. nothing indexed / job already running), 413 too large, 422 validation, 502 upstream (storage), 503 dependency unavailable |
+| Secrets | the service-role key and API keys never appear in any response |
 
-Executes `SELECT 1` through the request session, then:
+---
 
-```json
-{"status": "alive"}
+## 1. Health & config
+
+### `GET /api/health/` → `HealthResponse`
+
+Always **200**; the payload distinguishes "API down" from "API up, database down".
+
+```jsonc
+{"status": "healthy", "db": true, "vector_store": null, "version": "0.2.0", "uptime_s": 1284.3}
 ```
 
-| Status | When |
-|---|---|
-| 200 | DB reachable |
-| 500 | DB unreachable (the SQLAlchemy exception escapes — no handler) |
+`status` is `"healthy" | "degraded"` (`degraded` ⇒ `db: false`). The UI polls this for the sidebar
+indicator and treats a network error as "down".
 
-The frontend polls this every 25 s (`App.tsx:29`) and renders the dot in `Sidebar`; a failure is
-treated as `{"status":"down"}` client-side. The UI expects a `healthy` value, which this endpoint
-never returns — see `AGENTS.md §14.K`.
+### `GET /api/config/` → `ConfigResponse`
+
+Public, non-secret runtime configuration.
+
+```jsonc
+{"version": "0.2.0", "max_upload_mb": 50, "supported_content_types": ["application/pdf"],
+ "auth_enabled": false, "demo_mode": false}
+```
 
 ---
 
 ## 2. Documents
 
-### `POST /api/document/upload` → **201**
+### `POST /api/document/upload` → **202** `DocumentUploadResponse`
 
-`app/api/endpoints/documents.py:50`
+Multipart. **Indexing is asynchronous**: the response means "accepted", not "indexed".
 
-**Request** — `multipart/form-data` (`python-multipart`):
-
-| Field | Type | Required | Description |
+| Field | Type | Required | Notes |
 |---|---|---|---|
-| `file` | file | **yes** | PDF; validated by content-type (`application/pdf` or absent) **and** `%PDF` magic bytes |
-| `company_name` | str | no | defaults to a title-cased version of the filename |
-| `company_symbol` | str | no | NSE ticker, e.g. `RELIANCE` |
-| `financial_year` | str | no | e.g. `2025` |
-| `document_type` | enum | no | `annual_report` (default) \| `financial_results` \| `corporate_filing` \| `investor_presentation` \| `other` |
+| `file` | file | **yes** | PDF; validated by content-type and `%PDF` magic bytes, and by `MAX_UPLOAD_MB` (413 if bigger) |
+| `company_name` | str | no | defaults to a title-cased filename |
+| `company_symbol` | str | no | NSE ticker, upper-cased server-side |
+| `financial_year` | str | no | `2024-25`, `FY2024-25`, `2025` — normalised to `FY2024-25` on read |
+| `document_type` | enum | no | `annual_report` (default) \| `quarterly_results` \| `concall_transcript` \| `investor_presentation` \| `shareholding_pattern` \| `corporate_announcement` \| `financial_results` \| `corporate_filing` \| `other` |
 | `exchange` | str | no | default `NSE` |
 
-**Response 201** (`schema.DocumentUploadResponse`):
-
-```json
+```jsonc
 {
-  "id": "0f0b6f9e-6f0e-4a3a-9f5e-6d0f3f9a1b2c",
-  "url": "https://<project>.supabase.co/storage/v1/object/public/annual-reports/documents/0f0b…/original.pdf",
-  "metadata_map": {
-    "nse_document": {
-      "company_name": "Reliance Industries Limited",
-      "company_symbol": "RELIANCE",
-      "document_type": "annual_report",
-      "financial_year": "2025",
-      "report_date": null,
-      "exchange": "NSE",
-      "original_filename": "reliance-ar-2025.pdf"
-    },
-    "content_hash": "9f2c…",
-    "original_filename": "reliance-ar-2025.pdf"
-  },
-  "status": "indexed",
-  "created_at": "2026-10-24T12:00:00",
-  "updated_at": "2026-10-24T12:00:00"
+  "id": "…", "url": "https://…/documents/{id}/original.pdf",
+  "status": "uploaded", "progress": 0, "error": null,
+  "page_count": null, "file_size": 24800000, "content_hash": "<sha256>",
+  "metadata_map": {"nse_document": {…}, "content_hash": "…", "original_filename": "reliance.pdf"},
+  "created_at": "…", "updated_at": "…"
 }
 ```
 
-**Behaviour**
+* **Duplicate content** (same SHA-256) → **200** with the existing document; nothing is re-indexed.
+* Failure points: 400 not a PDF / empty, 413 too large, 500 storage or DB error (the stored object is
+  removed on DB failure).
 
-1. Empty body → `400 {"detail": "The uploaded file is empty."}`
-2. Non-PDF content-type → `400 {"detail": "Only PDF files are accepted. Received content-type: …"}`
-3. No `%PDF` prefix → `400 {"detail": "The uploaded file does not appear to be a valid PDF."}`
-4. **Duplicate (same SHA-256)** → returns the **existing** document with `status: "indexed"`,
-   HTTP **201** (idempotent; no second storage object).
-5. Storage upload failure → `500 {"detail": "Failed to upload file to storage: …"}`
-6. DB insert failure → storage object deleted, `500 {"detail": "Failed to create document record in database."}`
-7. Indexing failure → DB row + storage object deleted, `422 {"detail": "PDF indexing failed. The file may be corrupted or unreadable: …"}`
+**Lifecycle** (`document.status`, polled by the library):
 
-**Timing** — indexing (parse → chunk → Gemini embeddings → pgvector) happens **inside** this
-request. Multi-hundred-page PDFs can take minutes; there is no progress channel.
-
-**curl**
-
-```bash
-curl -X POST localhost:8000/api/document/upload \
-  -F "file=@reliance-ar-2025.pdf;type=application/pdf" \
-  -F "company_name=Reliance Industries Limited" \
-  -F "company_symbol=RELIANCE" -F "financial_year=2025" -F "document_type=annual_report"
+```
+uploaded → parsing → chunking → embedding → indexing → ready
+                                                    ↘ failed (document.error has the reason)
 ```
 
-### `GET /api/document/` → `List[Document]`
+### `GET /api/document/` → `List[Document>`
 
-`documents.py:186` · optional repeatable query `document_ids=<uuid>`
-
-```json
-[{"id":"…","url":"…","metadata_map":{…},"created_at":"…","updated_at":"…"}]
-```
-
-- **404 `{"detail":"Document(s) not found"}` when the result set is empty** (including an empty
-  library). Quirk, see `AGENTS.md §14.L`.
-- No pagination, no filtering by company/symbol/type.
+Query: `document_ids` (repeatable), `status`, `q` (company / symbol / fiscal year / filename),
+`limit` (`1..200`), `offset`. **`200 []` for an empty library.**
 
 ### `GET /api/document/{document_id}` → `Document`
 
-`documents.py:205` · path param is a `UUID` (FastAPI returns 422 for a malformed UUID).
-Returns `docs[0]` from `crud.fetch_documents(id=…)`; `404 {"detail":"Document not found"}` if absent.
+404 when missing. Includes `status` / `progress` / `error` / `page_count` / `file_size`.
+
+### `GET /api/document/{document_id}/file` → `application/pdf`
+
+Streams the original PDF **through the API** (the bucket can stay private; the service-role key never
+leaves the server). `?download=true` forces `Content-Disposition: attachment`. The citation viewer uses
+`#page=N` on this URL. 502 if storage is unreachable.
+
+### `POST /api/document/{document_id}/reindex` → **202** `DocumentUploadResponse`
+
+Re-runs ingestion from the stored PDF. Clears existing vectors first so chunks cannot double-count.
+409 while a job is already running. This is the library's "Retry indexing" action.
+
+### `DELETE /api/document/{document_id}` → **204**
+
+Deletes vectors → stored object → conversation links → row. If the vectors cannot be cleared the
+request fails with **503** and nothing is deleted (a filing that is invisible but still retrievable is
+worse than a failed delete).
 
 ---
 
 ## 3. Conversations
 
-### `POST /api/conversation/` → `Conversation`
+### `POST /api/conversation/` → **201** `Conversation`
 
-`conversation.py:31`
-
-**Request**
-
-```json
-{"document_ids": ["0f0b6f9e-6f0e-4a3a-9f5e-6d0f3f9a1b2c"]}
+```jsonc
+{"document_ids": ["<uuid>", …], "title": "Optional name"}   // both optional
 ```
 
-**Response** (`schema.Conversation`; `messages` empty on creation)
+An **empty scope is allowed** — create the thread, then `PATCH` the scope (this is how "New chat" works).
+404 if any `document_id` does not exist.
 
-```json
-{
-  "id": "6d8f…",
-  "created_at": "2026-10-24T12:03:11",
-  "updated_at": "2026-10-24T12:03:11",
-  "messages": [],
-  "documents": [{"id": "0f0b…", "url": "…", "metadata_map": {…}, "created_at": "…", "updated_at": "…"}]
-}
+### `GET /api/conversation/` → `List[ConversationSummary>`
+
+The thread index for the sidebar. Query: `limit` (`1..200`), `offset`, `q` (title search).
+
+```jsonc
+{"id": "…", "title": "Compare FY24 revenue", "created_at": "…", "updated_at": "…",
+ "last_message_at": "…", "message_count": 6, "document_ids": ["…"],
+ "preview": "Compare FY24 revenue across Reliance and TCS…"}
 ```
 
-Errors: `404 {"detail":"Documents not found: <id>, <id>"}` when any supplied id is unknown.
-An empty `document_ids` list is allowed and produces a conversation with no scope (the agent then
-has zero document tools — answers will be empty).
-
-`crud.create_conversation` (`crud.py:42`) inserts the conversation plus one
-`conversationdocument` row per id, then re-reads with eager loading.
+Ordered by `last_message_at` then `created_at`, newest first. Never includes message bodies.
 
 ### `GET /api/conversation/{conversation_id}` → `Conversation`
 
-`conversation.py:53` · includes every message (ordered as the DB returns them) with its full
-`sub_processes` array, plus the linked documents. `404 {"detail":"Conversation not found"}`.
+Messages (oldest first) each with `sub_processes[]` **and** a flat `sources[]`:
 
-### `DELETE /api/conversation/{conversation_id}` → **204**, empty body
+```jsonc
+{"id": "…", "title": "…", "last_message_at": "…",
+ "documents": [{"id": "…", "metadata_map": {…}, "status": "ready", …}],
+ "messages": [
+   {"id": "…", "role": "user", "content": "What was FY24 revenue?", "status": "SUCCESS",
+    "sub_processes": [], "sources": []},
+   {"id": "…", "role": "assistant", "content": "₹9.0 lakh crore [1]", "status": "SUCCESS",
+    "sub_processes": [
+      {"id": "…", "source": "SUB_QUESTION", "status": "FINISHED",
+       "name": "What was FY24 revenue?", "duration_ms": 812,
+       "metadata_map": {"sub_question": {"question": "…", "answer": "…", "citations": [{…}]}}}
+    ],
+    "sources": [
+      {"index": 1, "document_id": "…", "page": 41, "excerpt": "Revenue from operations …", "score": 0.91}
+    ]}
+ ]}
+```
 
-`conversation.py:66` · `404 {"detail":"Conversation not found"}` if the row is absent.
+`sources[].index` matches the `[n]` markers in the answer text. `sources` is also persisted, so it
+survives a reload.
 
-⚠ Does **not** delete child `message` / `messagesubprocess` / `conversationdocument` rows, and the
-FKs have no `ON DELETE CASCADE` ⇒ a conversation with messages raises a FK violation (500). See
-`AGENTS.md §14.E`.
+### `PATCH /api/conversation/{conversation_id}` → `Conversation`
+
+```jsonc
+{"title": "Renamed thread"}            // or
+{"document_ids": ["<uuid>", …]}        // replaces the scope entirely ([] = all filings)
+```
+
+404 for a missing thread or unknown document ids.
+
+### `DELETE /api/conversation/{conversation_id}` → **204**
+
+Deletes messages, sub-processes and scope links (explicitly *and* via `ON DELETE CASCADE`).
 
 ---
 
 ## 4. Chat / SSE
 
-### `GET /api/conversation/{conversation_id}/message?user_message=<text>` → `text/event-stream`
-
-`conversation.py:81` · returns `EventSourceResponse(event_publisher())`.
-
-⚠ The message is a **query parameter** (`user_message`), not a body — GET with side effects.
-The user message is persisted only at the end of the stream.
-
-**Protocol**
-
-- Event type: **none** (default `message` event); each frame's `data` is one JSON object.
-- Payload: a complete `schema.Message` snapshot (not a delta). `content` and `sub_processes`
-  grow monotonically across frames.
-- `status` is `PENDING` while generating; the last frame carries `SUCCESS` or `ERROR`.
-- The final frame is re-read from the DB, so it contains the persisted ids/timestamps.
-
-Frame shape:
+### `POST /api/conversation/{conversation_id}/message` → `text/event-stream` **(preferred)**
 
 ```jsonc
-{
-  "id": "b1e0…",                       // assistant message id (uuid4 generated up-front)
-  "conversation_id": "6d8f…",
-  "content": "Reliance's FY2025 consolidated revenue was …",   // cumulative
-  "role": "assistant",
-  "status": "PENDING",
-  "sub_processes": [
-    {
-      "id": null,
-      "message_id": "b1e0…",
-      "source": "SUB_QUESTION",
-      "status": "FINISHED",
-      "metadata_map": {
-        "sub_question": {
-          "question": "What was Reliance's FY2025 consolidated revenue?",
-          "answer": "₹ 10,71,774 crore",
-          "citations": [
-            {"document_id": "0f0b…", "text": "…consolidated revenue…", "page_number": 112, "score": 0.83}
-          ]
-        }
-      }
-    }
-  ],
-  "created_at": "2026-10-24T12:05:01",
-  "updated_at": null
-}
+{"content": "Compare FY24 revenue across both filings"}
 ```
 
-Sub-process semantics (produced by `ChatCallbackHandler`, `chat/messaging.py`):
+### `GET /api/conversation/{conversation_id}/message?user_message=<text>` → `text/event-stream` (deprecated)
 
-| Field | Meaning |
-|---|---|
-| `source` | `MessageSubProcessSourceEnum[event_type.name]` — e.g. `LLM`, `RETRIEVE`, `SYNTHESIZE`, `SUB_QUESTION`, `AGENT_STEP`, plus synthetic `CONSTRUCTED_QUERY_ENGINE` (engine built) |
-| `status` | `PENDING` on the start event, `FINISHED` on the end event of the same `event_id` |
-| `metadata_map.sub_question` | only for `SUB_QUESTION`: question, answer, citations |
-
-The **first** frame after the engine is built is always
-`{source: "CONSTRUCTED_QUERY_ENGINE", status: "FINISHED"}`.
-
-Persistence & edge cases:
-
-- On success, the user message and the assistant message (with all sub-processes) are committed
-  and the final snapshot is emitted.
-- On exception: assistant `status="ERROR"`, both messages still committed, no 5xx (the response
-  has already started).
-- If the model produced no text, the stream contains the canned apology
-  `"Sorry, I either wasn't able to understand your question or I don't have an answer for it."`
-- Client disconnect closes the anyio send channel; the producer keeps running until it notices
-  `send_chan._closed`.
-
-**curl**
-
-```bash
-curl -N "localhost:8000/api/conversation/<ID>/message?user_message=What%20was%20FY2025%20revenue%3F"
-```
+Identical contract, question in the query string. Kept for `curl -N` and the terminal client.
 
 ### `GET /api/conversation/{conversation_id}/test_message?user_message=<text>` → `Message`
 
-`conversation.py:181` — calls `message_conversation(...)`, drains `response.body_iterator`, and
-returns the **last** frame parsed as `schema.Message`. Useful in Swagger (which cannot render SSE).
-Because `sse-starlette` 1.6.5 sets `body_iterator` to the raw async generator, the yielded values
-are the JSON strings themselves. On an unexpected empty stream it raises `500`.
+Runs the exact same pipeline (persistence, trail, citations) without streaming — handy in Swagger.
+
+**Stream contract**
+
+* **unnamed** events: `data: {…}` with no `event:` line;
+* every frame is a **complete** `Message` snapshot — `content` and `sub_processes` grow monotonically,
+  so a client replaces state instead of reassembling deltas;
+* `status` is `PENDING` while generating, then exactly one terminal `SUCCESS` or `ERROR`;
+* `: ping` comments every 15 s (keep-alive);
+* pre-stream failures are real HTTP errors, not error frames: 404 unknown thread, 409 nothing indexed,
+  422 empty question.
+
+**Durability** — a dropped connection loses at most the last ~1.5 s / 200 characters:
+
+1. the user message and an assistant placeholder row are committed **before** generation starts;
+2. assistant content is flushed during the stream (every 1.5 s or 200 chars);
+3. the terminal state (status, content, `sources`, `sub_processes`) is written even on disconnect or
+   engine failure. Reconnecting = `GET /api/conversation/{id}`.
+
+**Scope resolution** — a thread with no documents answers across *all* `ready` documents; if none are
+indexed the request is rejected with **409**.
 
 ---
 
-## 5. Error summary
+## 5. WebSocket / other
 
-| Code | Sources |
-|---|---|
-| 400 | empty upload, wrong content-type, missing `%PDF` magic |
-| 404 | conversation not found, document not found, **document list empty**, unknown `document_ids` on create |
-| 422 | FastAPI validation (bad UUID, missing required form field), PDF indexing failure |
-| 500 | storage upload failure, DB insert failure, `test_message` empty stream, unhandled FK violation on conversation delete, DB errors |
-
-Error body is always FastAPI's default `{"detail": "<message>"}`. There is no error code
-namespace and no structured error envelope.
+None. Streaming is SSE only; there is no websocket endpoint.
 
 ---
 
-## 6. Contract expected by the frontend (currently unmet)
+## 6. Frontend contract map (M2 work)
 
-`frontend/src/lib/api.ts` `RealTransport` is a stub that disagrees with the server:
+The UI is connected as of M2 of `docs/plans/connect-and-deploy.md`. Until then `frontend/src/lib/api.ts`
+(`RealTransport`) is stale; the mapping table for the wire→domain translation lives in that plan (§M2.1).
 
-| Client does | Server expects |
-|---|---|
-| `GET /api/conversation/{id}/message?q=<text>` | `?user_message=<text>` |
-| Listens for named SSE events `sub_process`, `delta`, `done` | unnamed frames, each a full `Message` |
-| `POST /api/conversation/ {title, document_scope}` | `{document_ids}` |
-| `DocumentUploadResponse {document: FinDocument}` | `{id,url,metadata_map,status,…}` (flat) |
-| `FinDocument` fields (`nse_symbol`, `fiscal_year`, `pages`) | `metadata_map.nse_document.*` |
-| Plain `EventSource` (no headers) | works, but no `Accept` control; errors surface as `onerror` |
-
-Also, `GET /api/document/` 404s on an empty library, which `listDocuments()` would surface as a
-JSON parse/`Error` — the transport has no status checking at all (`res.json()` on every response).
-
-If you implement the adapter: map wire→domain in one place, convert the snapshot stream into the
-store's `onSubProcess`/`onToken`/`onDone` callbacks (diff `content` to produce tokens), and derive
-`Source.index` from citation order within a message.
+| Concern | Wire shape | UI domain shape |
+|---|---|---|
+| document | `metadata_map.nse_document.{company_name,company_symbol,financial_year}` + `page_count` | `FinDocument.metadata.{company_name,nse_symbol,fiscal_year,pages}` |
+| status | `uploaded…ready/failed` | same names |
+| message sources | `message.sources[]` | `ChatMessage.sources[]` (identical fields) |
+| trail step | `source` (CBEventType) + `name` + `duration_ms` | `MessageSubProcess.{source,name,detail,duration_ms}` |
+| conversation | `documents[]`, `title`, `last_message_at` | `document_scope[]`, `title`, `updated_at` |
 
 ---
 
 ## 7. OpenAPI
 
-- Spec: `GET /api/openapi.json`; UI: `/api/docs`; ReDoc: `/api/redoc`.
-- Title `fincite` (`settings.PROJECT_NAME`), description mentions "AI financial research backend
-  for Indian / NSE company annual reports and filings".
-- Operations are tagged `conversation`, `document`, `health` (`api/api.py:6-10`).
-- The SSE endpoint appears as a normal `GET` returning `text/event-stream`; Swagger cannot render
-  it — use `curl -N` or the browser `EventSource`.
-- No security schemes are declared.
+`/api/openapi.json` (spec) · `/api/docs` (Swagger) · `/api/redoc` (ReDoc).

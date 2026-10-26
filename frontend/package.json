@@ -5,8 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:mock": "VITE_USE_MOCK=1 vite",
+    "dev:real": "VITE_USE_MOCK=0 vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "build:demo": "VITE_USE_MOCK=1 vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@vercel/analytics": "^2.0.1",
