@@ -157,6 +157,8 @@ adoc/
 # Environments
 .env
 .env.*
+# …but the committed templates are documentation, not secrets
+!.env.example
 .envrc
 .venv
 env/

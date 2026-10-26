@@ -1,6 +1,10 @@
 /**
  * Domain types
  *
+ * These are the shapes the UI renders. They are intentionally *not* the wire
+ * shapes: `src/lib/api.ts` (and, from M2 on, `src/lib/wire.ts`) is the only
+ * place allowed to translate API payloads into these types.
+ */
 
 export type NSEDocumentType =
   | "annual_report"

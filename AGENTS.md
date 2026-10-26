@@ -421,13 +421,18 @@ All tables inherit `Base` (`models/base.py:6`): `id UUID PK` (default
 
 | Table | Columns (beyond base) | Notes |
 |---|---|---|
-| `conversation` | — | container for messages + document scope |
-| `document` | `url String NOT NULL UNIQUE`, `metadata_map JSONB` | `url` = Supabase public URL |
-| `conversationdocument` | `conversation_id FK`, `document_id FK` | M:N join, both indexed |
-| `message` | `conversation_id FK`, `content String`, `role`, `status` | `status` default `PENDING` |
-| `messagesubprocess` | `message_id FK`, `source`, `status`, `metadata_map JSONB` | one row per LlamaIndex callback event |
+| `conversation` | `title String(200)`, `last_message_at DateTime` (indexed) | title derived from the first question; `last_message_at` orders the sidebar list |
+| `document` | `url String NOT NULL UNIQUE`, `metadata_map JSONB`, `status`, `progress`, `error Text`, `page_count`, `file_size`, `content_hash String(64) UNIQUE` | `url` = Supabase public URL; `status` drives the ingestion UI |
+| `conversationdocument` | `conversation_id FK`, `document_id FK` | M:N join, both indexed, both `ON DELETE CASCADE` |
+| `message` | `conversation_id FK`, `content String`, `role`, `status`, `sources JSONB` | `status` default `PENDING`; `sources` = citations flattened onto the message |
+| `messagesubprocess` | `message_id FK`, `source`, `status`, `name`, `duration_ms`, `metadata_map JSONB` | one row per LlamaIndex callback event; `name` is the research-trail label |
 
-**Enums** (`models/db.py`): `MessageRoleEnum` = `user|assistant`;
+`document.status` lifecycle (enum `DocumentStatusEnum`, **lowercase** names == values):
+`uploaded → parsing → chunking → embedding → indexing → ready`, with `failed` reachable from any
+non-terminal state. Ingestion runs in `app/ingestion/jobs.py`, not in the upload request.
+
+**Enums** (`models/db.py`): `DocumentStatusEnum` = `uploaded|parsing|chunking|embedding|indexing|ready|failed`;
+`MessageRoleEnum` = `user|assistant`;
 `MessageStatusEnum` = `PENDING|SUCCESS|ERROR`;
 `MessageSubProcessStatusEnum` = `PENDING|FINISHED`;
 `MessageSubProcessSourceEnum` = every `CBEventType` name **plus**
@@ -454,11 +459,13 @@ Python enum class names (`to_pg_enum`, `models/db.py:37`).
 
 ### 7.2 API schemas (`backend/app/schema.py`)
 
-`Base` (id/created_at/updated_at, `from_attributes=True`) → `Conversation`, `Message`,
-`MessageSubProcess`, `Document`, `DocumentUploadResponse`; plus `ConversationCreate
-{document_ids: List[UUID]}`, `UserMessageCreate {content}`, `NSEDocumentMetadata`,
-`NSEDocumentTypeEnum`, `DocumentMetadataKeysEnum`, `Citation`, `QuestionAnswerPair`,
-`SubProcessMetadataKeysEnum` (= `EventPayload.SUB_QUESTION.value`).
+`Base` (id/created_at/updated_at, `from_attributes=True`) → `Conversation`, `ConversationSummary`,
+`Message`, `MessageSubProcess`, `Document`, `DocumentUploadResponse`, `HealthResponse`,
+`ConfigResponse`; plus `ConversationCreate {document_ids?: List[UUID], title?}`,
+`ConversationUpdate {title?, document_ids?}`, `MessageCreate {content}` (`UserMessageCreate` is an
+alias), `NSEDocumentMetadata`, `NSEDocumentTypeEnum`, `DocumentMetadataKeysEnum`, `Citation`, `Source`,
+`QuestionAnswerPair`, `SubProcessMetadataKeysEnum` (= `EventPayload.SUB_QUESTION.value`) and the helper
+`schema.citations_to_sources()` / `schema.normalise_fiscal_year()`.
 
 `Citation.from_node` (`schema.py:47`) converts a `NodeWithScore` into
 `{document_id, text, page_number, score}` — this is the only citation source of truth.
@@ -483,34 +490,44 @@ holds the owning `document.id`; `metadata_->>'page_label'` holds the PDF page.
 
 All under `settings.API_PREFIX = "/api"`. Verified route table (enumerated from the live app):
 
-| Method | Path | Handler | Request | Response |
-|---|---|---|---|---|
-| GET | `/api/health/` | `endpoints/health.py:11` | — | `{"status":"alive"}` (runs `SELECT 1`) |
-| POST | `/api/document/upload` | `documents.py:50` | multipart: `file` + optional `company_name`, `company_symbol`, `financial_year`, `document_type`, `exchange` | **201** `DocumentUploadResponse {id,url,metadata_map,status:"indexed",created_at,updated_at}` |
-| GET | `/api/document/` | `documents.py:186` | `?document_ids=<uuid>&document_ids=<uuid>` (repeatable) | `List[Document]`; **404 if empty** |
-| GET | `/api/document/{document_id}` | `documents.py:205` | path UUID | `Document` or 404 |
-| POST | `/api/conversation/` | `conversation.py:31` | `{"document_ids": ["<uuid>", …]}` | `Conversation` (with `messages`, `documents`); 404 if any id missing |
-| GET | `/api/conversation/{conversation_id}` | `conversation.py:53` | path UUID | `Conversation` or 404 |
-| DELETE | `/api/conversation/{conversation_id}` | `conversation.py:66` | path UUID | **204**; 404 if absent (⚠ 500 with messages, §14.E) |
-| GET | `/api/conversation/{conversation_id}/message` | `conversation.py:81` | **query** `user_message=<text>` | `text/event-stream` of JSON `Message` snapshots |
-| GET | `/api/conversation/{conversation_id}/test_message` | `conversation.py:181` | **query** `user_message=<text>` | single final `Message` (drains the SSE stream) |
-| GET | `/api/docs` · `/api/redoc` · `/api/openapi.json` | FastAPI | — | Swagger / ReDoc / spec |
+| Method | Path | Request | Response |
+|---|---|---|---|
+| GET | `/api/health/` | — | `200 {status: healthy\|degraded, db, vector_store, version, uptime_s}` — never 5xx |
+| GET | `/api/config/` | — | `200 {version, max_upload_mb, supported_content_types, auth_enabled, demo_mode}` |
+| POST | `/api/document/upload` | multipart `file` + optional `company_name`, `company_symbol`, `financial_year`, `document_type`, `exchange` | **202** `DocumentUploadResponse {status:"uploaded"}`; **200** with the existing doc on a duplicate hash; 413 too large |
+| GET | `/api/document/` | `?document_ids&status&q&limit&offset` | `List[Document]` — **`[]` when empty** |
+| GET | `/api/document/{document_id}` | path UUID | `Document` (with `status`/`progress`/`error`) or 404 |
+| GET | `/api/document/{document_id}/file` | `?download` | `application/pdf` proxied from storage (citation viewer) |
+| POST | `/api/document/{document_id}/reindex` | path UUID | **202**, re-runs ingestion (409 if already running) |
+| DELETE | `/api/document/{document_id}` | path UUID | **204**; vectors → storage → rows; **503** if vectors cannot be cleared |
+| POST | `/api/conversation/` | `{document_ids?: [], title?}` | **201** `Conversation` (empty scope allowed) |
+| GET | `/api/conversation/` | `?limit&offset&q` | `List[ConversationSummary]` (thread index, no messages) |
+| GET | `/api/conversation/{conversation_id}` | path UUID | `Conversation` with `messages[].sub_processes[]` **and** `messages[].sources[]` |
+| PATCH | `/api/conversation/{conversation_id}` | `{title?, document_ids?}` | `Conversation` (rename / re-scope) |
+| DELETE | `/api/conversation/{conversation_id}` | path UUID | **204** (cascade-safe) |
+| POST | `/api/conversation/{conversation_id}/message` | `{"content": "…"}` | `text/event-stream` of `Message` snapshots (**preferred**) |
+| GET | `/api/conversation/{conversation_id}/message` | **query** `user_message=` | same stream (deprecated) |
+| GET | `/api/conversation/{conversation_id}/test_message` | **query** `user_message=` | single final `Message` |
+| GET | `/api/docs` · `/api/redoc` · `/api/openapi.json` | — | Swagger / ReDoc / spec |
 
-**Error conventions:** 400 invalid PDF/empty file; 404 missing conversation/document (and empty
-document list); 422 indexing failed (file corrupt/unreadable) — the DB row and stored object are
-deleted first; 500 storage upload or DB insert failure.
+**Error conventions:** 400 invalid PDF/empty file; 404 missing document/conversation; 409 nothing indexed
+or a job already running; 413 over `MAX_UPLOAD_MB`; 422 validation; 502 storage unreachable;
+503 vector store unavailable.
 
 **SSE payload** — unnamed events, each frame is one complete serialized `schema.Message`:
 
 ```jsonc
-{"id":"…","conversation_id":"…","role":"assistant","status":"PENDING",
- "sub_processes":[{"message_id":"…","source":"SUB_QUESTION","status":"FINISHED",
+{"id":"…","conversation_id":"…","role":"assistant","status":"PENDING","content":"partial text…",
+ "sub_processes":[{"id":"…","message_id":"…","source":"SUB_QUESTION","status":"FINISHED",
+                   "name":"What was FY24 revenue?","duration_ms":812,
                    "metadata_map":{"sub_question":{"question":"…","answer":"…","citations":[…]}}}],
- "content":"partial answer text…","created_at":"…","updated_at":"…"}
+ "sources":[{"index":1,"document_id":"…","page":41,"excerpt":"…","score":0.91}],
+ "created_at":"…"}
 ```
 
-Last two frames: the final `Message` with `status: "SUCCESS"` (or `ERROR`). The backend also
-persists the user message and the assistant message (with all sub-processes) at the end.
+The last frame is the final `Message` with `status: "SUCCESS"` or `"ERROR"`. The user message and the
+assistant placeholder are persisted *before* generation, content is flushed during the stream, and the
+terminal state (including `sources` and the trail) is written even if the client disconnects.
 
 Deep reference: `docs/agents/API_REFERENCE.md`.
 
@@ -747,15 +764,18 @@ rather than silently adding a new framework.
 Ranked by likelihood of biting an agent. Each item was checked against the code in this
 session; re-verify before acting on one you intend to fix.
 
-**A. Frontend does not typecheck (5 errors) — root cause is a broken comment.**
-`frontend/src/lib/types.ts` lines 1-4 open `/**` and never close it before
-`export type NSEDocumentType`. The next `*/` is on line 22, so `NSEDocumentType`,
-`DocumentStatus`, `DocumentMetadata` and `FinDocument` are swallowed by the comment.
-`npx tsc --noEmit` reports:
-`Sidebar.tsx(3,3) TS6133 'Activity' unused`, `format.ts(1,15) TS2305 DocumentStatus`,
-`format.ts(1,31) TS2305 NSEDocumentType`, `types.ts(26,18) TS2552`, `types.ts(38,11) TS2304`.
-`vite build` still **succeeds** (esbuild strips types), which is why this is easy to miss.
-Fix = close the comment (`*/`) and drop the unused `Activity` import.
+> **Closed in the M0/M1 pass** (2026-10-26, see `docs/plans/connect-and-deploy.md`):
+> **A** (typecheck is green — `npm run typecheck`), **E** (cascade deletes + explicit child deletes),
+> **F** (compose port `5433:5432` + healthcheck), **I** (indexing moved to `app/ingestion/jobs.py`),
+> **J** (`DELETE /api/document/{id}` clears vectors, storage and rows), **L** (empty library → `200 []`),
+> **N** (`_bootstrap` anchors `alembic.ini`/`script_location` to `backend/`, CWD-independent).
+> Still open below in updated form: **B** (frontend transport — M2), **C**, **G**, **K**, **M**, **O**, **P**, **Q**.
+> Item **D** (streaming concurrency) was rewritten in M1; the double-close and `_closed` inspection are gone.
+
+**A. ~~Frontend does not typecheck~~ — FIXED.** `frontend/src/lib/types.ts` had an unterminated `/**`
+that swallowed four type declarations, plus an unused `Activity` import in `Sidebar.tsx`.
+Both are repaired and `npm run typecheck` is part of CI. If it regresses, `npx tsc --noEmit` is the
+fastest signal.
 
 **B. The frontend is mock-only and its "real" transport does not match the API.**
 `USE_MOCK = true` is a hardcoded const (`lib/api.ts:32`); to hit the backend you must edit source.
@@ -773,22 +793,24 @@ Missing: `frontend/src/lib/backend.ts`, `frontend/README.md`,
 (conversations live only in React state), and "15 passing backend tests" is correct but
 "`npm run typecheck` zero errors" is false. Trust code and this file.
 
-**D. Streaming concurrency is fragile.** `handle_chat_message` and `event_publisher` both do
-`async with send_chan` on the *same* stream (`messaging.py:133`, `conversation.py:113`) — double
-close; `ChatCallbackHandler.on_event_*` fires `asyncio.create_task` fire-and-forget
-(`messaging.py:51,65`), so sub-process frames can arrive after the channel closes; the code
-inspects the private `send_chan._closed` (`messaging.py:102`, `conversation.py:156`). Any change
-here needs a real end-to-end test.
+**D. Streaming concurrency — rewritten in M1, treat as load-bearing.**
+`handle_chat_message` no longer enters `async with send_chan` (the endpoint owns the channel and
+closes it exactly once); the callback handler tracks its scheduled sends in `_tasks` and exposes
+`drain()` so the producer can flush the tail of the trail before closing; nothing reads
+`send_chan._closed` any more (closed streams raise `ClosedResourceError`/`BrokenResourceError`, and a
+client disconnect ends generation quietly). Tests that pin this behaviour:
+`tests/app/test_connect_contract.py::test_handle_chat_message_does_not_close_the_callers_channel` and
+`test_answer_stream_persists_partial_text_and_yields_monotonic_snapshots`. Any change here needs an
+end-to-end check against a live SSE client.
 
-**E. `DELETE /api/conversation/{id}` fails for non-empty conversations.** `crud.delete_conversation`
-issues a bare `DELETE FROM conversation`; `message.conversation_id` /
-`conversationdocument.*` FKs have **no `ON DELETE CASCADE`** (migration `477cee72edc4`), so
-Postgres raises a FK violation → unhandled 500. The frontend hides it ("local delete anyway",
-`store.tsx:286`). Fix = cascade in the model + migration, or delete children explicitly.
+**E. ~~`DELETE /api/conversation/{id}` fails for non-empty conversations~~ — FIXED.**
+Migration `d4b6f8c0e2a3` re-creates the child FKs with `ON DELETE CASCADE`, and
+`crud.delete_conversation` also deletes children explicitly (safe on databases created before the
+cascade). The frontend still hides delete failures (`store.tsx`, "local delete anyway") — fix that in M2.
 
-**F. `docker-compose.yml` database port is wrong.** `127.0.0.1:5433:5433` maps host 5433 to
-container 5433, but Postgres listens on **5432** inside the image. Use `5433:5432`. (`version:
-'3'` is also obsolete.) Backend↔db works because the service connects to `db:5432`.
+**F. ~~`docker-compose.yml` database port is wrong~~ — FIXED.** Host `5433` now maps to container
+`5432`, the obsolete `version:` key is gone, and `db` has a `pg_isready` healthcheck that the backend
+`depends_on` with `condition: service_healthy`. Backend↔db works because the service connects to `db:5432`.
 
 **G. Three of the four `backend/scripts/*.py` are unusable as written.**
 `build_vector_tables.py`, `dedupe_vector_store.py` and `upsert_document.py` import `fire`, which is
@@ -801,15 +823,22 @@ the CLI layer with `argparse`.
 document with zero vectors — so the "re-index from storage" fallback is effectively dead code
 and a document whose vectors are missing yields an empty tool. Do not rely on that except branch.
 
-**I. Indexing runs inside the upload request.** `ingest_document` performs PDF parsing and Gemini
-embedding synchronously in the request handler (blocking the worker for minutes on a 300-page
-report). The roadmap calls for a job queue; until then, large uploads look like timeouts.
+**I. ~~Indexing runs inside the upload request~~ — FIXED (single-process version).** `POST
+/api/document/upload` stores the file + row (`status="uploaded"`) and schedules
+`app/ingestion/jobs.py`, returning **202**; the job walks `parsing → chunking → embedding → indexing →
+ready` writing `progress`/`error`. Constraints worth knowing: the scheduler is **process-local**
+(`asyncio.create_task` + a `Semaphore(1)`), so a restart mid-ingest leaves the row stuck — the boot-time
+sweep `crud.mark_stale_documents_failed` (15 min) marks those `failed` and the library offers a retry.
+Durability across workers needs a real queue (decision record 0002 in the plan).
 
-**J. No document deletion path.** There is no `DELETE /api/document/{id}` and no cleanup of
-`data_pg_vector_store` rows, so removing a filing requires manual SQL (see
-`scripts/dedupe_vector_store.py` for the table name).
+**J. ~~No document deletion path~~ — FIXED.** `DELETE /api/document/{id}` clears pgvector rows
+(`metadata_->>'db_document_id'`), the stored PDF, conversation links and the row. It fails closed:
+if the vector delete errors, the response is **503** and nothing else is touched.
 
-**K. Frontend/backend type drift.** `FinDocument.metadata` uses `nse_symbol`, `fiscal_year`,
+**K. Frontend/backend type drift (unchanged until M2).** The API now exposes
+`document.status/progress/page_count/file_size` and `message.sources`, which narrows the gap — but the
+UI types are still `nse_symbol`/`fiscal_year`/`pages` and its `SubProcessSource` union still differs
+from `CBEventType`. A `wire.ts` mapper is the planned fix. `FinDocument.metadata` uses `nse_symbol`, `fiscal_year`,
 `period`, `pages`, `file_size`; the backend uses `company_symbol`, `financial_year`,
 `original_filename` and no page/size counters. Document-type enums differ
 (`quarterly_results`/`concall_transcript`/`shareholding_pattern`/`corporate_announcement` in the
@@ -817,15 +846,15 @@ UI vs `financial_results`/`corporate_filing`/`investor_presentation`/`other` in 
 Sub-process enums differ too (UI: `llm|retrieval|rerank|parser`; API: LlamaIndex
 `CBEventType` names). A mapper layer is required before real mode works.
 
-**L. `GET /api/document/` returns 404 for an empty library** (`documents.py:199`) instead of
-`[]` — hostile to clients that poll.
+**L. ~~`GET /api/document/` returns 404 for an empty library~~ — FIXED.** It returns `200 []`.
 
 **M. Import-time side effects.** `chat/engine.py:64` calls `nest_asyncio.apply()` on import;
 `core/config.py:83` writes `os.environ["GOOGLE_API_KEY"]`. Importing `app.main` therefore
 requires `DATABASE_URL` + `GOOGLE_API_KEY` to be set (or the test defaults from `conftest.py`).
 
-**N. `_bootstrap()` depends on CWD.** `Config("alembic.ini")` is relative; running the app from
-outside `backend/` raises. Same for `uv run alembic`.
+**N. ~~`_bootstrap()` depends on CWD~~ — FIXED.** `main.py` resolves `alembic.ini` from
+`Path(__file__).resolve().parents[1]` and pins `script_location`, so the API boots from any working
+directory. (`uv run alembic` from outside `backend/` still needs the CWD rule, §15.ALWAYS.1.)
 
 **O. Stale/incidental values.** `alembic.ini` still points at `llama_app_db`;
 `scripts/upsert_document.py` says "SEC"; `dedupe_vector_store.py` hardcodes
@@ -856,25 +885,28 @@ the pytest output). Not urgent, but a migration to `google-genai` will eventuall
    Frontend commands from `frontend/`.
 2. **Keep `db_document_id` on every vector node and `page_label` in metadata.** They are the
    backbone of per-document filtering and citations (§4.4).
-3. **Mirror the existing layering:** endpoint (HTTP + validation) → `crud.py` (SQL) → model.
+3. **Keep `DocumentStatusEnum` names equal to their values** (lowercase). SQLAlchemy persists the enum
+   *name*, so a mismatch between name and value silently writes a different string than the API
+   advertises — and the migration, the DB, OpenAPI and the UI must all agree.
+4. **Mirror the existing layering:** endpoint (HTTP + validation) → `crud.py` (SQL) → model.
    Never write SQL/ORM queries inside an endpoint or inside `chat/`.
-4. **Keep the SSE contract as full `Message` snapshots**, unnamed events, monotonic
+5. **Keep the SSE contract as full `Message` snapshots**, unnamed events, monotonic
    `content`/`sub_processes`. The frontend's whole streaming design depends on it.
-5. **Use Pydantic v2 APIs** (`model_validate`, `model_dump`, `field_validator`) in new code and
+6. **Use Pydantic v2 APIs** (`model_validate`, `model_dump`, `field_validator`) in new code and
    keep `app/schema.py` as the single source of API shapes.
-6. **Add or update a test** for any change to `crud.py`, `ingestion/`, `storage/`, or the upload
+7. **Add or update a test** for any change to `crud.py`, `ingestion/`, `storage/`, or the upload
    endpoint, following the patch-where-used + `AsyncMock` patterns in §13.
-7. **Run `uv run pytest -q` (backend) and `npx tsc --noEmit` (frontend) before declaring work
-   done.** Report the *actual* output; typecheck currently fails (§14.A).
-8. **Update `backend/.env.example` when you add a setting**, and `Settings` in
+8. **Run `uv run pytest -q` (backend) and `npm run typecheck` (frontend) before declaring work
+   done.** Report the *actual* output.
+9. **Update `backend/.env.example` when you add a setting**, and `Settings` in
    `core/config.py` with a sane default so tests keep passing without new env vars.
-9. **New migrations:** `uv run alembic revision --autogenerate -m "…"`, review the diff, keep a
+10. **New migrations:** `uv run alembic revision --autogenerate -m "…"`, review the diff, keep a
    single head, and remember `_bootstrap()` refuses to start if the DB is not at head.
-10. **Preserve the domain prompt contract** (tools first, exact units, financial year, page
+11. **Preserve the domain prompt contract** (tools first, exact units, financial year, page
     citations, no fabrication) whenever you touch `constants.py` or `qa_response_synth.py`.
-11. **Match the frontend design system** — tokens in `index.css`, tiny mono labels, `aria-label`
+12. **Match the frontend design system** — tokens in `index.css`, tiny mono labels, `aria-label`
     on icon buttons, framer-motion easings already in use.
-12. **State uncertainty plainly.** If you could not run something, say which command and why.
+13. **State uncertainty plainly.** If you could not run something, say which command and why.
 
 ### NEVER
 
@@ -886,8 +918,9 @@ the pytest output). Not urgent, but a migration to `google-genai` will eventuall
    client, in logs, or in API responses.
 4. **Never edit `alembic/versions/*.py` that already ran** (or delete rows from
    `alembic_version`); add a new revision instead.
-5. **Never switch `USE_MOCK` to `false` and call it "connected"** — `RealTransport` does not
-   implement the backend contract (§14.B). Fix the transport first and verify against a live API.
+5. **Never call the frontend "connected" while `RealTransport` is stale** (§14.B). `USE_MOCK` is now
+   env-driven (`VITE_USE_MOCK`), which makes real mode one variable away — but it is still the old
+   contract. Verify against a live API (`VITE_USE_MOCK=0 npm run dev`) before claiming integration.
 6. **Never delete the commented-out UI blocks or "unused" helpers as "cleanup"** without asking;
    they are deliberate parking spots for in-progress UI.
 7. **Never trust `README.md` over the code.** If a doc claim is wrong, fix the doc in the same
@@ -911,9 +944,11 @@ the pytest output). Not urgent, but a migration to `google-genai` will eventuall
 ### Quick "is it healthy?" checklist
 
 ```bash
-cd backend  && uv run pytest -q                     # expect: 15 passed
+cd backend  && uv run pytest -q                     # expect: 52 passed
 cd backend  && uv run python -c "import app.main"   # needs DATABASE_URL + GOOGLE_API_KEY set
-cd frontend && npx tsc --noEmit                     # expect: FAILS (§14.A) until the comment is fixed
+cd frontend && npm run typecheck                    # expect: 0 errors
 cd frontend && npm run build                        # expect: single dist/index.html (~622 kB)
-curl -s localhost:8000/api/health/                  # {"status":"alive"} — requires DB + env
+curl -s localhost:8000/api/health/                  # {"status":"healthy","db":true,…} — requires DB + env
+curl -s localhost:8000/api/config/                  # public runtime config
+curl -s localhost:8000/api/document/                 # 200 [] on an empty library
 ```

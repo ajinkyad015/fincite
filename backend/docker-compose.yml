@@ -1,10 +1,9 @@
-version: '3'
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Local development docker-compose for fincite backend
 #
 # NOTE: This compose file is for local development ONLY.
-# In production, use Supabase for PostgreSQL + pgvector + Storage.
+# In production, use Supabase for PostgreSQL + pgvector + Storage (or see
+# docker-compose.prod.yml once M5 lands).
 #
 # To use:
 #   1. Copy .env.example to .env and fill in your values
@@ -21,13 +20,14 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
-      - db
-    env_file: 
+      db:
+        condition: service_healthy
+    env_file:
       - .env
     environment:
       # Override DATABASE_URL to point at the local pgvector container
       DATABASE_URL: "postgresql://user:password@db:5432/fincite_db"
-      BACKEND_CORS_ORIGINS: '["http://localhost:3000", "http://localhost:8000"]'
+      BACKEND_CORS_ORIGINS: '["http://localhost:5173", "http://localhost:8000"]'
 
   # Local PostgreSQL + pgvector for development without a Supabase project.
   # For storage (PDFs), you still need SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
@@ -39,9 +39,16 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: fincite_db
     ports:
-      - "127.0.0.1:5433:5433"
+      # Postgres listens on 5432 inside the image — publish it on 5433 on the
+      # host so a locally installed Postgres can keep 5432.
+      - "127.0.0.1:5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d fincite_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
 volumes:
   postgres_data:

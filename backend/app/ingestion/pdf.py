@@ -67,6 +67,38 @@ def load_pdf_from_bytes(
         return docs
 
 
+def index_documents(
+    document_id: str,
+    llama_docs: List[LlamaIndexDocument],
+    vector_store: VectorStore,
+    callback_manager: CallbackManager | None = None,
+) -> VectorStoreIndex:
+    """
+    Chunk + embed + upsert already-parsed PDF pages into pgvector.
+
+    Split out of `ingest_document` so the background ingestion job can report
+    progress between parse and embed without re-downloading the PDF.
+    """
+    if not llama_docs:
+        raise ValueError(
+            f"PDFReader produced no documents for document_id={document_id}. "
+            "The file may be empty or unreadable."
+        )
+
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+    logger.info("Document indexing started for document %s", document_id)
+    km = {"callback_manager": callback_manager} if callback_manager else {}
+    index = VectorStoreIndex.from_documents(
+        llama_docs,
+        storage_context=storage_context,
+        show_progress=True,
+        **km,
+    )
+    index.set_index_id(document_id)
+    logger.info("Document indexing completed for document %s", document_id)
+    return index
+
+
 async def ingest_document(
     document: schema.Document,
     vector_store: VectorStore,
@@ -78,6 +110,10 @@ async def ingest_document(
 
     Each indexed node carries DB_DOC_ID_KEY so retrieval can be filtered
     to a specific document.
+
+    Kept as the one-shot, synchronous entry point (scripts, tests). The API uses
+    `app.ingestion.jobs` instead, which runs the same steps in the background
+    and records lifecycle status as it goes.
 
     Returns the created VectorStoreIndex (mainly useful for testing).
     Raises RuntimeError if download or indexing fails.
@@ -92,25 +128,7 @@ async def ingest_document(
     logger.info("PDF parsing started for document %s", document_id)
     llama_docs = load_pdf_from_bytes(pdf_bytes, document_id)
 
-    if not llama_docs:
-        raise ValueError(
-            f"PDFReader produced no documents for document_id={document_id}. "
-            "The file may be empty or unreadable."
-        )
-
-    # 3. Build storage context backed by pgvector
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
-    # 4. Index — this calls Gemini embeddings and writes to pgvector
-    logger.info("Document indexing started for document %s", document_id)
-    km = {"callback_manager": callback_manager} if callback_manager else {}
-    index = VectorStoreIndex.from_documents(
-        llama_docs,
-        storage_context=storage_context,
-        show_progress=True,
-        **km,
+    # 3. Chunk, embed, upsert
+    return index_documents(
+        document_id, llama_docs, vector_store, callback_manager=callback_manager
     )
-    index.set_index_id(document_id)
-    logger.info("Document indexing completed for document %s", document_id)
-
-    return index
