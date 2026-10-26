@@ -1,6 +1,5 @@
 import { useState, type ReactNode } from "react";
 import {
-  Activity,
   BookMarked,
   Check,
   MessagesSquare,

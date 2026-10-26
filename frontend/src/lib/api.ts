@@ -13,7 +13,15 @@
  *   GET    /api/document/
  *   GET    /api/document/{id}
  *
- * Set USE_MOCK = false (and VITE_API_URL) to talk to the real backend.
+ * Transport selection is environment-driven (see M0 of
+ * docs/plans/connect-and-deploy.md):
+ *
+ *   VITE_USE_MOCK=1  → in-memory demo transport (seeded corpus, canned answers)
+ *   VITE_USE_MOCK=0  → real backend
+ *   unset            → mock in `vite dev`, real in a production build
+ *
+ * VITE_API_URL defaults to "" (same origin) so the Vite dev proxy and the
+ * production reverse proxy both work without configuration.
  */
 
 import type {
@@ -29,10 +37,19 @@ import type {
 import { ANSWER_BANK, FALLBACK_EXCERPT, SEED_DOCUMENTS, type CannedAnswer } from "./mockData";
 import { nowIso, uid } from "./format";
 
-export const USE_MOCK = false;
-export const BASE_URL: string =
-  (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_URL ??
-  "http://localhost:8000";
+const env = (import.meta as unknown as { env?: Record<string, string | boolean> }).env ?? {};
+
+function resolveUseMock(): boolean {
+  const raw = env.VITE_USE_MOCK;
+  if (raw === undefined || raw === "") {
+    // No explicit choice: demo data while developing, real API in a build.
+    return env.DEV === true || env.DEV === "true";
+  }
+  return raw === "1" || raw === "true";
+}
+
+export const USE_MOCK: boolean = resolveUseMock();
+export const BASE_URL: string = (env.VITE_API_URL as string | undefined) || "";
 
 /* ------------------------------------------------------------------ */
 /*  Streaming handler contract                                         */

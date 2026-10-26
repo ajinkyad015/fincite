@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     PROJECT_NAME: str = "fincite"
     API_PREFIX: str = "/api"
+    APP_VERSION: str = "0.2.0"
 
     # Database
     DATABASE_URL: str
@@ -28,6 +29,19 @@ class Settings(BaseSettings):
     # Vector store
     VECTOR_STORE_TABLE_NAME: str = "pg_vector_store"
     VECTOR_STORE_EMBED_DIM: int = 3072
+
+    # Uploads
+    MAX_UPLOAD_MB: int = 50
+
+    # Ingestion
+    # Set to false to accept uploads without indexing them (e.g. UI work that
+    # does not need Gemini calls). Documents then stay in "uploaded".
+    INGESTION_ENABLED: bool = True
+
+    # Auth (M4). While false, every endpoint is public — see AGENTS.md §14.Q.
+    AUTH_ENABLED: bool = False
+    # Marks a seeded/demo deployment so the UI can label it.
+    DEMO_MODE: bool = False
 
     # Logging
     LOG_LEVEL: str = "INFO"

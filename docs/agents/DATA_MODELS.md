@@ -48,27 +48,35 @@ There is **no FK** between `DOCUMENT` and the vector table — the link is the J
 
 ## 3. Tables
 
-### 3.1 `conversation` (`models/db.py:52`)
+### 3.1 `conversation` (`models/db.py`)
 
 | Column | Type | Null | Notes |
 |---|---|---|---|
 | id | UUID | no | PK, default `uuid_generate_v4()`, indexed (`ix_conversation_id`) |
+| title | varchar(200) | yes | set on create, or derived from the first question (`crud.touch_conversation`) |
+| last_message_at | timestamp | yes | ordering key for the thread index, indexed (`b2e4d6f8a0c1`) |
 | created_at | timestamp | no | `now()` |
 | updated_at | timestamp | no | `now()` + ORM onupdate |
 
 Relationships: `messages` → `Message.conversation`; `conversation_documents` →
-`ConversationDocument.conversation`. No cascade configured.
+`ConversationDocument.conversation`. Child FKs cascade (`d4b6f8c0e2a3`).
 
-### 3.2 `document` (`models/db.py:41`)
+### 3.2 `document` (`models/db.py`)
 
 | Column | Type | Null | Notes |
 |---|---|---|---|
 | id | UUID | no | PK |
 | url | varchar | **no** | **UNIQUE** — Supabase public URL of the PDF |
 | metadata_map | JSONB | yes | NSE metadata + content hash (below) |
-| created_at / updated_at | timestamp | no | |
+| status | `DocumentStatusEnum` | no | ingestion lifecycle, default `uploaded` (`a1f0c3d5b7e9`) |
+| progress | integer | no | 0–100, written by the ingestion job |
+| error | text | yes | set when `status = failed` |
+| page_count | integer | yes | number of parsed pages |
+| file_size | bigint | yes | bytes, from the upload body |
+| content_hash | varchar(64) | yes | **UNIQUE index** — duplicate detection (promoted out of `metadata_map`) |
+| created_at / updated_at | timestamp | no | `updated_at` drives the stale-ingestion sweep (15 min) |
 
-Created in migration `90a1d6a26343`. `crud.upsert_document_by_url` uses
+Created in migration `90a1d6a26343`; lifecycle columns added in `a1f0c3d5b7e9`. `crud.upsert_document_by_url` uses
 `INSERT … ON CONFLICT (url) DO UPDATE SET metadata_map = …` (Postgres dialect insert).
 
 `metadata_map` (written at `api/endpoints/documents.py:143`):
@@ -89,8 +97,8 @@ Created in migration `90a1d6a26343`. `crud.upsert_document_by_url` uses
 }
 ```
 
-Lookup helper: `crud.fetch_document_by_content_hash` uses
-`Document.metadata_map["content_hash"].astext == content_hash` (`crud.py:162`).
+Lookup helper: `crud.fetch_document_by_content_hash` matches the `content_hash` **column** (falling back
+to `metadata_map["content_hash"]` for pre-backfill rows).
 
 ### 3.3 `conversationdocument` (`models/db.py:63`)
 
@@ -101,9 +109,9 @@ Lookup helper: `crud.fetch_document_by_content_hash` uses
 | document_id | UUID | yes | FK → `document.id`, indexed |
 | created_at / updated_at | timestamp | no | |
 
-Created in `90a1d6a26343`; indexes added in `873c0c4616ea`. No unique constraint on
-`(conversation_id, document_id)` — the same document can be linked twice if the API is called
-with duplicates.
+Created in `90a1d6a26343`; indexes added in `873c0c4616ea`; both FKs cascade on delete
+(`d4b6f8c0e2a3`). No unique constraint on `(conversation_id, document_id)` — `crud.update_conversation`
+replaces the whole set (delete-then-insert), which keeps duplicates out of that path.
 
 ### 3.4 `message` (`models/db.py:76`)
 
@@ -114,6 +122,11 @@ with duplicates.
 | content | varchar | yes (DB) | **but `schema.Message.content: str` is required** |
 | role | `MessageRoleEnum` | yes | `user` / `assistant` |
 | status | `MessageStatusEnum` | yes | default in ORM: `PENDING` |
+| sources | JSONB | yes | citations flattened onto the message (`c3a5e7b9d1f2`) |
+
+`sources` mirrors the UI's `Source[]`: `[{index, document_id, page, excerpt, score}]`, derived from the
+trail's SUB_QUESTION citations via `schema.citations_to_sources()`. Old rows may be `null` — readers
+fall back to the sub-process metadata.
 
 ### 3.5 `messagesubprocess` (`models/db.py:91`)
 
@@ -123,6 +136,8 @@ with duplicates.
 | message_id | UUID | yes | FK → `message.id`, indexed |
 | source | `MessageSubProcessSourceEnum` | yes | LlamaIndex event name |
 | status | `MessageSubProcessStatusEnum` | **no** | default `FINISHED` |
+| name | varchar(300) | yes | research-trail label (`messaging.describe_sub_process`) |
+| duration_ms | integer | yes | wall-clock time of the step |
 | metadata_map | JSONB | yes | e.g. `{"sub_question": {...}}` |
 
 `schema.MessageSubProcess.metadata_map` is keyed by `SubProcessMetadataKeysEnum.SUB_QUESTION`
