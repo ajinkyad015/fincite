@@ -1,6 +1,6 @@
 # Fincite Backend
 
-FastAPI · Python 3.11 · LlamaIndex · PostgreSQL + pgvector · Supabase Storage · Gemini.
+FastAPI · Python 3.11 · LlamaIndex · PostgreSQL + pgvector · Supabase Storage · NVIDIA NIM (build.nvidia.com).
 
 **Full documentation**
 
@@ -16,7 +16,7 @@ FastAPI · Python 3.11 · LlamaIndex · PostgreSQL + pgvector · Supabase Storag
 ## Run
 
 ```bash
-cp .env.example .env          # DATABASE_URL, SUPABASE_*, GOOGLE_API_KEY
+cp .env.example .env          # DATABASE_URL, SUPABASE_*, NVIDIA_API_KEY
 uv sync
 uv run alembic upgrade head   # create/patch tables (must be at head before boot)
 uv run start                  # bootstrap + uvicorn on 0.0.0.0:8000
@@ -37,3 +37,7 @@ uv run start                  # bootstrap + uvicorn on 0.0.0.0:8000
 * **Enum values are lowercase and equal to their names** (`DocumentStatusEnum`). SQLAlchemy stores the
   *name*; a mismatch between name and value silently diverges from what the API documents.
 * Migrations must stay at a single head — `_bootstrap()` refuses to start otherwise.
+* **Models are NVIDIA NIMs, built in one place.** `app/llama_index_settings.py` factories serve both
+  global `Settings` and the per-conversation ReAct agent. Changing the embedding model or
+  `VECTOR_STORE_EMBED_DIM` requires `DROP TABLE data_pg_vector_store` + restart + re-indexing every
+  document (startup now refuses to boot against a dimension mismatch).

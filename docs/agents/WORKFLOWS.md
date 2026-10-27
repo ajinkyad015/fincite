@@ -51,7 +51,7 @@ End-to-end traces for the five flows that matter. Line references are to the cur
                        empty result ⇒ ValueError "PDFReader produced no documents"
        15c           StorageContext.from_defaults(vector_store=…)             pdf.py:102
        15d           VectorStoreIndex.from_documents(llama_docs, show_progress=True)
-                       SentenceSplitter(512/10) → GeminiEmbedding(3072) → INSERT
+                       SentenceSplitter(512/10) → NVIDIAEmbedding(2048) → INSERT
        15e           index.set_index_id(document_id)                          pdf.py:113
 16 handler           failure ⇒ crud.delete_document_by_id + delete_document    :166-174
                        → 422 "PDF indexing failed…"
@@ -178,7 +178,7 @@ tools = [QueryEngineTool(index_to_query_engine(doc_id, index),
                                       description=build_description_for_document(doc)))
          for doc_id, index in doc_id_to_index.items()]
 response_synth = get_custom_response_synth(callback_manager, conversation.documents)
-chat_llm = Gemini(model=GEMINI_CHAT_LLM_NAME)
+chat_llm = get_chat_llm()  # NVIDIA NIM, via llama_index_settings
 question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)
 sub_q_engine = SubQuestionQueryEngine.from_defaults(tools, question_gen, response_synth,
                                                     use_async=True, verbose=DEBUG)

@@ -188,7 +188,7 @@ Managed entirely by `llama_index.vector_stores.postgres.PGVectorStore`
 CustomPGVectorStore.from_params(
     url.host, url.port or 5432, url.database, url.username, url.password,
     settings.VECTOR_STORE_TABLE_NAME,          # "pg_vector_store"
-    embed_dim=settings.VECTOR_STORE_EMBED_DIM, # 3072
+    embed_dim=settings.VECTOR_STORE_EMBED_DIM, # 2048
 )
 ```
 
@@ -196,7 +196,7 @@ CustomPGVectorStore.from_params(
 |---|---|
 | Data table | `data_pg_vector_store` (`data_` + table name) |
 | Metadata table | `data_pg_vector_store_metadata_col` |
-| Vector type | `vector(3072)` (pgvector), cosine distance |
+| Vector type | `vector(2048)` (pgvector), cosine distance |
 | Columns | `id`, `node_id`, `text`, `metadata_` (JSONB), `embedding` |
 | Per-doc key | `metadata_->>'db_document_id'` = `document.id` (constant `DB_DOC_ID_KEY`) |
 | Page key | `metadata_->>'page_label'` (string; `Citation.from_node` casts to `int`) |

@@ -12,7 +12,7 @@ Upload PDFs, ask questions in plain English, and get answers that cite the exact
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](backend/pyproject.toml)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](backend/app/main.py)
 [![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.12-6B4FBB)](backend/app/chat/engine.py)
-[![Gemini](https://img.shields.io/badge/Google%20Gemini-LLM%20%2B%20Embeddings-4285F4?logo=google&logoColor=white)](backend/app/llama_index_settings.py)
+[![NVIDIA NIM](https://img.shields.io/badge/NVIDIA%20NIM-LLM%20%2B%20Embeddings-76B900?logo=nvidia&logoColor=white)](backend/app/llama_index_settings.py)
 [![Supabase](https://img.shields.io/badge/Supabase-Postgres%20%2B%20pgvector%20%2B%20Storage-3FCF8E?logo=supabase&logoColor=white)](backend/app/storage/supabase.py)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/package.json)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](frontend/tsconfig.json)
@@ -75,7 +75,7 @@ A single research session, end to end:
 ```
 
 1. **Upload** — `POST /api/document/upload` with the PDF and optional NSE metadata (company, ticker, financial year, document type). Duplicates are detected by SHA-256 and returned idempotently.
-2. **Index** — the PDF is stored in Supabase Storage, parsed page-by-page, split into sentence-aware chunks, embedded with Gemini, and written to pgvector with the document ID stamped on every node.
+2. **Index** — the PDF is stored in Supabase Storage, parsed page-by-page, split into sentence-aware chunks, embedded with NVIDIA Nemotron, and written to pgvector with the document ID stamped on every node.
 3. **Ask** — create a conversation over any set of indexed documents, then send a question. The agent decides which documents to consult, breaks the question into per-document sub-questions, retrieves and synthesises.
 4. **Read & verify** — the answer streams token-by-token over Server-Sent Events alongside structured sub-process events, so the UI can render a research trail and clickable `[n]` citations that open the exact passage.
 
@@ -99,13 +99,13 @@ flowchart LR
 
     subgraph Supabase["Supabase"]
         PG[("PostgreSQL<br/>conversations · messages · documents")]
-        VEC[("pgvector<br/>data_pg_vector_store · 3072-d")]
+        VEC[("pgvector<br/>data_pg_vector_store · 2048-d")]
         ST[["Storage bucket<br/>documents/ID/original.pdf"]]
     end
 
-    subgraph Google["Google AI"]
-        LLM["Gemini 1.5 Flash<br/>reasoning · sub-questions · synthesis"]
-        EMB["gemini-embedding-001<br/>3072-d embeddings"]
+    subgraph Nvidia["NVIDIA AI · build.nvidia.com"]
+        LLM["Llama 3.3 70B Instruct<br/>reasoning · sub-questions · synthesis"]
+        EMB["nvidia/nemotron-3-embed-1b<br/>2048-d embeddings"]
     end
 
     UI -- "multipart upload" --> R
@@ -126,7 +126,7 @@ flowchart LR
 |---|---|---|
 | **API** | FastAPI · Pydantic v2 · `sse-starlette` | Async-native, typed request/response models, first-class OpenAPI docs, SSE without WebSockets. |
 | **Orchestration** | LlamaIndex 0.12 (`ReActAgent`, `SubQuestionQueryEngine`, `VectorStoreIndex`) | Battle-tested primitives for agentic RAG; callback system doubles as the observability bus. |
-| **Models** | Google Gemini — `gemini-1.5-flash` (chat) · `gemini-embedding-001` (3072-d) | Fast, inexpensive long-context model for multi-step reasoning; high-dimensional embeddings for dense financial prose. |
+| **Models** | NVIDIA hosted NIMs (build.nvidia.com) — `meta/llama-3.3-70b-instruct` (chat, 128k ctx) · `nvidia/nemotron-3-embed-1b` (2048-d) | One OpenAI-compatible endpoint and key for multi-step reasoning and retrieval-tuned embeddings over dense financial prose; models are env-selectable. |
 | **Data** | PostgreSQL + pgvector (Supabase) · SQLAlchemy 2 async · Alembic | One database for relational state *and* vectors — no separate vector DB to operate; migrations are versioned. |
 | **Object storage** | Supabase Storage | Original PDFs are kept for re-indexing and future viewer features; service-role key stays server-side. |
 | **Frontend** | React 19 · TypeScript (strict) · Vite 7 · Tailwind CSS v4 · Framer Motion | Lightweight, no heavy state library; design-token driven editorial UI. |
@@ -139,7 +139,7 @@ The core of Fincite is a **three-tier query harness** built in [`backend/app/cha
 
 ```
             ┌──────────────────────────────────────────────────────────────────────┐
-  Tier 1    │  ReActAgent  (Gemini · max 6 iterations · system prompt w/ doc list) │
+  Tier 1    │  ReActAgent  (Llama 3.3 70B · max 6 iterations · system prompt w/ doc list) │
             │  "Should I use a tool? Which? Is the answer complete?"               │
             └───────────────────────────────┬──────────────────────────────────────┘
                                             │ single tool: document_question_engine
@@ -159,7 +159,7 @@ The core of Fincite is a **three-tier query harness** built in [`backend/app/cha
                                                │
                                    ┌───────────▼───────────┐
                                    │  pgvector (one table) │
-                                   │  cosine · 3072-d      │
+                                   │  cosine · 2048-d      │
                                    └───────────────────────┘
 ```
 
@@ -179,7 +179,7 @@ sequenceDiagram
     participant U as Browser
     participant API as FastAPI · /api/conversation/:id/message
     participant H as handle_chat_message
-    participant A as ReActAgent · Gemini
+    participant A as ReActAgent · Llama 3.3 70B
     participant S as SubQuestionQueryEngine
     participant V as pgvector
     participant DB as PostgreSQL
@@ -215,7 +215,7 @@ PDF bytes ─▶ validate (MIME + %PDF magic) ─▶ SHA-256 dedupe ─▶ UUID
         ─▶ Postgres  document row  { url, metadata_map: { nse_document, content_hash, original_filename } }
         ─▶ PDFReader (page-labelled LlamaIndex Documents, db_document_id stamped)
         ─▶ SentenceSplitter  chunk 512 · overlap 10
-        ─▶ GeminiEmbedding  3072-d
+        ─▶ NVIDIAEmbedding  2048-d
         ─▶ pgvector  data_pg_vector_store
         ─▶ 201 { status: "indexed" }
 ```
@@ -266,7 +266,7 @@ Vectors live alongside in `data_pg_vector_store` (managed by LlamaIndex), linked
 
 ### 3.6 Process model
 
-`uv run start` performs deploy-time bootstrap **once** in the parent process — wait for DB, verify Alembic is at head, `CREATE EXTENSION vector`, create vector tables, pre-fetch NLTK tokenizer data — then launches `uvicorn` with `BACKEND_WORKERS` (default 4) worker processes. Each worker's lifespan only does per-process work: configure Gemini settings off the event loop, open its own connection pools, and close them on shutdown. The vector store deliberately **shares the app's async engine**, so a worker holds one pool, not two.
+`uv run start` performs deploy-time bootstrap **once** in the parent process — wait for DB, verify Alembic is at head, `CREATE EXTENSION vector`, create vector tables, pre-fetch NLTK tokenizer data — then launches `uvicorn` with `BACKEND_WORKERS` (default 4) worker processes. Each worker's lifespan only does per-process work: configure NVIDIA model clients off the event loop, open its own connection pools, and close them on shutdown. The vector store deliberately **shares the app's async engine**, so a worker holds one pool, not two.
 
 ---
 
@@ -278,7 +278,7 @@ fincitee/
 │   ├── app/
 │   │   ├── main.py                  #   bootstrap, lifespan, uvicorn entrypoint
 │   │   ├── core/config.py           #   pydantic-settings; env validation & URL normalisation
-│   │   ├── llama_index_settings.py  #   Gemini LLM + embeddings + SentenceSplitter
+│   │   ├── llama_index_settings.py  #   NVIDIA LLM + embedding factories + SentenceSplitter
 │   │   ├── api/
 │   │   │   ├── api.py               #   router registry (/conversation, /document, /health)
 │   │   │   ├── crud.py              #   async SQLAlchemy data access
@@ -329,7 +329,7 @@ By subsystem:
 | **Ingestion** | Upload PDF with NSE metadata (company, ticker, FY, type, exchange) | ✅ |
 | | MIME + magic-byte validation; empty-file rejection | ✅ |
 | | SHA-256 duplicate detection (idempotent re-upload) | ✅ |
-| | Page-labelled parsing → sentence-aware chunking → Gemini embeddings → pgvector | ✅ |
+| | Page-labelled parsing → sentence-aware chunking → NVIDIA embeddings → pgvector | ✅ |
 | | Atomic rollback of Storage + DB on indexing failure | ✅ |
 | | **Background indexing** (202 + `status`/`progress`/`error`, polled by the UI) | ✅ |
 | | **Delete a filing** — vectors, stored PDF, links and rows | ✅ |
@@ -387,19 +387,19 @@ cd backend && uv run python scripts/chat_llama.py --base_url http://localhost:80
 | **Node 20+** and npm | for the frontend |
 | **PostgreSQL with pgvector** | a Supabase project (recommended) **or** the bundled `docker compose` database |
 | **Supabase project** | Storage bucket (default name `annual-reports`) + service-role key |
-| **Google AI Studio API key** | https://aistudio.google.com/apikey |
+| **NVIDIA API key** (`nvapi-…`) | https://build.nvidia.com — sign in, open any model, “Get API Key” |
 
 ### 6.2 Backend
 
 ```bash
 cd backend
-cp .env.example .env          # fill in DATABASE_URL, SUPABASE_*, GOOGLE_API_KEY
+cp .env.example .env          # fill in DATABASE_URL, SUPABASE_*, NVIDIA_API_KEY
 uv sync                        # installs from uv.lock (dev group included)
 uv run alembic upgrade head    # create tables
 uv run start                   # bootstrap + uvicorn on http://0.0.0.0:8000
 ```
 
-Or with Docker (local pgvector included — you still need Supabase Storage + Gemini credentials in `.env`):
+Or with Docker (local pgvector included — you still need Supabase Storage + an NVIDIA API key in `.env`):
 
 ```bash
 cd backend && docker compose up --build
@@ -484,10 +484,12 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 | `DATABASE_URL` | — | Postgres URL; normalised to `postgresql+asyncpg://` automatically |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | — | Storage access (server-side only) |
 | `SUPABASE_STORAGE_BUCKET` | `annual-reports` | Bucket holding original PDFs |
-| `GOOGLE_API_KEY` | — | Gemini LLM + embeddings |
-| `GEMINI_CHAT_LLM_NAME` | `models/gemini-1.5-flash` | Reasoning / synthesis model |
-| `GEMINI_EMBEDDING_MODEL_NAME` | `models/gemini-embedding-001` | Embedding model |
-| `VECTOR_STORE_TABLE_NAME` / `VECTOR_STORE_EMBED_DIM` | `pg_vector_store` / `3072` | pgvector table & dimension (must match the embedding model) |
+| `NVIDIA_API_KEY` | — | NVIDIA NIM LLM + embeddings (`nvapi-…` from build.nvidia.com) |
+| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` | Reasoning / synthesis model |
+| `NVIDIA_EMBEDDING_MODEL_NAME` | `nvidia/nemotron-3-embed-1b` | Embedding model |
+| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | NIM endpoint (override for a self-hosted NIM) |
+| `NVIDIA_CHAT_CONTEXT_WINDOW` / `NVIDIA_CHAT_MAX_TOKENS` | `131072` / `4096` | Must match the chat model's NIM limits |
+| `VECTOR_STORE_TABLE_NAME` / `VECTOR_STORE_EMBED_DIM` | `pg_vector_store` / `2048` | pgvector table & dimension (must match the embedding model) |
 | `MAX_UPLOAD_MB` | `50` | Upload size ceiling (413 above it) |
 | `INGESTION_ENABLED` | `true` | `false` accepts uploads without indexing them |
 | `AUTH_ENABLED` | `false` | Reserved for M4 (Supabase JWT); endpoints are public while false |
@@ -511,7 +513,7 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 - [x] **Conversation listing** — `GET /api/conversation/` returns the sidebar index (title, preview,
       message count, last activity).
 - [ ] **Evaluation harness** — golden Q&A set over public filings for regression-testing answer faithfulness.
-- [ ] **Model abstraction** — swap Gemini for other providers via LlamaIndex settings.
+- [x] **Model abstraction** — providers/models swap via `app/llama_index_settings.py` factories + env (Google Gemini → NVIDIA NIM, Oct 2026).
 
 ---
 
@@ -534,5 +536,5 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 MIT © 2026 Ajinkya Datir — see [`LICENSE`](LICENSE).
 
 <div align="center">
-<sub>Built with FastAPI · LlamaIndex · Google Gemini · Supabase · React</sub>
+<sub>Built with FastAPI · LlamaIndex · NVIDIA NIM · Supabase · React</sub>
 </div>

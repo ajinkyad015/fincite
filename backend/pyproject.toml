@@ -23,8 +23,18 @@ dependencies = [
   "pydantic-settings==2.8.1",
   "llama-index-vector-stores-postgres==0.4.2",
   "llama-index-readers-file==0.4.6",
-  "llama-index-llms-gemini>=0.5.0",
-  "llama-index-embeddings-gemini>=0.3.2",
+  # NVIDIA (build.nvidia.com / NIM) providers. Exact pins threaded through
+  # llama-index-core==0.12.23: llms-nvidia 0.3.4+ pulls llms-openai>=0.4,
+  # which needs core>=0.12.37, and both 0.4+ integration lines need
+  # core>=0.13 — so 0.3.3 / 0.3.4 are the newest that fit. Revisit them
+  # together with the core pin (a separate, larger upgrade).
+  "llama-index-llms-nvidia==0.3.3",
+  "llama-index-embeddings-nvidia==0.3.4",
+  # Transitive, but capped here: llms-openai 0.3.38 (the newest on the chain
+  # above) imports response types that openai>=1.82 renamed, so an uncapped
+  # `openai<2` resolves to a combination that fails at import time. Both
+  # NVIDIA clients are OpenAI SDK clients underneath. Drop with the pins above.
+  "openai>=1.66.3,<1.82",
   "supabase==2.16.0",
   "python-multipart==0.0.9",
   "nest-asyncio==1.6.0",

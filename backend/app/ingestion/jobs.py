@@ -12,8 +12,9 @@ writing progress to the row as it goes; the library UI polls
 
 Design constraints (see docs/plans/connect-and-deploy.md §M1.4):
 
-* **One ingestion at a time.** Gemini embedding is rate-limited and memory
-  hungry; a semaphore keeps concurrent uploads from starving each other.
+* **One ingestion at a time.** The NVIDIA embedding API is rate-limited and
+  parsing is memory hungry; a semaphore keeps concurrent uploads from
+  starving each other.
 * **Own DB session.** The job outlives the request, so it never borrows the
   request-scoped session.
 * **No new infrastructure.** This is deliberately a process-local task. When

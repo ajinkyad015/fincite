@@ -67,11 +67,14 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
     SUPABASE_STORAGE_BUCKET: str = "annual-reports"
-    GOOGLE_API_KEY: str          # required
-    GEMINI_CHAT_LLM_NAME: str = "models/gemini-1.5-flash"
-    GEMINI_EMBEDDING_MODEL_NAME: str = "models/gemini-embedding-001"
+    NVIDIA_API_KEY: str          # required
+    NVIDIA_CHAT_LLM_NAME: str = "meta/llama-3.3-70b-instruct"
+    NVIDIA_EMBEDDING_MODEL_NAME: str = "nvidia/nemotron-3-embed-1b"
+    NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
+    NVIDIA_CHAT_CONTEXT_WINDOW: int = 131072
+    NVIDIA_CHAT_MAX_TOKENS: int = 4096
     VECTOR_STORE_TABLE_NAME: str = "pg_vector_store"
-    VECTOR_STORE_EMBED_DIM: int = 3072
+    VECTOR_STORE_EMBED_DIM: int = 2048
     LOG_LEVEL: str = "INFO"
     BACKEND_WORKERS: int = 4
     BACKEND_CORS_ORIGINS: List[AnyHttpUrl | Literal["*"]] = []
@@ -86,9 +89,10 @@ Validators (`mode="before"`):
 | `DATABASE_URL` | must start with `postgres`; `postgres://`→`postgresql://`→`postgresql+asyncpg://` (idempotent) |
 | `LOG_LEVEL` | upper-cased; rejects anything outside DEBUG/INFO/WARNING/ERROR/CRITICAL |
 
-`settings` is instantiated at import (`config.py:82`) and immediately does
-`os.environ["GOOGLE_API_KEY"] = settings.GOOGLE_API_KEY` (`:83`) so the Google SDK picks it up.
-Consequence: **importing anything under `app` requires `DATABASE_URL` and `GOOGLE_API_KEY`.**
+`settings` is instantiated at import and immediately exports `NVIDIA_API_KEY` and
+`NVIDIA_BASE_URL` to `os.environ` (`config.py:123-124`) for the NVIDIA LlamaIndex clients'
+env-var fallbacks (construction also passes them explicitly — `llama_index_settings.py`).
+Consequence: **importing anything under `app` requires `DATABASE_URL` and `NVIDIA_API_KEY`.**
 
 Env file: `.env` in the CWD (`env_file=".env"`, no prefix). See `backend/.env.example`.
 

@@ -191,4 +191,4 @@ curl -s localhost:8000/api/conversation/<ID> | jq '.messages[-1] | {status, len:
 
 If you write a test, drive `handle_chat_message` with an `anyio` stream and a stubbed
 `get_chat_engine` (patch `app.chat.messaging.get_chat_engine`) — that is the cheapest way to pin
-the frame contract without Gemini.
+the frame contract without an LLM provider.

@@ -11,7 +11,7 @@ These cover the promises the UI now builds on:
   exposes citations on the message, and always ends in SUCCESS or ERROR;
 * `handle_chat_message` never closes the channel it was handed.
 
-No database, no Gemini, no network: everything external is mocked.
+No database, no NVIDIA API, no network: everything external is mocked.
 """
 import datetime
 from typing import Any, Dict, List
@@ -491,7 +491,7 @@ async def test_answer_stream_marks_the_message_failed_when_the_engine_raises():
     conversation = schema.Conversation(id=conversation_id, title=None, documents=[], messages=[])
 
     async def exploding_handle(conv, user_message, send_chan, callback_handler=None):
-        raise RuntimeError("gemini exploded")
+        raise RuntimeError("llm exploded")
 
     crud_mock = MagicMock()
     crud_mock.create_message = AsyncMock(

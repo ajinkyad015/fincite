@@ -28,7 +28,7 @@ Companion files: `../DATA_MODELS.md`, `../WORKFLOWS.md`, `../modules/rag-engine.
 │   app/ingestion/pdf.py ─┐                                                    │
 │   app/chat/engine.py  ──┼──►  LlamaIndex  ──►  pgvector (data_pg_vector_store)│
 │   app/chat/pg_vector.py ┘        │                                           │
-│                                  └──► Google Gemini (LLM + 3072-d embeddings)│
+│                                  └──► NVIDIA NIM API (LLM + 2048-d embeddings)│
 │   app/storage/supabase.py  ──►  Supabase Storage (documents/{id}/original.pdf)│
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -116,8 +116,8 @@ Dependency rules that hold today (keep them):
 | Coupling | Consequence |
 |---|---|
 | `chat/pg_vector.py` reaches into `db/session.py` | vector store shares the app pool; closing one affects the other |
-| `core/config.py:83` mutates `os.environ` at import | importing the app has a global side effect on the Gemini SDK |
-| `chat/engine.py:64` calls `nest_asyncio.apply()` at import | re-entrant loops; masks sync/async mistakes (e.g. `VectorStoreIndex.from_documents` inside an async handler) |
+| `core/config.py:123` mutates `os.environ` at import | importing the app has a global side effect on the NVIDIA clients' env fallbacks |
+| `chat/engine.py:65` calls `nest_asyncio.apply()` at import | re-entrant loops; masks sync/async mistakes (e.g. `VectorStoreIndex.from_documents` inside an async handler) |
 | `models/db.py` derives enum values from LlamaIndex's `CBEventType` | upgrading `llama-index-core` can add enum values the DB type doesn't have ⇒ need a migration |
 
 ---
@@ -127,8 +127,8 @@ Dependency rules that hold today (keep them):
 ### 4.1 Tier 1 — `ReActAgent`
 
 ```python
-chat_llm = Gemini(model=settings.GEMINI_CHAT_LLM_NAME, api_key=settings.GOOGLE_API_KEY)   # :219
-question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)                           # :223
+chat_llm = get_chat_llm()  # llama_index_settings factory (NVIDIA NIM)                     # :224
+question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)                            # :225
 document_question_engine = SubQuestionQueryEngine.from_defaults(...)                      # :225
 top_level_tools = [QueryEngineTool(document_question_engine, "document_question_engine")] # :233
 chat_engine = ReActAgent.from_tools(tools=top_level_tools, llm=chat_llm,
@@ -146,7 +146,7 @@ conversation and today's date; the agent must consult tools before answering.
 - `response_synthesizer=get_custom_response_synth(...)` — Refine + QA prompts that restate:
   selected documents, preserve units, name the financial year, do not fabricate
   (`qa_response_synth.py:16-66`).
-- `question_gen` reuses the same Gemini model, so one conversation makes many LLM calls
+- `question_gen` reuses the same NVIDIA chat model, so one conversation makes many LLM calls
   (question generation + N sub-answers + synthesis + ReAct steps).
 
 ### 4.3 Tier 3 — per-document tools
@@ -227,7 +227,7 @@ POST multipart
          ├── StorageContext.from_defaults(vector_store=…)
          ├── VectorStoreIndex.from_documents(show_progress=True)
          │     SentenceSplitter(chunk_size=512, chunk_overlap=10)  (llama_index_settings.py:22)
-         │     GeminiEmbedding(3072-d) → INSERT into data_pg_vector_store
+         │     NVIDIAEmbedding(2048-d) → INSERT into data_pg_vector_store
          └── index.set_index_id(document_id)
 ```
 
@@ -317,7 +317,7 @@ gzip) — no code splitting, everything inlined, fonts still fetched from Google
 | Change chunking/embeddings | `chat/constants.py` (chunk), `llama_index_settings.py`, **plus a migration/reindex** if `VECTOR_STORE_EMBED_DIM` changes |
 | New agent tool | `chat/engine.py` (`top_level_tools`) + tool description in `chat/utils.py`/constants |
 | New streamed UI metric | `chat/messaging.py` (`get_metadata_from_event`) + `schema.SubProcessMetadataKeysEnum` + `ResearchTrail`/`types.ts` |
-| Swap LLM provider | `llama_index_settings.py` + `engine.py:219` (both construct `Gemini` explicitly) + `core/config.py` |
+| Swap LLM provider | `llama_index_settings.py` (factories `get_chat_llm()`/`get_embed_model()` — the only construction site) + `core/config.py` + `pyproject.toml`; a new embedding dimension also means recreating `data_pg_vector_store` + re-indexing |
 | Real backend mode | `lib/api.ts` (`USE_MOCK`, `RealTransport`), plus a wire⇄domain mapper module that does not exist yet |
 | Background indexing | new queue module + `documents.py` (return 202) + progress endpoint + `store.watchDocument` |
 

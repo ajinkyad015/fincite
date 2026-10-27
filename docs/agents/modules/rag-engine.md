@@ -14,9 +14,9 @@ Everything that turns a question plus a set of documents into a streamed, cited 
 | `chat/qa_response_synth.py` | custom QA/Refine prompts | `get_custom_response_synth` |
 | `chat/constants.py` | prompt + chunking constants | `DB_DOC_ID_KEY`, `SYSTEM_MESSAGE`, `NODE_PARSER_CHUNK_SIZE=512`, `NODE_PARSER_CHUNK_OVERLAP=10` |
 | `chat/utils.py` | human labels for tools/prompts | `build_title_for_document`, `build_description_for_document`, `_fallback_title`, `_fallback_description` |
-| `llama_index_settings.py` | global defaults | `_setup_llama_index_settings()` sets `Settings.llm`, `.embed_model`, `.node_parser` |
+| `llama_index_settings.py` | NVIDIA client factories + global defaults | `get_chat_llm()` / `get_embed_model()` build the NIM clients; `_setup_llama_index_settings()` registers them as `Settings.llm` / `.embed_model` (+ `.node_parser`) |
 
-Import-time side effects: `chat/engine.py:64` `nest_asyncio.apply()`.
+Import-time side effects: `chat/engine.py:65` `nest_asyncio.apply()`.
 
 ---
 
@@ -26,7 +26,7 @@ Import-time side effects: `chat/engine.py:64` `nest_asyncio.apply()`.
 ReActAgent(max_iterations=6, context=SYSTEM_MESSAGE, chat_history)
 └── QueryEngineTool "document_question_engine"
     └── SubQuestionQueryEngine(use_async=True,
-                               question_gen=LLMQuestionGenerator(Gemini),
+                               question_gen=LLMQuestionGenerator(NVIDIA chat LLM),
                                response_synthesizer=custom QA/Refine)
         ├── QueryEngineTool name=<doc A uuid>  desc="Annual report for …"
         │     └── VectorStoreIndex.as_query_engine(similarity_top_k=3,
@@ -35,7 +35,7 @@ ReActAgent(max_iterations=6, context=SYSTEM_MESSAGE, chat_history)
         └── …
 ```
 
-All tiers use `settings.GEMINI_CHAT_LLM_NAME`; embeddings are configured globally in
+All tiers use `settings.NVIDIA_CHAT_LLM_NAME`; embeddings are configured globally in
 `llama_index_settings.py` and used by `VectorStoreIndex`.
 
 ---
@@ -56,7 +56,7 @@ All tiers use `settings.GEMINI_CHAT_LLM_NAME`; embeddings are configured globall
 4. one `QueryEngineTool` per doc: `name = doc_id` (the LLM selects tools by name **and**
    description), `description = build_description_for_document(doc)`.
 5. `response_synth = get_custom_response_synth(callback_manager, conversation.documents)`.
-6. `chat_llm = Gemini(model=…, api_key=settings.GOOGLE_API_KEY)`.
+6. `chat_llm = get_chat_llm()` — the `llama_index_settings` factory, shared with `Settings.llm` so agent/question-gen/synthesis cannot drift.
 7. `question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)`.
 8. `SubQuestionQueryEngine.from_defaults(query_engine_tools, question_gen, response_synthesizer,
    verbose=LOG_LEVEL=="DEBUG", use_async=True)`.
@@ -68,7 +68,7 @@ All tiers use `settings.GEMINI_CHAT_LLM_NAME`; embeddings are configured globall
 
 **Cost per question** (rule of thumb): 1 ReAct planning call + 1 question-generation call + N
 sub-answer calls + 1 synthesis (refine may loop) + N×retrieval embedding calls. A 3-document
-question is easily 6-8 Gemini calls.
+question is easily 6-8 LLM calls.
 
 ---
 
@@ -135,7 +135,7 @@ depends on it.
 | LlamaIndex event | Where it comes from | UI effect |
 |---|---|---|
 | `CONSTRUCTED_QUERY_ENGINE` (synthetic) | `messaging.py:137` | "engine built" step |
-| `LLM` | every Gemini call | thinking / synthesis steps |
+| `LLM` | every NVIDIA chat call | thinking / synthesis steps |
 | `RETRIEVE` | vector search per doc | retrieval step |
 | `SYNTHESIZE` | response synthesizer | synthesis step |
 | `SUB_QUESTION` | sub-question engine, payload `EventPayload.SUB_QUESTION` = `SubQuestionAnswerPair` | Q/A + citations per document |
@@ -154,8 +154,8 @@ Adding a new streamed field: extend `get_metadata_from_event` + `schema.SubProce
 
 | Change | Files | Caveats |
 |---|---|---|
-| Different Gemini model | `.env GEMINI_CHAT_LLM_NAME`, `engine.py:219` (explicit `Gemini(...)`) | both construct LLMs — keep them in sync |
-| Different provider | `llama_index_settings.py`, `engine.py:219-223`, `core/config.py` | `GOOGLE_API_KEY` env export must go too |
+| Different chat model | `.env NVIDIA_CHAT_LLM_NAME` (+ `NVIDIA_CHAT_CONTEXT_WINDOW`/`NVIDIA_CHAT_MAX_TOKENS`) | ids outside the pinned client's known-model table are validated via `GET /v1/models` at construction |
+| Different provider | `llama_index_settings.py` factories, `core/config.py`, `pyproject.toml` | single construction site; `NVIDIA_*` env exports in `config.py` must go too |
 | Top-k | `index_to_query_engine` (`engine.py:109`, `similarity_top_k=3`) | higher k ⇒ more context tokens, slower |
 | Chunk size | `constants.py:25-26` | requires re-index; no migration needed |
 | Embedding dimension/model | `.env` + `pg_vector.py` + recreate `data_pg_vector_store` | old rows become unusable |

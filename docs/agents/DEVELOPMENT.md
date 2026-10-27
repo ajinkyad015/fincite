@@ -14,7 +14,7 @@ output; ❌ marks commands that currently fail (see `AGENTS.md §14`).
 | Node + npm | Node 20+ | frontend only |
 | PostgreSQL + pgvector | 14+ | Supabase project **or** `ankane/pgvector` via compose |
 | Supabase project | — | Storage bucket (default `annual-reports`) + service-role key |
-| Google AI key | — | https://aistudio.google.com/apikey |
+| NVIDIA API key | — | https://build.nvidia.com — sign in, open any model, "Get API Key" (`nvapi-…`) |
 
 There is no `Makefile`, no `justfile`, no CI workflow, and no task runner.
 
@@ -34,7 +34,7 @@ Minimum `.env` to boot:
 
 ```dotenv
 DATABASE_URL=postgresql://postgres:<pw>@<host>:5432/postgres
-GOOGLE_API_KEY=<key>
+NVIDIA_API_KEY=nvapi-<key>
 # required for anything that touches Storage (i.e. all uploads):
 SUPABASE_URL=https://<project>.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=<service-role-key>
@@ -99,7 +99,9 @@ cd backend && uv run pytest -q
 injects dummy env vars before import and every external boundary is patched.
 
 Warnings you will see (all third-party, ignore): `supabase`/`gotrue`/`supafunc` deprecations,
-`google.generativeai` end-of-life, `google.api_core` Python-version notice.
+a pydantic protected-namespace notice from the NVIDIA model table, and "Unable to determine
+validity of nvidia/nemotron-3-embed-1b" (the model postdates the pinned embeddings client's
+known-model table; harmless).
 
 ```bash
 cd frontend && npx tsc --noEmit
@@ -217,10 +219,12 @@ offline environment falls back to Georgia/system fonts.
 |---|---|---|
 | `ModuleNotFoundError: fire` running a script | `fire` not declared | add dependency or use `argparse` |
 | `pytest` can't import `app` | run from repo root | `cd backend` first |
-| `Settings` validation error on import | `DATABASE_URL` / `GOOGLE_API_KEY` unset | export both (or rely on `conftest.py` in tests) |
+| `Settings` validation error on import | `DATABASE_URL` / `NVIDIA_API_KEY` unset | export both (or rely on `conftest.py` in tests) |
 | Boot: "Database is not up to date" | migrations behind | `uv run alembic upgrade head` |
 | Upload 500 "must be set to use Supabase Storage" | missing `SUPABASE_*` | set them; restart |
 | Upload 422 | unreadable/corrupt PDF, or embeddings failed | check logs with `LOG_LEVEL=DEBUG`, retry smaller file |
+| Boot: vector-table dimension mismatch | embedding model/`VECTOR_STORE_EMBED_DIM` changed without recreating the table | `DROP TABLE data_pg_vector_store`, restart, then `POST /api/document/{id}/reindex` for every document |
+| NVIDIA 410/404 on a model | catalog model retired (ids on build.nvidia.com are versioned) | set `NVIDIA_CHAT_LLM_NAME`/`NVIDIA_EMBEDDING_MODEL_NAME` to the successor (embedding change ⇒ table recreate + re-index; also re-check `NVIDIA_CHAT_CONTEXT_WINDOW`/`MAX_TOKENS`) |
 | Answers have no citations | nodes missing `db_document_id`/`page_label`, or doc not indexed | re-upload; verify with the SQL above |
 | Deleting a thread 500s | FK violation (no cascade) | see `AGENTS.md §14.E` |
 | `tsc` errors about `FinDocument` | broken comment in `types.ts` | close the `/**` on line 1-4 |

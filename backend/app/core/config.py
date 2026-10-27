@@ -21,21 +21,44 @@ class Settings(BaseSettings):
     SUPABASE_SERVICE_ROLE_KEY: str = ""
     SUPABASE_STORAGE_BUCKET: str = "annual-reports"
 
-    # Google / Gemini AI
-    GOOGLE_API_KEY: str
-    GEMINI_CHAT_LLM_NAME: str = "models/gemini-1.5-flash"
-    GEMINI_EMBEDDING_MODEL_NAME: str = "models/gemini-embedding-001"
+    # NVIDIA AI (build.nvidia.com hosted NIMs, OpenAI-compatible API).
+    # One `nvapi-…` key serves both chat and embeddings. Get one from any
+    # model page on https://build.nvidia.com ("Get API Key").
+    NVIDIA_API_KEY: str
+    # ReAct brain + question generation + synthesis. Any chat model id from
+    # the NVIDIA API catalog works here (ids are `org/model`, no `models/`
+    # prefix). The default is in llama-index-llms-nvidia's known-model table,
+    # so constructing it needs no catalog lookup; an unknown id makes the
+    # client verify it against GET /v1/models at startup instead.
+    NVIDIA_CHAT_LLM_NAME: str = "meta/llama-3.3-70b-instruct"
+    # Must stay in lock-step with VECTOR_STORE_EMBED_DIM below (this model's
+    # native — and only — output size is 2048).
+    NVIDIA_EMBEDDING_MODEL_NAME: str = "nvidia/nemotron-3-embed-1b"
+    # Hosted API catalog endpoint. Override to point at a self-hosted NIM
+    # (e.g. "http://localhost:8080/v1").
+    NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
+    # llama-index-llms-nvidia (an OpenAILike) otherwise assumes a 3900-token
+    # window and a 1024-token reply cap, which would starve the response
+    # synthesizer and truncate answers. 131072 / 4096 are this model's NIM
+    # context length and max_tokens ceiling; keep them matched to
+    # NVIDIA_CHAT_LLM_NAME when swapping models.
+    NVIDIA_CHAT_CONTEXT_WINDOW: int = 131072
+    NVIDIA_CHAT_MAX_TOKENS: int = 4096
 
     # Vector store
     VECTOR_STORE_TABLE_NAME: str = "pg_vector_store"
-    VECTOR_STORE_EMBED_DIM: int = 3072
+    # Must equal NVIDIA_EMBEDDING_MODEL_NAME's output dimension. Changing it
+    # (or the embedding model) makes every stored vector unusable: drop and
+    # recreate the vector table, then re-index every document. Startup
+    # refuses to run against a table built for a different dimension.
+    VECTOR_STORE_EMBED_DIM: int = 2048
 
     # Uploads
     MAX_UPLOAD_MB: int = 50
 
     # Ingestion
     # Set to false to accept uploads without indexing them (e.g. UI work that
-    # does not need Gemini calls). Documents then stay in "uploaded".
+    # does not need embedding calls). Documents then stay in "uploaded".
     INGESTION_ENABLED: bool = True
 
     # Auth (M4). While false, every endpoint is public — see AGENTS.md §14.Q.
@@ -94,4 +117,8 @@ class Settings(BaseSettings):
     )
 
 settings = Settings()
-os.environ["GOOGLE_API_KEY"] = settings.GOOGLE_API_KEY
+# The NVIDIA LlamaIndex clients fall back to these env vars when a parameter
+# is not passed explicitly; keep the environment in sync with the validated
+# settings (we also pass both explicitly — see app/llama_index_settings.py).
+os.environ["NVIDIA_API_KEY"] = settings.NVIDIA_API_KEY
+os.environ["NVIDIA_BASE_URL"] = settings.NVIDIA_BASE_URL

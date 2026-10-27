@@ -38,7 +38,7 @@ Do NOT read all of them — only what's relevant.
 Two deliverables in one repo, deployable independently:
 
 1. **`backend/`** — FastAPI + LlamaIndex RAG service. Upload a PDF → it is stored in Supabase
-   Storage, parsed page-by-page, chunked, embedded with Google Gemini, and written into
+   Storage, parsed page-by-page, chunked, embedded with NVIDIA Nemotron-3-Embed, and written into
    PostgreSQL/pgvector. Users then open a *conversation* scoped to 1..n documents and ask
    questions; answers stream over **SSE** as complete `Message` snapshots, with page-level
    citations and a persisted reasoning trace ("research trail").
@@ -84,8 +84,9 @@ deletion, no background job queue, no CI, no frontend tests.
 | `llama-index-core` | 0.12.23 | agent, query engines, callbacks |
 | `llama-index-vector-stores-postgres` | 0.4.2 | `PGVectorStore` |
 | `llama-index-readers-file` | 0.4.6 | `PDFReader` |
-| `llama-index-llms-gemini` | 0.5.0 | `Gemini` LLM |
-| `llama-index-embeddings-gemini` | 0.3.2 | `GeminiEmbedding` |
+| `llama-index-llms-nvidia` | 0.3.3 | `NVIDIA` LLM (OpenAILike; pin threaded through core 0.12.23, see `pyproject.toml`) |
+| `llama-index-embeddings-nvidia` | 0.3.4 | `NVIDIAEmbedding` |
+| `openai` | 1.81.0 | SDK under both NVIDIA clients (capped `<1.82` in `pyproject.toml`) |
 | `supabase` | 2.16.0 | Storage client |
 | `nltk` | 3.9.1 | sentence tokenizer data |
 | `nest-asyncio` | 1.6.0 | re-entrant loop patch (imported in `chat/engine.py:64`) |
@@ -122,8 +123,12 @@ deletion, no background job queue, no CI, no frontend tests.
 - **PostgreSQL + pgvector** — Supabase in prod; `ankane/pgvector:v0.5.0` locally.
 - **Supabase Storage** — bucket from `SUPABASE_STORAGE_BUCKET` (default `annual-reports`),
   object path `documents/{document_id}/original.pdf`.
-- **Google AI (Gemini)** — chat `models/gemini-1.5-flash`, embeddings
-  `models/gemini-embedding-001` (3072 dims).
+- **NVIDIA AI (build.nvidia.com hosted NIMs)** — OpenAI-compatible API at
+  `https://integrate.api.nvidia.com/v1`, one `nvapi-…` key for chat
+  `meta/llama-3.3-70b-instruct` and embeddings `nvidia/nemotron-3-embed-1b`
+  (2048 dims, native only). Both clients are built in
+  `app/llama_index_settings.py` (`get_chat_llm()` / `get_embed_model()`);
+  embeddings are asymmetric (`input_type` passage vs query).
 - **Docker** — `backend/Dockerfile` (`python:3.11.3-slim-bullseye` + `uv sync --frozen`),
   `backend/docker-compose.yml` (backend + local pgvector).
 
@@ -151,7 +156,7 @@ fincitee/
 │   ├── app/
 │   │   ├── main.py                # FastAPI app, lifespan, _bootstrap(), `start()` entrypoint
 │   │   ├── schema.py              # ALL Pydantic API schemas (incl. NSE metadata, Citation)
-│   │   ├── llama_index_settings.py# global LlamaIndex Settings: Gemini LLM, embeddings, splitter
+│   │   ├── llama_index_settings.py# NVIDIA LLM/embedding factories + global Settings + splitter
 │   │   ├── core/config.py         # pydantic-settings `Settings` + URL/CORS/LOG_LEVEL validators
 │   │   ├── db/
 │   │   │   ├── session.py         # async engine + async_sessionmaker (pool 4 / overflow 4)
@@ -195,7 +200,7 @@ fincitee/
 │   │   └── upsert_document.py     # insert a Document row by URL
 │   │
 │   └── tests/
-│       ├── conftest.py            # sets dummy DATABASE_URL / GOOGLE_API_KEY / SUPABASE_* before import
+│       ├── conftest.py            # sets dummy DATABASE_URL / NVIDIA_API_KEY / SUPABASE_* before import
 │       ├── app/chat/test_engine.py# 8 tests: singleton embed_dim + get_chat_history matrix
 │       └── app/test_refactored.py # 7 tests: NSE metadata, storage, ingestion, upload, health
 │
@@ -240,9 +245,9 @@ Browser (React 19 SPA, mock transport today)
    │  fetch / EventSource        (target: /api/**)
    ▼
 FastAPI (uvicorn, N workers)  ──►  PostgreSQL  (relational: conversation/message/document)
-   │        │                  ──►  pgvector    (table data_pg_vector_store, 3072-d)
+   │        │                  ──►  pgvector    (table data_pg_vector_store, 2048-d)
    │        └──► Supabase Storage (documents/{id}/original.pdf)
-   └──► Google Gemini (chat + embeddings)
+   └──► NVIDIA NIM API (chat + embeddings)
 ```
 
 **One database for both relational state and vectors.** There is no separate vector DB, no
@@ -252,7 +257,7 @@ cache, no queue. A single uvicorn process pool serves everything; heavyweight in
 ### 4.2 The three-tier RAG harness (`backend/app/chat/engine.py:181` `get_chat_engine`)
 
 ```
-Tier 1  ReActAgent (Gemini, max_iterations=6, SYSTEM_MESSAGE context)
+Tier 1  ReActAgent (meta/llama-3.3-70b-instruct via NVIDIA, max_iterations=6, SYSTEM_MESSAGE context)
         │  exactly ONE tool: `document_question_engine`
 Tier 2  SubQuestionQueryEngine (LLMQuestionGenerator, use_async=True, custom response synth)
         │  one QueryEngineTool per document, each ExactMatchFilter(db_document_id=…)
@@ -285,7 +290,7 @@ Tier 3  VectorStoreIndex.as_query_engine(similarity_top_k=3, filters=…)
    Without it, per-document filtering and citations both fail.
 2. **Node metadata must include `page_label`** — `Citation.from_node` does
    `int(node.source_node.metadata["page_label"])` (`schema.py:49`). Missing key ⇒ KeyError.
-3. **`VECTOR_STORE_EMBED_DIM` must equal the embedding model's dimension (3072).** Vectors of a
+3. **`VECTOR_STORE_EMBED_DIM` must equal the embedding model's dimension (2048).** Vectors of a
    different width cannot share the table.
 4. **pgvector table name** is `data_` + `VECTOR_STORE_TABLE_NAME` (LlamaIndex convention) ⇒
    `data_pg_vector_store`.
@@ -326,7 +331,7 @@ endpoints/conversation.py: message_conversation (SSE)
   │         ├─ chat/qa_response_synth.py get_custom_response_synth
   │         ├─ storage/supabase.py       download_document  (only on re-index fallback)
   │         ├─ chat/constants.py         DB_DOC_ID_KEY, SYSTEM_MESSAGE
-  │         └─ llama_index ReActAgent / SubQuestionQueryEngine / Gemini
+  │         └─ llama_index ReActAgent / SubQuestionQueryEngine / NVIDIA LLM
   └─ chat/messaging.py:ChatCallbackHandler → anyio send_chan → event_publisher → EventSourceResponse
 ```
 
@@ -383,8 +388,9 @@ main.tsx → App.tsx (StoreProvider)
 
 1. Run `_bootstrap()` **only if** `FINCITE_BOOTSTRAP_DONE != "1"` (i.e. when launched with
    `uvicorn app.main:app` directly).
-2. `await asyncio.to_thread(_setup_llama_index_settings)` — Gemini constructor performs a
-   blocking model-metadata lookup, so it must not run on the event loop.
+2. `await asyncio.to_thread(_setup_llama_index_settings)` — NVIDIA client construction can
+   perform a blocking `GET /v1/models` validation for model ids outside its known table,
+   so it must not run on the event loop.
 3. `(await get_vector_store_singleton()).ensure_initialized()` — creates this process's engines,
    **no DDL**.
 4. `yield` → serve; on shutdown `vector_store.close()` disposes the shared engine.
@@ -473,7 +479,7 @@ alias), `NSEDocumentMetadata`, `NSEDocumentTypeEnum`, `DocumentMetadataKeysEnum`
 ### 7.3 Vector store
 
 `data_pg_vector_store` (LlamaIndex-managed, `VECTOR_STORE_TABLE_NAME` + `data_` prefix),
-`embed_dim = VECTOR_STORE_EMBED_DIM` (3072), cosine distance, columns include
+`embed_dim = VECTOR_STORE_EMBED_DIM` (2048), cosine distance, columns include
 `id, text, metadata_ (JSONB), node_id, embedding`. Every row's `metadata_->>'db_document_id'`
 holds the owning `document.id`; `metadata_->>'page_label'` holds the PDF page.
 
@@ -593,26 +599,28 @@ after the last step → completion attaches `sources[]` → clicking `[n]` or a 
 
 `uv run start` → logging → Sentry → `_bootstrap` (DB wait → Alembic head check → pgvector DDL →
 NLTK data → close) → flag → uvicorn with `BACKEND_WORKERS` → each worker lifespan configures
-Gemini settings in a thread → opens its own pools → serves.
+NVIDIA settings in a thread → opens its own pools → serves.
 
 ---
 
 ## 10. CONFIGURATION & ENVIRONMENT VARIABLES
 
 `backend/app/core/config.py` (`Settings`, env prefix `""`, reads `.env`). Required: `DATABASE_URL`,
-`GOOGLE_API_KEY`. Everything else has a default.
+`NVIDIA_API_KEY`. Everything else has a default.
 
 | Variable | Default | Notes / where used |
 |---|---|---|
 | `DATABASE_URL` | **required** | validator rewrites `postgres://`→`postgresql://`→`postgresql+asyncpg://`; rejects non-postgres (`config.py:54`) |
-| `GOOGLE_API_KEY` | **required** | also exported to `os.environ` at import (`config.py:83`) for the Gemini SDK |
+| `NVIDIA_API_KEY` | **required** | `nvapi-…` key from build.nvidia.com (chat + embeddings); also exported to `os.environ` at import (`config.py:123`, with `NVIDIA_BASE_URL`) for the NVIDIA clients' env fallbacks |
 | `SUPABASE_URL` | `""` | Storage; `RuntimeError` if empty when used |
 | `SUPABASE_SERVICE_ROLE_KEY` | `""` | server-side only, never returned to clients |
 | `SUPABASE_STORAGE_BUCKET` | `annual-reports` | must exist in the Supabase project |
-| `GEMINI_CHAT_LLM_NAME` | `models/gemini-1.5-flash` | LLM for agent, question-gen, synthesis |
-| `GEMINI_EMBEDDING_MODEL_NAME` | `models/gemini-embedding-001` | must be 3072-d |
+| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` | LLM for agent, question-gen, synthesis; any build.nvidia.com chat id (unknown ids are validated via `GET /v1/models` at construction) |
+| `NVIDIA_EMBEDDING_MODEL_NAME` | `nvidia/nemotron-3-embed-1b` | must output exactly `VECTOR_STORE_EMBED_DIM` (2048) |
+| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | hosted catalog endpoint; override for a self-hosted NIM. Trailing slash is normalised per-client in `llama_index_settings.py` (the two packages' hosted-URL constants disagree on it) |
+| `NVIDIA_CHAT_CONTEXT_WINDOW` / `NVIDIA_CHAT_MAX_TOKENS` | `131072` / `4096` | declared to LlamaIndex for synthesis sizing / reply cap; must match the chat model's NIM limits |
 | `VECTOR_STORE_TABLE_NAME` | `pg_vector_store` | real table = `data_pg_vector_store` |
-| `VECTOR_STORE_EMBED_DIM` | `3072` | asserted by a test (`test_engine.py:44`) |
+| `VECTOR_STORE_EMBED_DIM` | `2048` | asserted by a test (`test_engine.py:44`) |
 | `PROJECT_NAME` | `fincite` | FastAPI title |
 | `API_PREFIX` | `/api` | all routes + docs |
 | `LOG_LEVEL` | `INFO` | one of DEBUG/INFO/WARNING/ERROR/CRITICAL; `DEBUG` ⇒ uvicorn reload + verbose agent traces |
@@ -640,7 +648,7 @@ the code/README contract — treat them as unverified.
 
 ```bash
 uv sync                                  # install from uv.lock incl. dev group  ✅
-cp .env.example .env                     # then fill DATABASE_URL / SUPABASE_* / GOOGLE_API_KEY
+cp .env.example .env                     # then fill DATABASE_URL / SUPABASE_* / NVIDIA_API_KEY
 uv run alembic upgrade head              # migrate (CWD must be backend/)
 uv run start                             # bootstrap + uvicorn on 0.0.0.0:8000
 # or: uv run uvicorn app.main:app --port 8000
@@ -728,7 +736,7 @@ curl "localhost:8000/api/conversation/<ID>/test_message?user_message=Hello"
 `pytest.ini`/`pyproject` config (strict asyncio mode ⇒ async tests need
 `@pytest.mark.asyncio`). **Verified: `uv run pytest -q` → 15 passed, 4 warnings, ~8 s.**
 
-**`tests/conftest.py`** sets `DATABASE_URL`, `GOOGLE_API_KEY`, `SUPABASE_URL`,
+**`tests/conftest.py`** sets `DATABASE_URL`, `NVIDIA_API_KEY`, `SUPABASE_URL`,
 `SUPABASE_SERVICE_ROLE_KEY` via `os.environ.setdefault` **before** any app import — this is why
 the suite runs with no services. Add any new required setting there.
 
@@ -736,7 +744,7 @@ the suite runs with no services. Add any new required setting there.
 
 | File | Tests | What they pin |
 |---|---|---|
-| `tests/app/chat/test_engine.py` | 8 | `get_vector_store_singleton` passes `embed_dim=3072` (monkeypatched `from_params`); `get_chat_history` matrix: happy path, consecutive same-role messages, empty input, ERROR-status user/assistant filtering, blank content stripping, unpaired messages |
+| `tests/app/chat/test_engine.py` | 8 | `get_vector_store_singleton` passes `embed_dim=2048` (monkeypatched `from_params`); `get_chat_history` matrix: happy path, consecutive same-role messages, empty input, ERROR-status user/assistant filtering, blank content stripping, unpaired messages |
 | `tests/app/test_refactored.py` | 7 | `NSEDocumentMetadata` parsing + defaults; Supabase storage helpers with `@patch("app.storage.supabase.create_client")`; `ingest_document` flow (PDFReader/VectorStoreIndex/StorageContext patched); upload endpoint success + invalid file; health endpoint |
 
 **Patterns to reuse**
@@ -746,7 +754,7 @@ the suite runs with no services. Add any new required setting there.
 - `AsyncMock(spec=AsyncSession)` for the DB dependency; `AsyncMock(spec=UploadFile)` with
   `read.return_value = b"%PDF-1.4 …"`.
 - Event-loop bridging in sync tests: `asyncio.run(coro)` (see
-  `test_get_vector_store_singleton_uses_3072_embedding_dimension`).
+  `test_get_vector_store_singleton_uses_2048_embedding_dimension`).
 - Pydantic message doubles: subclass `schema.Message` with defaults
   (`class MockMessage(Message): conversation_id: UUID = uuid4(); sub_processes: list = []`).
 - Reset module singletons when a test touches them (`supabase._supabase_client = None`,
@@ -848,9 +856,9 @@ Sub-process enums differ too (UI: `llm|retrieval|rerank|parser`; API: LlamaIndex
 
 **L. ~~`GET /api/document/` returns 404 for an empty library~~ — FIXED.** It returns `200 []`.
 
-**M. Import-time side effects.** `chat/engine.py:64` calls `nest_asyncio.apply()` on import;
-`core/config.py:83` writes `os.environ["GOOGLE_API_KEY"]`. Importing `app.main` therefore
-requires `DATABASE_URL` + `GOOGLE_API_KEY` to be set (or the test defaults from `conftest.py`).
+**M. Import-time side effects.** `chat/engine.py:65` calls `nest_asyncio.apply()` on import;
+`core/config.py:123` writes `os.environ["NVIDIA_API_KEY"]` (+ `NVIDIA_BASE_URL`). Importing `app.main` therefore
+requires `DATABASE_URL` + `NVIDIA_API_KEY` to be set (or the test defaults from `conftest.py`).
 
 **N. ~~`_bootstrap()` depends on CWD~~ — FIXED.** `main.py` resolves `alembic.ini` from
 `Path(__file__).resolve().parents[1]` and pins `script_location`, so the API boots from any working
@@ -871,9 +879,18 @@ commented-out UI blocks remain in `Sidebar.tsx`, `ChatView.tsx`, `LibraryView.ts
 **Q. No auth, tenancy, rate limiting, or CI.** Every endpoint is public; the Supabase
 service-role key must never leak to the client; there is no `.github/workflows`.
 
-**R. Dependency age.** `sentry-sdk` 1.29.2 and `uvicorn` 0.22.0 are old; the Gemini SDK
-(`google-generativeai`) is end-of-life and emits a `FutureWarning` on every import (visible in
-the pytest output). Not urgent, but a migration to `google-genai` will eventually be required.
+**R. Dependency age.** `sentry-sdk` 1.29.2 and `uvicorn` 0.22.0 are old. The NVIDIA
+integrations are pinned to the last core-0.12-compatible releases
+(`llama-index-llms-nvidia==0.3.3`, `llama-index-embeddings-nvidia==0.3.4`, plus an
+`openai<1.82` cap — rationale in `pyproject.toml`); moving them means the deferred
+llama-index-core 0.13+ upgrade. Two pinned-client quirks are compensated in
+`llama_index_settings.py`: embeddings 0.3.4 sends `input_type="passage"` on the *sync*
+query path (fixed by the `_NVIDIAEmbedding` subclass), and the two packages disagree
+on the hosted base URL's trailing slash (normalised in the factories). Catalog model
+ids also retire (the previous embedding default's predecessor returned 410s); treat a
+410/404 from NVIDIA as "pick the successor model + re-check dims" (and for embeddings,
+recreate the vector table + re-index — `pg_vector.run_setup()` now refuses to boot
+against a table built for a different dimension).
 
 ---
 
@@ -910,11 +927,11 @@ the pytest output). Not urgent, but a migration to `google-genai` will eventuall
 
 ### NEVER
 
-1. **Never change `VECTOR_STORE_EMBED_DIM` (3072) or the embedding model without recreating the
+1. **Never change `VECTOR_STORE_EMBED_DIM` (2048) or the embedding model without recreating the
    vector table** — rows of mixed dimensionality break similarity search.
-2. **Never send blocking work onto the event loop.** PDF parsing, Gemini model construction, and
+2. **Never send blocking work onto the event loop.** PDF parsing, LLM client construction, and
    any `requests` call must be wrapped (`asyncio.to_thread`) or moved to a task.
-3. **Never expose `SUPABASE_SERVICE_ROLE_KEY`, `GOOGLE_API_KEY`, or `DATABASE_URL`** to the
+3. **Never expose `SUPABASE_SERVICE_ROLE_KEY`, `NVIDIA_API_KEY`, or `DATABASE_URL`** to the
    client, in logs, or in API responses.
 4. **Never edit `alembic/versions/*.py` that already ran** (or delete rows from
    `alembic_version`); add a new revision instead.
@@ -944,8 +961,8 @@ the pytest output). Not urgent, but a migration to `google-genai` will eventuall
 ### Quick "is it healthy?" checklist
 
 ```bash
-cd backend  && uv run pytest -q                     # expect: 52 passed
-cd backend  && uv run python -c "import app.main"   # needs DATABASE_URL + GOOGLE_API_KEY set
+cd backend  && uv run pytest -q                     # expect: 60 passed
+cd backend  && uv run python -c "import app.main"   # needs DATABASE_URL + NVIDIA_API_KEY set
 cd frontend && npm run typecheck                    # expect: 0 errors
 cd frontend && npm run build                        # expect: single dist/index.html (~622 kB)
 curl -s localhost:8000/api/health/                  # {"status":"healthy","db":true,…} — requires DB + env

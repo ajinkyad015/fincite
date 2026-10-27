@@ -1,8 +1,9 @@
 """
 Chat engine construction.
 
-Builds a ReActAgent with per-document RAG query engines powered by Google Gemini.
-Documents are retrieved from Supabase Storage and indexed into pgvector.
+Builds a ReActAgent with per-document RAG query engines powered by NVIDIA
+hosted NIMs (build.nvidia.com). Documents are retrieved from Supabase
+Storage and indexed into pgvector.
 
 Flow:
     conversation documents
@@ -19,7 +20,7 @@ Flow:
           ↓
     SubQuestionQueryEngine
           ↓
-    ReActAgent (streaming, powered by Gemini)
+    ReActAgent (streaming, powered by the NVIDIA chat model)
 """
 from typing import Dict, List
 import logging
@@ -40,7 +41,6 @@ from llama_index.core.callbacks.base import BaseCallbackHandler, CallbackManager
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core.query_engine import SubQuestionQueryEngine
 from llama_index.core.agent import ReActAgent
-from llama_index.llms.gemini import Gemini
 from llama_index.core.base.llms.types import MessageRole
 
 from llama_index.readers.file.docs.base import PDFReader
@@ -56,6 +56,7 @@ from app.chat.constants import DB_DOC_ID_KEY, SYSTEM_MESSAGE
 from app.chat.utils import build_title_for_document, build_description_for_document
 from app.chat.pg_vector import get_vector_store_singleton
 from app.chat.qa_response_synth import get_custom_response_synth
+from app.llama_index_settings import get_chat_llm
 from app.storage.supabase import download_document
 
 logger = logging.getLogger(__name__)
@@ -183,7 +184,7 @@ async def get_chat_engine(
     conversation: ConversationSchema,
 ) -> ReActAgent:
     """
-    Build a ReActAgent (powered by Gemini) for a conversation.
+    Build a ReActAgent (powered by the NVIDIA chat model) for a conversation.
 
     Architecture:
         One QueryEngineTool per selected document (filtered to that doc's vectors)
@@ -215,11 +216,12 @@ async def get_chat_engine(
     response_synth = get_custom_response_synth(callback_manager, conversation.documents)
 
     from llama_index.core.question_gen import LLMQuestionGenerator
-    
-    chat_llm = Gemini(
-        model=settings.GEMINI_CHAT_LLM_NAME,
-        api_key=settings.GOOGLE_API_KEY,
-    )
+
+    # Same factory as the global Settings.llm so the agent, the question
+    # generator, and the synthesizer always run on the same model/endpoint.
+    # For the default (catalog-known) model this constructor performs no
+    # network I/O, so building it on the event loop is safe.
+    chat_llm = get_chat_llm()
     question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)
 
     document_question_engine = SubQuestionQueryEngine.from_defaults(

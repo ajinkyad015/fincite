@@ -93,10 +93,10 @@ roughly half of the reads/writes the UI assumes.
 | B9 | Streaming concurrency is fragile: `async with send_chan` in two places, fire-and-forget `create_task` on callback events, reads private `send_chan._closed`. | `messaging.py:51,65,102`, `conversation.py:113,156` |
 | B10 | `_bootstrap()` resolves `Config("alembic.ini")` relative to CWD → breaks when the container/workdir differs. | `main.py:89`, AGENTS.md §14.N |
 | B11 | `/api/health/` returns `{"status":"alive"}` but the UI type expects `healthy｜degraded｜down`. | `health.py:16`, `types.ts:110` |
-| B12 | No auth, no tenancy, no rate limiting — every endpoint is public and pays Gemini tokens. | AGENTS.md §14.Q |
+| B12 | No auth, no tenancy, no rate limiting — every endpoint is public and pays NVIDIA API tokens. | AGENTS.md §14.Q |
 | B13 | `docker-compose.yml` maps host 5433 → container **5433** (Postgres listens on 5432), no frontend/web/reverse-proxy service, obsolete `version: '3'`. | `docker-compose.yml` |
 | B14 | No `.github/workflows` at all. | repo root |
-| B15 | Chat model is `models/gemini-1.5-flash`; the 1.5 family is end-of-life. **Deployment blocker — verify before go-live.** Changing the *chat* model is free; changing the *embedding* model requires re-indexing (3072-dim lock). | `config.py:24`, `pyproject.toml` |
+| B15 | ~~Chat model `models/gemini-1.5-flash` is end-of-life~~ — **RESOLVED pre-M2 by the Google → NVIDIA provider swap** (Oct 2026): chat `meta/llama-3.3-70b-instruct`, embeddings `nvidia/nemotron-3-embed-1b` (2048-d) via build.nvidia.com hosted NIMs; both are env-selected in `llama_index_settings.py`. The standing caution survives: catalog model ids retire (410/404), the *chat* swap is an env change, the *embedding* swap needs a vector-table recreate + full re-index. | `config.py`, `pyproject.toml` |
 
 **Conclusion:** the integration is not a matter of flipping a flag. It is a contract-first project:
 harden the API additively (M1), write a real client transport + mapper (M2), then spend the bulk of the
@@ -117,7 +117,7 @@ flowchart LR
     V -- "/api/* (proxied, same-origin)" --> B
     B --> PG[("Postgres + pgvector<br/>docker: pgvector")]
     B --> SB[["Supabase Storage"]]
-    B --> G["Gemini API"]
+    B --> G["NVIDIA NIM API<br/>integrate.api.nvidia.com"]
 ```
 
 Same-origin via a Vite proxy removes CORS from the developer's life and makes the frontend's base URL
@@ -132,7 +132,7 @@ flowchart TB
     C -- "/api/* (HTTP/1.1, no buffering)" --> A["FastAPI container<br/>2–4 uvicorn workers"]
     A --> PG[("Supabase Postgres<br/>+ pgvector")]
     A --> ST[["Supabase Storage<br/>PDFs"]]
-    A --> GM["Gemini API"]
+    A --> GM["NVIDIA NIM API"]
     A --> SEN["Sentry"]
 ```
 
@@ -299,7 +299,7 @@ async def run_ingestion(document_id: str):
 - Status writes go through `crud.update_document_status` (keeps the endpoint→crud→model layering).
 - Recover on boot: any document stuck in a non-terminal status older than 10 min → reset to `failed`
   with a retry hint (a `startup` sweep in `lifespan`).
-- Keep a `MAX_CONCURRENT_INGESTIONS = 1` semaphore — Gemini embedding is rate-limited and memory-hungry.
+- Keep a `MAX_CONCURRENT_INGESTIONS = 1` semaphore — the NVIDIA embedding API is rate-limited and parsing is memory-hungry.
 - **Explicitly deferred:** Redis/RQ/Celery. Add it only when concurrency > 1 is needed; record the decision
   in `docs/plans/decisions/000X-ingestion-jobs.md`.
 
@@ -466,7 +466,7 @@ addition — flagging rather than assuming.
 - Rate limits (per user, in-process token bucket is fine at this scale): uploads/hour, messages/minute,
   concurrent streams = 1; return `429` with `Retry-After` and surface a friendly toast.
 - Quotas: pages ingested / questions asked per day, exposed in `GET /api/usage` so the sidebar can show a
-  small "142 / 500 questions" meter. Hard cap protects the Gemini bill.
+  small "142 / 500 questions" meter. Hard cap protects the NVIDIA API bill.
 - Frontend: sign-in screen matching the editorial design, token in memory + refresh, auto-redirect on
   401, tenant-aware empty states ("Your library is empty" with an upload CTA).
 - Deferred (documented): orgs/teams, shared libraries, per-document ACLs, RLS policies (not needed while
@@ -529,9 +529,9 @@ fincite.example.com {
 | Variable | dev | staging | prod |
 |---|---|---|---|
 | `DATABASE_URL` | local pgvector | Supabase (staging project) | Supabase (prod) |
-| `GOOGLE_API_KEY` | personal | staging key, low quota | prod key, quota alarm |
-| `GEMINI_CHAT_LLM_NAME` | `models/gemini-2.5-flash` (verify) | same | same |
-| `GEMINI_EMBEDDING_MODEL_NAME` | unchanged (`gemini-embedding-001`, 3072-d) | unchanged | unchanged |
+| `NVIDIA_API_KEY` | personal | staging key, low quota | prod key, quota alarm |
+| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` (verify still served) | same | same |
+| `NVIDIA_EMBEDDING_MODEL_NAME` | unchanged (`nvidia/nemotron-3-embed-1b`, 2048-d) | unchanged | unchanged |
 | `BACKEND_CORS_ORIGINS` | `["http://localhost:5173"]` (unused with proxy) | staging origin | **exact** prod origin |
 | `AUTH_ENABLED` | `false` | `true` | `true` |
 | `BACKEND_WORKERS` | 1 (reload) | 2 | 2–4 |
@@ -539,9 +539,10 @@ fincite.example.com {
 | `SENTRY_DSN` | unset | set | set |
 | `MAX_UPLOAD_MB` (new) | 50 | 50 | 50 |
 
-**Before go-live, verify the chat model is still available** (B15). Gemini 1.5 is retired; pick a current
-Flash model, test one question end-to-end, and update `.env.example` + README. Do **not** touch the
-embedding model/dimension without a full re-index — 3072-d is a hard invariant (§15.NEVER.1).
+**Before go-live, verify both NVIDIA models are still served** (B15): catalog ids retire (the swap
+already had to skip one end-of-life embedding model). Test one ingest + one question end-to-end with
+the prod key. Do **not** touch the embedding model/dimension without a table recreate + full
+re-index — 2048-d is a hard invariant (§15.NEVER.1), and startup refuses a mismatched table.
 
 #### 5.4 Cost & failure budgets
 
@@ -567,7 +568,7 @@ passes; `https://…/api/docs` reachable; TLS A-grade; SSE works through the rev
 - [ ] Observability: Sentry release tagging, request IDs in logs, `/api/health/` uptime monitor, LLM
       latency/cost dashboard (log-based is enough).
 - [ ] Reliability: graceful shutdown closes the vector store and finishes in-flight streams; ingestion
-      sweep on boot; retry with jitter on Gemini 429/5xx; DB connection pool sized under Supabase limits.
+      sweep on boot; retry with jitter on NVIDIA 429/5xx; DB connection pool sized under Supabase limits.
 - [ ] Security pass: secrets audit, dependency audit (`uv`, `npm audit`), upload validation (magic bytes
       already), CORS lock-down, no `DEBUG` in prod, rate limits verified, `.env` never committed.
 - [ ] Accessibility & performance pass: axe scan, keyboard-only run-through, Lighthouse ≥ 90 on the app
@@ -697,7 +698,7 @@ Acceptance checklist for the release candidate:
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | Contract drift returns after M1 (someone edits one side) | Medium | High | `wire.ts` isolation + shared fixtures + generated types + CI check |
-| Gemini 1.5 Flash already retired → nothing answers | High | Blocker | Verify in M1.1; switch chat model there (cheap), never the embedding model |
+| NVIDIA catalog model retired (410) → nothing answers/ingests | Medium | Blocker | Verify at go-live (B15); chat = env swap, embedding = env swap + table recreate + re-index |
 | Long SSE killed by the host/proxy | Medium | High | `flush_interval -1` / `proxy_buffering off`, 10-min timeouts, heartbeat comments, durable partials + rehydrate |
 | Uploads during a demo take minutes and look broken | High | High | Background ingestion + real progress + `MAX_UPLOAD_MB` + a pre-seeded demo filing |
 | Supabase connection limits with 4 workers × pools | Medium | Medium | 2 workers, small pools, `pgbouncer` (port 6543) if needed |
