@@ -21,11 +21,14 @@ from uuid import UUID, uuid4
 import anyio
 import pytest
 from fastapi import Response
+from sqlalchemy.exc import MissingGreenlet
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.exceptions import HTTPException
 
 from app import schema
+from app.api import crud
 from app.api.endpoints import conversation as conversation_module
+from app.db.session import SessionLocal
 from app.api.endpoints import documents as documents_module
 from app.chat import messaging
 from app.models.db import (
@@ -587,3 +590,61 @@ async def test_thread_without_scope_falls_back_to_all_ready_documents():
         with pytest.raises(HTTPException) as excinfo:
             await conversation_module._resolve_scope(db, empty_thread)
     assert excinfo.value.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Persistence regressions: the terminal answer must always be committed.
+# ---------------------------------------------------------------------------
+
+
+class _ExpiredMessage:
+    """Stand-in for an ORM row whose attributes expired on commit.
+
+    Reading ``id`` after a commit is exactly what async SQLAlchemy forbids
+    (implicit sync IO → MissingGreenlet).
+    """
+
+    content = ""
+    status = None
+    sources = None
+
+    @property
+    def id(self):
+        raise MissingGreenlet("greenlet_spawn has not been called")
+
+
+@pytest.mark.asyncio
+async def test_finalise_message_never_reads_an_expired_orm_attribute():
+    """Regression for the second traceback in the chat failure report."""
+    db = AsyncMock(spec=AsyncSession)
+    db.get = AsyncMock(return_value=_ExpiredMessage())
+    message_id = uuid4()
+
+    trail_step = schema.MessageSubProcess(
+        message_id=message_id,
+        source=MessageSubProcessSourceEnum.CONSTRUCTED_QUERY_ENGINE,
+        status=MessageSubProcessStatusEnum.FINISHED,
+        name="Building the query engine",
+    )
+    with patch.object(
+        crud, "fetch_message_with_sub_processes", AsyncMock(return_value=None)
+    ) as fetch:
+        result = await crud.finalise_message(
+            db,
+            str(message_id),
+            "final answer",
+            MessageStatusEnum.SUCCESS,
+            sub_processes=[trail_step],
+        )
+
+    assert result is None
+    db.commit.assert_awaited()
+    # The id is the plain argument, never `message.id` post-commit. Trail rows
+    # still bind a real UUID object, as they did before the fix.
+    fetch.assert_awaited_once_with(db, str(message_id))
+    assert db.add.call_args.args[0].message_id == message_id
+
+
+def test_async_sessions_do_not_expire_instances_on_commit():
+    """Implicit lazy loads in async code raise MissingGreenlet — opt out."""
+    assert SessionLocal.kw.get("expire_on_commit") is False

@@ -13,8 +13,8 @@ start() (once per deploy, in the process that launches uvicorn):
 lifespan (per worker process):
     1. _bootstrap() only if start() did not already run it (e.g. when the app
        is launched via `uvicorn app.main:app` directly)
-    2. Configure LlamaIndex settings (NVIDIA LLM + embeddings) — per process;
-       client construction runs in a worker thread (see lifespan)
+    2. Configure LlamaIndex settings (OpenAI-compatible LLM + embeddings) —
+       per process; client construction runs in a worker thread (see lifespan)
     3. Initialise pgvector store engines for this process (no DDL — tables
        were already created in start())
     4. Start FastAPI
@@ -143,10 +143,11 @@ async def lifespan(app: FastAPI):
     if os.environ.get(_BOOTSTRAP_DONE_ENV_VAR) != "1":
         await _bootstrap()
 
-    # 1. Configure LlamaIndex (NVIDIA LLM + embeddings) — per process. Keep
-    #    construction off the event loop: for a chat model outside the
-    #    client's known-model table the constructor verifies it with a
-    #    blocking GET /v1/models call.
+    # 1. Configure LlamaIndex (configured LLM + embeddings) — per process.
+    #    Construction is config-only and network-free now (see
+    #    app/llama_index_settings.py); keeping it off the event loop stays
+    #    cheap insurance against future provider SDKs that do blocking work
+    #    in their constructors.
     await asyncio.to_thread(_setup_llama_index_settings)
 
     # 2. Create this process's vector store engines (no DDL).

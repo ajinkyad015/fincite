@@ -51,7 +51,7 @@ End-to-end traces for the five flows that matter. Line references are to the cur
                        empty result ⇒ ValueError "PDFReader produced no documents"
        15c           StorageContext.from_defaults(vector_store=…)             pdf.py:102
        15d           VectorStoreIndex.from_documents(llama_docs, show_progress=True)
-                       SentenceSplitter(512/10) → NVIDIAEmbedding(2048) → INSERT
+                       SentenceSplitter(512/10) → configured embedding model (2048-d) → INSERT
        15e           index.set_index_id(document_id)                          pdf.py:113
 16 handler           failure ⇒ crud.delete_document_by_id + delete_document    :166-174
                        → 422 "PDF indexing failed…"
@@ -165,22 +165,30 @@ yield final.model_dump_json()
                                                                if empty: send apology
 ```
 
-### `get_chat_engine` internals (`chat/engine.py:181`)
+*Persistence invariant (2026-10-27):* `SessionLocal` uses `expire_on_commit=False`. The
+endpoint copies `assistant_id` / `created_at` before any later commit, and
+`crud.finalise_message` uses the plain `message_id` argument instead of `message.id`. Reading
+an ORM attribute after `commit()` triggers an implicit sync lazy load
+(`sqlalchemy.exc.MissingGreenlet`), which used to abort the terminal write and leave the
+assistant row stuck in PENDING.
+
+### `get_chat_engine` internals (`chat/engine.py`)
 
 ```
+chat_llm = get_chat_llm()  # generic OpenAILike, env-declared metadata (no catalog lookup)
 callback_manager = CallbackManager([handler])
 doc_id_to_index = build_doc_id_to_index_map(callback_manager, conversation.documents)
     per doc: VectorStoreIndex.from_vector_store(vector_store, callback_manager)
              (fallback on exception: fetch_and_read_document → from_documents → set_index_id)
 id_to_doc = {str(doc.id): doc}
-tools = [QueryEngineTool(index_to_query_engine(doc_id, index),
+tools = [QueryEngineTool(index_to_query_engine(doc_id, index, llm=chat_llm),
                          ToolMetadata(name=doc_id,
                                       description=build_description_for_document(doc)))
          for doc_id, index in doc_id_to_index.items()]
-response_synth = get_custom_response_synth(callback_manager, conversation.documents)
-chat_llm = get_chat_llm()  # NVIDIA NIM, via llama_index_settings
+response_synth = get_custom_response_synth(callback_manager, conversation.documents, llm=chat_llm)
 question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)
-sub_q_engine = SubQuestionQueryEngine.from_defaults(tools, question_gen, response_synth,
+sub_q_engine = SubQuestionQueryEngine.from_defaults(tools, llm=chat_llm,
+                                                    question_gen, response_synth,
                                                     use_async=True, verbose=DEBUG)
 chat_history = get_chat_history(conversation.messages)
 context = SYSTEM_MESSAGE.format(doc_titles=…, curr_date=utcnow %Y-%m-%d)
@@ -314,3 +322,5 @@ uv run start  (console script `start = "app.main:start"`)
 | `FileNotFoundError: alembic.ini` | started outside `backend/` |
 | `RuntimeError: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set` | only raised on first storage call, not at boot |
 | Container up but 502 | workers still importing heavy libs (llama-index) — allow ~10-20 s |
+| `LLMMetadata: 2 validation errors … is_chat_model` on the first message | using a client that infers capabilities from a model-name table; set `NVIDIA_CHAT_IS_CHAT_MODEL` / `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL` in `.env` (both must be real booleans) |
+| `MissingGreenlet` in `finalise_message` | ORM attribute read after `commit()`; keep `expire_on_commit=False` and plain-id/scalar persistence |

@@ -262,7 +262,11 @@ async def _answer_stream(
             "",
             status=MessageStatusEnum.PENDING,
         )
+        # Copy the scalars we need before any further commit on this session:
+        # `snapshot()` runs after `crud.touch_conversation()` and after the
+        # periodic content flushes, so it must not touch the ORM instance.
         assistant_id = str(assistant.id)
+        assistant_created_at = assistant.created_at
         await crud.touch_conversation(
             db, conversation_id, title_if_empty=_derive_title(question)
         )
@@ -293,7 +297,7 @@ async def _answer_stream(
                 status=message_status,
                 sub_processes=trail,
                 sources=schema.citations_to_sources(citations_from_sub_processes(trail)),
-                created_at=assistant.created_at,
+                created_at=assistant_created_at,
             )
 
         try:

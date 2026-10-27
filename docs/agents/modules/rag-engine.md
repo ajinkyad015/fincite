@@ -14,7 +14,7 @@ Everything that turns a question plus a set of documents into a streamed, cited 
 | `chat/qa_response_synth.py` | custom QA/Refine prompts | `get_custom_response_synth` |
 | `chat/constants.py` | prompt + chunking constants | `DB_DOC_ID_KEY`, `SYSTEM_MESSAGE`, `NODE_PARSER_CHUNK_SIZE=512`, `NODE_PARSER_CHUNK_OVERLAP=10` |
 | `chat/utils.py` | human labels for tools/prompts | `build_title_for_document`, `build_description_for_document`, `_fallback_title`, `_fallback_description` |
-| `llama_index_settings.py` | NVIDIA client factories + global defaults | `get_chat_llm()` / `get_embed_model()` build the NIM clients; `_setup_llama_index_settings()` registers them as `Settings.llm` / `.embed_model` (+ `.node_parser`) |
+| `llama_index_settings.py` | env-driven model factories + global defaults | `get_chat_llm()` builds a generic `OpenAILike` (no model table), `get_embed_model()` a config-driven `NVIDIAEmbedding` subclass; `_setup_llama_index_settings()` registers them as `Settings.llm` / `.embed_model` (+ `.node_parser`) and logs the effective profile |
 
 Import-time side effects: `chat/engine.py:65` `nest_asyncio.apply()`.
 
@@ -25,18 +25,21 @@ Import-time side effects: `chat/engine.py:65` `nest_asyncio.apply()`.
 ```
 ReActAgent(max_iterations=6, context=SYSTEM_MESSAGE, chat_history)
 └── QueryEngineTool "document_question_engine"
-    └── SubQuestionQueryEngine(use_async=True,
-                               question_gen=LLMQuestionGenerator(NVIDIA chat LLM),
-                               response_synthesizer=custom QA/Refine)
+    └── SubQuestionQueryEngine(use_async=True, llm=chat_llm,
+                               question_gen=LLMQuestionGenerator(chat_llm),
+                               response_synthesizer=custom QA/Refine(llm=chat_llm))
         ├── QueryEngineTool name=<doc A uuid>  desc="Annual report for …"
-        │     └── VectorStoreIndex.as_query_engine(similarity_top_k=3,
+        │     └── VectorStoreIndex.as_query_engine(similarity_top_k=3, llm=chat_llm,
         │              filters=MetadataFilters([ExactMatchFilter(db_document_id=uuid)]))
         ├── QueryEngineTool name=<doc B uuid> …
         └── …
 ```
 
-All tiers use `settings.NVIDIA_CHAT_LLM_NAME`; embeddings are configured globally in
-`llama_index_settings.py` and used by `VectorStoreIndex`.
+All tiers share the **one** `chat_llm` from `get_chat_llm()` (`settings.NVIDIA_CHAT_LLM_NAME` +
+declared capabilities); embeddings are configured globally in `llama_index_settings.py` and used
+by `VectorStoreIndex`. Passing `llm` explicitly into every factory matters: LlamaIndex resolves
+`Settings.llm` internally even when a synthesizer is supplied, and that lookup used to receive
+`None` booleans from the old NVIDIA client → `LLMMetadata` ValidationError on the first message.
 
 ---
 
@@ -44,27 +47,30 @@ All tiers use `settings.NVIDIA_CHAT_LLM_NAME`; embeddings are configured globall
 
 `chat/engine.py:181`
 
-1. `CallbackManager([callback_handler])` — the manager is threaded into every index/engine so all
+1. `chat_llm = get_chat_llm()` — generic `OpenAILike`, config-only construction (no catalog
+   lookup, safe on the event loop), explicit boolean metadata.
+2. `CallbackManager([callback_handler])` — the manager is threaded into every index/engine so all
    events reach the SSE handler.
-2. `build_doc_id_to_index_map(...)` (`:112`):
+3. `build_doc_id_to_index_map(...)`:
    - `vector_store = await get_vector_store_singleton()`
    - `StorageContext.from_defaults(vector_store=vector_store)`
    - per document: `VectorStoreIndex.from_vector_store(...)`; on exception
      `fetch_and_read_document(doc)` → `from_documents(...)` → `set_index_id(doc_id)`.
    - ⚠ does **not** check that vectors exist for the doc (see `AGENTS.md §14.H`).
-3. `id_to_doc = {str(doc.id): doc}`.
-4. one `QueryEngineTool` per doc: `name = doc_id` (the LLM selects tools by name **and**
-   description), `description = build_description_for_document(doc)`.
-5. `response_synth = get_custom_response_synth(callback_manager, conversation.documents)`.
-6. `chat_llm = get_chat_llm()` — the `llama_index_settings` factory, shared with `Settings.llm` so agent/question-gen/synthesis cannot drift.
+4. `id_to_doc = {str(doc.id): doc}`.
+5. one `QueryEngineTool` per doc via `index_to_query_engine(doc_id, index, llm=chat_llm)`:
+   `name = doc_id` (the LLM selects tools by name **and** description),
+   `description = build_description_for_document(doc)`.
+6. `response_synth = get_custom_response_synth(callback_manager, conversation.documents,
+   llm=chat_llm)` — custom QA/Refine prompts (domain contract unchanged).
 7. `question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)`.
-8. `SubQuestionQueryEngine.from_defaults(query_engine_tools, question_gen, response_synthesizer,
-   verbose=LOG_LEVEL=="DEBUG", use_async=True)`.
+8. `SubQuestionQueryEngine.from_defaults(query_engine_tools, llm=chat_llm, question_gen,
+   response_synthesizer, verbose=LOG_LEVEL=="DEBUG", use_async=True)`.
 9. single top-level tool `document_question_engine` with a deliberately broad description.
 10. `chat_history = get_chat_history(conversation.messages)`.
 11. `SYSTEM_MESSAGE.format(doc_titles=…, curr_date=utcnow %Y-%m-%d)`.
-12. `ReActAgent.from_tools(tools, llm, chat_history, verbose, context, callback_manager,
-    max_iterations=6)`.
+12. `ReActAgent.from_tools(tools, llm=chat_llm, chat_history, verbose, context,
+    callback_manager, max_iterations=6)`.
 
 **Cost per question** (rule of thumb): 1 ReAct planning call + 1 question-generation call + N
 sub-answer calls + 1 synthesis (refine may loop) + N×retrieval embedding calls. A 3-document
@@ -154,8 +160,8 @@ Adding a new streamed field: extend `get_metadata_from_event` + `schema.SubProce
 
 | Change | Files | Caveats |
 |---|---|---|
-| Different chat model | `.env NVIDIA_CHAT_LLM_NAME` (+ `NVIDIA_CHAT_CONTEXT_WINDOW`/`NVIDIA_CHAT_MAX_TOKENS`) | ids outside the pinned client's known-model table are validated via `GET /v1/models` at construction |
-| Different provider | `llama_index_settings.py` factories, `core/config.py`, `pyproject.toml` | single construction site; `NVIDIA_*` env exports in `config.py` must go too |
+| Different chat model | **`.env` only**: `NVIDIA_CHAT_LLM_NAME` + the full `NVIDIA_CHAT_*` profile (booleans, context window, max tokens, timeout) | no code change, no catalog lookup, any id works. Booleans must be explicit — `LLMMetadata` rejects `None`. Restart logs the effective profile |
+| Different provider | `.env NVIDIA_BASE_URL` / `NVIDIA_API_KEY` (any OpenAI-compatible `/v1`); `NVIDIA_EMBEDDING_REQUEST_STYLE` for plain embedding APIs; `llama_index_settings.py` + `pyproject.toml` only if a new SDK is needed | there are no `NVIDIA_*` env exports in `config.py` any more; all clients get key/endpoint explicitly |
 | Top-k | `index_to_query_engine` (`engine.py:109`, `similarity_top_k=3`) | higher k ⇒ more context tokens, slower |
 | Chunk size | `constants.py:25-26` | requires re-index; no migration needed |
 | Embedding dimension/model | `.env` + `pg_vector.py` + recreate `data_pg_vector_store` | old rows become unusable |

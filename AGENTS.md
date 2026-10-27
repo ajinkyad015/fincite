@@ -8,6 +8,19 @@
 **Repo:** `shinosuke0103/fincitee` · **License:** MIT · **Size:** 83 tracked files, ~7,350 lines of
 application source (45 Python · 14 TSX · 6 TS · 1 CSS) plus committed lockfiles and a 493-line README.
 
+> **Update 2026-10-27 (chat creation failures + model swapping).** The chat LLM is now a
+> **generic OpenAI-compatible client** (`llama_index.llms.openai_like.OpenAILike`), not
+> `llama_index.llms.nvidia.NVIDIA`. The old client inferred `is_chat_model` /
+> `is_function_calling_model` from a frozen model table and set both to `None` for newer ids
+> (e.g. `nvidia/nemotron-3.5-bolt-e4b`), which made `get_response_synthesizer()` /
+> `index.as_query_engine()` raise a pydantic `LLMMetadata` ValidationError on the first
+> message. All model ids **and their capabilities** now come from `.env` — see §10.2 for the
+> model-swap checklist. The follow-on `MissingGreenlet` in `crud.finalise_message()` (reading
+> `message.id` after commit) is also fixed: async sessions use `expire_on_commit=False` and
+> persistence never touches an expired ORM attribute. Verify with `cd backend && uv run pytest -q`
+> (**70 passed**). Details: `app/llama_index_settings.py`, `app/core/config.py`,
+> `app/chat/engine.py`, `app/api/crud.py`, `app/db/session.py`.
+
 ---
 
 ## Extended Documentation
@@ -38,7 +51,8 @@ Do NOT read all of them — only what's relevant.
 Two deliverables in one repo, deployable independently:
 
 1. **`backend/`** — FastAPI + LlamaIndex RAG service. Upload a PDF → it is stored in Supabase
-   Storage, parsed page-by-page, chunked, embedded with NVIDIA Nemotron-3-Embed, and written into
+   Storage, parsed page-by-page, chunked, embedded with the configured embedding model (default
+   NVIDIA Nemotron-3-Embed), and written into
    PostgreSQL/pgvector. Users then open a *conversation* scoped to 1..n documents and ask
    questions; answers stream over **SSE** as complete `Message` snapshots, with page-level
    citations and a persisted reasoning trace ("research trail").
@@ -84,9 +98,9 @@ deletion, no background job queue, no CI, no frontend tests.
 | `llama-index-core` | 0.12.23 | agent, query engines, callbacks |
 | `llama-index-vector-stores-postgres` | 0.4.2 | `PGVectorStore` |
 | `llama-index-readers-file` | 0.4.6 | `PDFReader` |
-| `llama-index-llms-nvidia` | 0.3.3 | `NVIDIA` LLM (OpenAILike; pin threaded through core 0.12.23, see `pyproject.toml`) |
-| `llama-index-embeddings-nvidia` | 0.3.4 | `NVIDIAEmbedding` |
-| `openai` | 1.81.0 | SDK under both NVIDIA clients (capped `<1.82` in `pyproject.toml`) |
+| `llama-index-llms-openai-like` | 0.3.4 | **chat LLM** — provider-agnostic `OpenAILike`; replaces `llama-index-llms-nvidia` (removed: its frozen model table produced `None` LLMMetadata booleans for newer ids). Pin threaded through core 0.12.23, see `pyproject.toml` |
+| `llama-index-embeddings-nvidia` | 0.3.4 | `NVIDIAEmbedding` base class, subclassed as `_NVIDIAEmbedding` for config-driven request shape |
+| `openai` | 1.81.0 | SDK under both clients (capped `<1.82` in `pyproject.toml`) |
 | `supabase` | 2.16.0 | Storage client |
 | `nltk` | 3.9.1 | sentence tokenizer data |
 | `nest-asyncio` | 1.6.0 | re-entrant loop patch (imported in `chat/engine.py:64`) |
@@ -123,12 +137,15 @@ deletion, no background job queue, no CI, no frontend tests.
 - **PostgreSQL + pgvector** — Supabase in prod; `ankane/pgvector:v0.5.0` locally.
 - **Supabase Storage** — bucket from `SUPABASE_STORAGE_BUCKET` (default `annual-reports`),
   object path `documents/{document_id}/original.pdf`.
-- **NVIDIA AI (build.nvidia.com hosted NIMs)** — OpenAI-compatible API at
-  `https://integrate.api.nvidia.com/v1`, one `nvapi-…` key for chat
-  `meta/llama-3.3-70b-instruct` and embeddings `nvidia/nemotron-3-embed-1b`
-  (2048 dims, native only). Both clients are built in
-  `app/llama_index_settings.py` (`get_chat_llm()` / `get_embed_model()`);
-  embeddings are asymmetric (`input_type` passage vs query).
+- **OpenAI-compatible model providers (default: NVIDIA hosted NIMs)** — API at
+  `https://integrate.api.nvidia.com/v1`, one `nvapi-…` key, chat id
+  `meta/llama-3.3-70b-instruct` and embedding id `nvidia/nemotron-3-embed-1b`
+  (2048 dims, native only) **by default only**. No model id is hardcoded in
+  executable code: ids, endpoint, key and declared capabilities are env-driven
+  (`core/config.py`). Both clients are built in `app/llama_index_settings.py`
+  (`get_chat_llm()` = `OpenAILike`, `get_embed_model()` = config-driven
+  `NVIDIAEmbedding` subclass); NIM embeddings are asymmetric (`input_type`
+  passage vs query) unless `NVIDIA_EMBEDDING_REQUEST_STYLE=openai`.
 - **Docker** — `backend/Dockerfile` (`python:3.11.3-slim-bullseye` + `uv sync --frozen`),
   `backend/docker-compose.yml` (backend + local pgvector).
 
@@ -156,7 +173,7 @@ fincitee/
 │   ├── app/
 │   │   ├── main.py                # FastAPI app, lifespan, _bootstrap(), `start()` entrypoint
 │   │   ├── schema.py              # ALL Pydantic API schemas (incl. NSE metadata, Citation)
-│   │   ├── llama_index_settings.py# NVIDIA LLM/embedding factories + global Settings + splitter
+│   │   ├── llama_index_settings.py# env-driven chat/embedding factories + global Settings + splitter
 │   │   ├── core/config.py         # pydantic-settings `Settings` + URL/CORS/LOG_LEVEL validators
 │   │   ├── db/
 │   │   │   ├── session.py         # async engine + async_sessionmaker (pool 4 / overflow 4)
@@ -247,7 +264,7 @@ Browser (React 19 SPA, mock transport today)
 FastAPI (uvicorn, N workers)  ──►  PostgreSQL  (relational: conversation/message/document)
    │        │                  ──►  pgvector    (table data_pg_vector_store, 2048-d)
    │        └──► Supabase Storage (documents/{id}/original.pdf)
-   └──► NVIDIA NIM API (chat + embeddings)
+   └──► configured OpenAI-compatible endpoint (chat + embeddings)
 ```
 
 **One database for both relational state and vectors.** There is no separate vector DB, no
@@ -257,13 +274,19 @@ cache, no queue. A single uvicorn process pool serves everything; heavyweight in
 ### 4.2 The three-tier RAG harness (`backend/app/chat/engine.py:181` `get_chat_engine`)
 
 ```
-Tier 1  ReActAgent (meta/llama-3.3-70b-instruct via NVIDIA, max_iterations=6, SYSTEM_MESSAGE context)
+Tier 1  ReActAgent (env-selected chat model, max_iterations=6, SYSTEM_MESSAGE context)
         │  exactly ONE tool: `document_question_engine`
 Tier 2  SubQuestionQueryEngine (LLMQuestionGenerator, use_async=True, custom response synth)
         │  one QueryEngineTool per document, each ExactMatchFilter(db_document_id=…)
-Tier 3  VectorStoreIndex.as_query_engine(similarity_top_k=3, filters=…)
+Tier 3  VectorStoreIndex.as_query_engine(similarity_top_k=3, filters=…, llm=chat_llm)
         │
         └── pgvector (single shared table, cosine)
+
+One `chat_llm` instance from `get_chat_llm()` is passed explicitly to the agent, the question
+generator, the response synthesizer **and** both `from_defaults`/`as_query_engine` calls.
+LlamaIndex resolves `Settings.llm` internally even when those components are supplied, so
+passing it is what guarantees every tier uses the configured model (and that a missing global
+cannot blow up with "No API key found for OpenAI").
 ```
 
 ### 4.3 Patterns inventory (and where they live)
@@ -310,7 +333,9 @@ app/main.py
   ├─ api/api.py                api_router → endpoints/{conversation,documents,health}
   ├─ db/wait_for_db.py         check_database_connection()      ← _bootstrap()
   ├─ chat/pg_vector.py         get_vector_store_singleton()     ← _bootstrap(), lifespan, upload, engine
-  ├─ llama_index_settings.py   _setup_llama_index_settings()    ← lifespan (in asyncio.to_thread)
+  ├─ llama_index_settings.py   get_chat_llm()/get_embed_model() ← env-driven model factories
+  │                            _setup_llama_index_settings()    ← lifespan (in asyncio.to_thread)
+  ├─ db/session.py             SessionLocal (expire_on_commit=False) ← all async DB work
   └─ alembic (Config("alembic.ini"), psycopg2 engine)           ← _bootstrap()
 
 endpoints/documents.py: upload_document_endpoint
@@ -331,7 +356,7 @@ endpoints/conversation.py: message_conversation (SSE)
   │         ├─ chat/qa_response_synth.py get_custom_response_synth
   │         ├─ storage/supabase.py       download_document  (only on re-index fallback)
   │         ├─ chat/constants.py         DB_DOC_ID_KEY, SYSTEM_MESSAGE
-  │         └─ llama_index ReActAgent / SubQuestionQueryEngine / NVIDIA LLM
+  │         └─ llama_index ReActAgent / SubQuestionQueryEngine / configured chat LLM
   └─ chat/messaging.py:ChatCallbackHandler → anyio send_chan → event_publisher → EventSourceResponse
 ```
 
@@ -388,9 +413,10 @@ main.tsx → App.tsx (StoreProvider)
 
 1. Run `_bootstrap()` **only if** `FINCITE_BOOTSTRAP_DONE != "1"` (i.e. when launched with
    `uvicorn app.main:app` directly).
-2. `await asyncio.to_thread(_setup_llama_index_settings)` — NVIDIA client construction can
-   perform a blocking `GET /v1/models` validation for model ids outside its known table,
-   so it must not run on the event loop.
+2. `await asyncio.to_thread(_setup_llama_index_settings)` — builds the two configured clients
+   and logs the effective model profile (no secrets). Construction is network-free since the
+   generic `OpenAILike` chat client replaced the NVIDIA catalog-validating one, but keeping it
+   off the event loop stays safe if a future provider SDK does blocking work in its constructor.
 3. `(await get_vector_store_singleton()).ensure_initialized()` — creates this process's engines,
    **no DDL**.
 4. `yield` → serve; on shutdown `vector_store.close()` disposes the shared engine.
@@ -599,42 +625,89 @@ after the last step → completion attaches `sources[]` → clicking `[n]` or a 
 
 `uv run start` → logging → Sentry → `_bootstrap` (DB wait → Alembic head check → pgvector DDL →
 NLTK data → close) → flag → uvicorn with `BACKEND_WORKERS` → each worker lifespan configures
-NVIDIA settings in a thread → opens its own pools → serves.
+the env-selected model clients in a thread → opens its own pools → serves.
 
 ---
 
 ## 10. CONFIGURATION & ENVIRONMENT VARIABLES
 
 `backend/app/core/config.py` (`Settings`, env prefix `""`, reads `.env`). Required: `DATABASE_URL`,
-`NVIDIA_API_KEY`. Everything else has a default.
+`NVIDIA_API_KEY`. Everything else has a default. Validators reject blank model ids, non-positive
+limits and an embedding dimension that disagrees with the vector column — fail at boot, not
+mid-chat. **No import-time `os.environ` mutation any more**: both clients receive the key /
+endpoint explicitly in `llama_index_settings.py`.
+
+### 10.1 Variable reference
 
 | Variable | Default | Notes / where used |
 |---|---|---|
-| `DATABASE_URL` | **required** | validator rewrites `postgres://`→`postgresql://`→`postgresql+asyncpg://`; rejects non-postgres (`config.py:54`) |
-| `NVIDIA_API_KEY` | **required** | `nvapi-…` key from build.nvidia.com (chat + embeddings); also exported to `os.environ` at import (`config.py:123`, with `NVIDIA_BASE_URL`) for the NVIDIA clients' env fallbacks |
+| `DATABASE_URL` | **required** | validator rewrites `postgres://`→`postgresql://`→`postgresql+asyncpg://`; rejects non-postgres |
+| `NVIDIA_API_KEY` | **required** | key for chat + embeddings (any non-empty string for an unauthenticated local endpoint); `NVIDIA_*` names are historical — the endpoint is any OpenAI-compatible `/v1` |
 | `SUPABASE_URL` | `""` | Storage; `RuntimeError` if empty when used |
 | `SUPABASE_SERVICE_ROLE_KEY` | `""` | server-side only, never returned to clients |
 | `SUPABASE_STORAGE_BUCKET` | `annual-reports` | must exist in the Supabase project |
-| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` | LLM for agent, question-gen, synthesis; any build.nvidia.com chat id (unknown ids are validated via `GET /v1/models` at construction) |
+| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | chat + embedding endpoint; trailing slash stripped once in `Settings` |
+| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` | chat id for agent / question-gen / synthesis. Free-form string; **no catalog lookup, no model table** |
+| `NVIDIA_CHAT_IS_CHAT_MODEL` | `true` | declared `LLMMetadata.is_chat_model`; must be a real boolean (see §10.3) |
+| `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL` | `false` | declared `LLMMetadata.is_function_calling_model`; ReAct is prompt-based |
+| `NVIDIA_CHAT_CONTEXT_WINDOW` / `NVIDIA_CHAT_MAX_TOKENS` | `131072` / `4096` | prompt sizing / reply cap; re-check for the model you configure |
+| `NVIDIA_CHAT_TIMEOUT` | `120` | per-request chat timeout (seconds, streams included) |
 | `NVIDIA_EMBEDDING_MODEL_NAME` | `nvidia/nemotron-3-embed-1b` | must output exactly `VECTOR_STORE_EMBED_DIM` (2048) |
-| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | hosted catalog endpoint; override for a self-hosted NIM. Trailing slash is normalised per-client in `llama_index_settings.py` (the two packages' hosted-URL constants disagree on it) |
-| `NVIDIA_CHAT_CONTEXT_WINDOW` / `NVIDIA_CHAT_MAX_TOKENS` | `131072` / `4096` | declared to LlamaIndex for synthesis sizing / reply cap; must match the chat model's NIM limits |
+| `NVIDIA_EMBEDDING_REQUEST_STYLE` | `nim` | `nim` sends `input_type` + `truncate`; `openai` sends a plain `/v1/embeddings` body |
+| `NVIDIA_EMBEDDING_TRUNCATE` | `END` | `NONE`/`START`/`END`; only sent in `nim` style |
+| `NVIDIA_EMBEDDING_DIMENSIONS` | unset | optional reduced size; boot validation requires it to equal `VECTOR_STORE_EMBED_DIM` |
 | `VECTOR_STORE_TABLE_NAME` | `pg_vector_store` | real table = `data_pg_vector_store` |
-| `VECTOR_STORE_EMBED_DIM` | `2048` | asserted by a test (`test_engine.py:44`) |
+| `VECTOR_STORE_EMBED_DIM` | `2048` | asserted by tests; startup refuses a table built for another dimension |
 | `PROJECT_NAME` | `fincite` | FastAPI title |
 | `API_PREFIX` | `/api` | all routes + docs |
 | `LOG_LEVEL` | `INFO` | one of DEBUG/INFO/WARNING/ERROR/CRITICAL; `DEBUG` ⇒ uvicorn reload + verbose agent traces |
 | `BACKEND_WORKERS` | `4` | uvicorn workers (ignored when reload) |
 | `BACKEND_CORS_ORIGINS` | `[]` | JSON list or comma-separated; empty ⇒ **no CORS middleware** |
 | `SENTRY_DSN` | unset | enables Sentry |
-| `FINCITE_BOOTSTRAP_DONE` | unset | internal handoff flag (`main.py:47`) |
+| `FINCITE_BOOTSTRAP_DONE` | unset | internal handoff flag (`main.py`) |
 
 **Frontend config:** only `VITE_API_URL` (read via `import.meta.env` at `lib/api.ts:34`,
 default `http://localhost:8000`). **`USE_MOCK` is a hardcoded `true` constant** at
 `lib/api.ts:32` — there is no env switch today.
 
-`backend/.env.example` documents every variable; `docker-compose.yml` overrides `DATABASE_URL`
-and `BACKEND_CORS_ORIGINS` for the local pgvector container.
+`backend/.env.example` documents every variable (grouped into *chat model profile* and
+*embedding model profile*); `docker-compose.yml` overrides `DATABASE_URL` and
+`BACKEND_CORS_ORIGINS` for the local pgvector container.
+
+### 10.2 Swapping models — the checklist
+
+1. **Chat:** set `NVIDIA_CHAT_LLM_NAME` to the exact id the endpoint serves (e.g.
+   `nvidia/nemotron-3.5-bolt-e4b`). Set `NVIDIA_BASE_URL` / `NVIDIA_API_KEY` if the
+   provider changes (no client rewrites the endpoint from a model table any more — if a
+   model needs a dedicated endpoint, set `NVIDIA_BASE_URL` yourself). Re-check
+   `NVIDIA_CHAT_CONTEXT_WINDOW`, `NVIDIA_CHAT_MAX_TOKENS`, `NVIDIA_CHAT_IS_CHAT_MODEL`
+   and `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL` against that model's docs — they are
+   declarations, not guesses. Restart; startup logs the effective profile
+   (`Models configured — chat=…` in `_setup_llama_index_settings`).
+2. **Embeddings:** set `NVIDIA_EMBEDDING_MODEL_NAME`, choose
+   `NVIDIA_EMBEDDING_REQUEST_STYLE` (`nim` for NVIDIA NIMs, `openai` for plain
+   `/v1/embeddings`), and set `NVIDIA_EMBEDDING_DIMENSIONS` only if the model supports a
+   reduced size. Its output dimension must equal `VECTOR_STORE_EMBED_DIM`; otherwise
+   **drop the vector table and re-index every document** (§14.R).
+3. **Never** add a model id to executable code, and never reintroduce a client that infers
+   metadata from a hardcoded model-name table. `config.py` + `llama_index_settings.py` are
+   the only places model configuration belongs.
+
+### 10.3 Why the metadata is explicit (the 2026-10-27 failure)
+
+`llama-index-llms-nvidia==0.3.3` ended its constructor with
+`is_chat_model = _is_chat_model()` / `is_function_calling_model = _is_function_calling_model()`,
+both resolved from a frozen `CHAT_MODEL_TABLE`. For ids it did not know (the warning was
+"Found … in available_models, but type is unknown") both were `None`, and
+`OpenAILike.metadata` → `LLMMetadata(is_chat_model=None, …)` raises
+`pydantic_core.ValidationError: 2 validation errors`. The call site was
+`get_response_synthesizer()` inside `index.as_query_engine()` — hence the traceback on the
+first `POST /api/conversation/{id}/message`. That client also did a blocking
+`GET /v1/models` at construction. `OpenAILike` + explicit env booleans fixes both, and
+removes the pydantic "protected namespace model_" warning emitted by that client's `Model`
+class. The follow-on `sqlalchemy.exc.MissingGreenlet` in `finalise_message()` was caused by
+reading `message.id` after `await db.commit()` (commit expires ORM attributes); use the
+`message_id` argument and `expire_on_commit=False` (§15).
 
 ---
 
@@ -734,18 +807,23 @@ curl "localhost:8000/api/conversation/<ID>/test_message?user_message=Hello"
 
 **Framework:** `pytest` 7.4.0 + `pytest-asyncio` 0.23.8, tests under `backend/tests/`, no
 `pytest.ini`/`pyproject` config (strict asyncio mode ⇒ async tests need
-`@pytest.mark.asyncio`). **Verified: `uv run pytest -q` → 15 passed, 4 warnings, ~8 s.**
+`@pytest.mark.asyncio`). **Verified 2026-10-27: `uv run pytest -q` → 70 passed, 2 warnings
+(both `supabase` deprecations), ~4 s.** The old pydantic protected-namespace and
+"Unable to determine validity of …" embedding warnings are gone.
 
 **`tests/conftest.py`** sets `DATABASE_URL`, `NVIDIA_API_KEY`, `SUPABASE_URL`,
 `SUPABASE_SERVICE_ROLE_KEY` via `os.environ.setdefault` **before** any app import — this is why
 the suite runs with no services. Add any new required setting there.
 
-**Existing coverage (15 tests):**
+**Existing coverage (70 tests)** — highlights:
 
 | File | Tests | What they pin |
 |---|---|---|
 | `tests/app/chat/test_engine.py` | 8 | `get_vector_store_singleton` passes `embed_dim=2048` (monkeypatched `from_params`); `get_chat_history` matrix: happy path, consecutive same-role messages, empty input, ERROR-status user/assistant filtering, blank content stripping, unpaired messages |
-| `tests/app/test_refactored.py` | 7 | `NSEDocumentMetadata` parsing + defaults; Supabase storage helpers with `@patch("app.storage.supabase.create_client")`; `ingest_document` flow (PDFReader/VectorStoreIndex/StorageContext patched); upload endpoint success + invalid file; health endpoint |
+| `tests/app/test_refactored.py` | 7 | `NSEDocumentMetadata` parsing + defaults; Supabase storage helpers; `ingest_document` flow; upload endpoint success + invalid file; health endpoint |
+| `tests/app/test_llama_index_settings.py` | 12 | chat client is `OpenAILike` with **env-declared** metadata; arbitrary model ids need no catalog lookup; `get_response_synthesizer` / custom synth accept it; embedding request shapes (nim/openai, query/passage, dimensions); config validators |
+| `tests/app/test_engine_model_swap.py` | 1 | full `get_chat_engine()` build with `nvidia/nemotron-3.5-bolt-e4b` and **no** global `Settings.llm` — reproduces the reported traceback |
+| `tests/app/test_connect_contract.py` | 29 | SSE snapshot contract, partial flushes, ERROR terminal state, plus `finalise_message` never reading an expired ORM attribute and `expire_on_commit=False` |
 
 **Patterns to reuse**
 - Patch **where the name is used**, not where it is defined:
@@ -856,9 +934,11 @@ Sub-process enums differ too (UI: `llm|retrieval|rerank|parser`; API: LlamaIndex
 
 **L. ~~`GET /api/document/` returns 404 for an empty library~~ — FIXED.** It returns `200 []`.
 
-**M. Import-time side effects.** `chat/engine.py:65` calls `nest_asyncio.apply()` on import;
-`core/config.py:123` writes `os.environ["NVIDIA_API_KEY"]` (+ `NVIDIA_BASE_URL`). Importing `app.main` therefore
-requires `DATABASE_URL` + `NVIDIA_API_KEY` to be set (or the test defaults from `conftest.py`).
+**M. Import-time side effects.** `chat/engine.py` calls `nest_asyncio.apply()` on import.
+`core/config.py` instantiates `Settings` at import, so `DATABASE_URL` + `NVIDIA_API_KEY`
+must be set (or the test defaults from `conftest.py`). The old
+`os.environ["NVIDIA_API_KEY"]` / `NVIDIA_BASE_URL` writes were removed — both model
+clients now receive the key and endpoint explicitly in `llama_index_settings.py`.
 
 **N. ~~`_bootstrap()` depends on CWD~~ — FIXED.** `main.py` resolves `alembic.ini` from
 `Path(__file__).resolve().parents[1]` and pins `script_location`, so the API boots from any working
@@ -879,18 +959,24 @@ commented-out UI blocks remain in `Sidebar.tsx`, `ChatView.tsx`, `LibraryView.ts
 **Q. No auth, tenancy, rate limiting, or CI.** Every endpoint is public; the Supabase
 service-role key must never leak to the client; there is no `.github/workflows`.
 
-**R. Dependency age.** `sentry-sdk` 1.29.2 and `uvicorn` 0.22.0 are old. The NVIDIA
+**R. Dependency age.** `sentry-sdk` 1.29.2 and `uvicorn` 0.22.0 are old. The model
 integrations are pinned to the last core-0.12-compatible releases
-(`llama-index-llms-nvidia==0.3.3`, `llama-index-embeddings-nvidia==0.3.4`, plus an
-`openai<1.82` cap — rationale in `pyproject.toml`); moving them means the deferred
-llama-index-core 0.13+ upgrade. Two pinned-client quirks are compensated in
-`llama_index_settings.py`: embeddings 0.3.4 sends `input_type="passage"` on the *sync*
-query path (fixed by the `_NVIDIAEmbedding` subclass), and the two packages disagree
-on the hosted base URL's trailing slash (normalised in the factories). Catalog model
-ids also retire (the previous embedding default's predecessor returned 410s); treat a
-410/404 from NVIDIA as "pick the successor model + re-check dims" (and for embeddings,
-recreate the vector table + re-index — `pg_vector.run_setup()` now refuses to boot
-against a table built for a different dimension).
+(`llama-index-llms-openai-like==0.3.4`, `llama-index-embeddings-nvidia==0.3.4`,
+plus an `openai<1.82` cap — rationale in `pyproject.toml`); moving them means the
+deferred llama-index-core 0.13+ upgrade.
+
+`llama-index-llms-nvidia` was **removed** on 2026-10-27: its frozen `CHAT_MODEL_TABLE`
+returns `None` for `is_chat_model` / `is_function_calling_model` on newer catalog ids,
+which crashes `LLMMetadata` (§10.3), and it performs a blocking `GET /v1/models` for
+unknown ids. The replacement `OpenAILike` is model-agnostic and needs no catalog I/O.
+`llama-index-embeddings-nvidia` remains only as a base class: `_NVIDIAEmbedding` in
+`llama_index_settings.py` overrides `_validate_model` (no warnings / endpoint rewrites
+for unknown ids) and every sync/async request builder (fixes 0.3.4's sync query sending
+`input_type="passage"`, and makes the NIM-only fields config-driven). Catalog model ids
+still retire (the previous embedding default's predecessor returned 410s); a 410/404
+means "set the successor id in `.env` + re-check the profile in §10.2" (and for
+embeddings, recreate the vector table + re-index — `pg_vector.run_setup()` refuses to
+boot against a table built for a different dimension).
 
 ---
 
@@ -914,7 +1000,7 @@ against a table built for a different dimension).
 7. **Add or update a test** for any change to `crud.py`, `ingestion/`, `storage/`, or the upload
    endpoint, following the patch-where-used + `AsyncMock` patterns in §13.
 8. **Run `uv run pytest -q` (backend) and `npm run typecheck` (frontend) before declaring work
-   done.** Report the *actual* output.
+   done.** Report the *actual* output (backend baseline after 2026-10-27: **70 passed**).
 9. **Update `backend/.env.example` when you add a setting**, and `Settings` in
    `core/config.py` with a sane default so tests keep passing without new env vars.
 10. **New migrations:** `uv run alembic revision --autogenerate -m "…"`, review the diff, keep a
@@ -924,6 +1010,14 @@ against a table built for a different dimension).
 12. **Match the frontend design system** — tokens in `index.css`, tiny mono labels, `aria-label`
     on icon buttons, framer-motion easings already in use.
 13. **State uncertainty plainly.** If you could not run something, say which command and why.
+14. **Change models only through `.env` + `core/config.py`** (§10.2). Declare every
+    `LLMMetadata` capability explicitly, pass the configured `chat_llm` into *all*
+    LlamaIndex factories (`as_query_engine`, `from_defaults`, `get_response_synthesizer`,
+    `ReActAgent.from_tools`), and keep model ids out of executable code.
+15. **Never read an ORM instance's attributes after `await db.commit()`** in async code:
+    copy the scalars first (`assistant_id`, `assistant_created_at`) or use the plain
+    `message_id` argument. `SessionLocal` sets `expire_on_commit=False`; code that needs
+    fresh values must `await db.refresh(...)` / re-query explicitly.
 
 ### NEVER
 
@@ -952,16 +1046,20 @@ against a table built for a different dimension).
 11. **Never reformat unrelated files.** Diffs should be scoped; this codebase mixes legacy and
     modern Python styles on purpose.
 
-12. - After completing any task that changes architecture, adds new modules,
-    or modifies data models, you MUST update the relevant sections of
-    AGENTS.md before finishing.
+12. **After completing any task that changes architecture, adds new modules, or modifies data
+    models, update the relevant sections of AGENTS.md before finishing.**
+13. **Never let a provider client infer model capabilities from a hardcoded model-name table**
+    (that is what broke chat creation). `OpenAILike` + explicit env booleans is the contract;
+    if a client must know something about a model, it goes in `Settings`.
+14. **Never call `Settings.llm` implicitly** in new RAG code — pass the configured client
+    explicitly; the global is only for ingestion-time defaults.
 
 ---
 
 ### Quick "is it healthy?" checklist
 
 ```bash
-cd backend  && uv run pytest -q                     # expect: 60 passed
+cd backend  && uv run pytest -q                     # expect: 70 passed
 cd backend  && uv run python -c "import app.main"   # needs DATABASE_URL + NVIDIA_API_KEY set
 cd frontend && npm run typecheck                    # expect: 0 errors
 cd frontend && npm run build                        # expect: single dist/index.html (~622 kB)

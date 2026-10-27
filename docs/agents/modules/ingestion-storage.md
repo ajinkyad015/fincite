@@ -47,7 +47,7 @@ return index
 
 - Chunking is **not** done here: `VectorStoreIndex.from_documents` applies the global
   `Settings.node_parser` configured in `llama_index_settings.py` (`SentenceSplitter(512, 10)`).
-- Embeddings come from `Settings.embed_model` (NVIDIA Nemotron-3-Embed-1B, 2048-d, `input_type="passage"` on this path; retrieval uses `"query"`).
+- Embeddings come from `Settings.embed_model` (default NVIDIA Nemotron-3-Embed-1B, 2048-d, `input_type="passage"` on this path; retrieval uses `"query"`). Ids, endpoint and the `nim`/`openai` request style are all set in `.env` — `NVIDIA_EMBEDDING_REQUEST_STYLE=openai` omits the NIM-only fields.
 - `ingest_document` is `async def` but its body is fully synchronous (parse + embed + insert). It
   blocks the event loop for the whole request — `AGENTS.md §14.I`.
 - `callback_manager` is optional and only the tests pass one; production upload does not stream
@@ -89,7 +89,7 @@ start() → _bootstrap(release_connections=True)                     main.py:81
 Workers (`lifespan`, `main.py:119`) skip everything when `FINCITE_BOOTSTRAP_DONE == "1"`, then:
 
 ```python
-await asyncio.to_thread(_setup_llama_index_settings)      # NVIDIA ctor may do blocking catalog I/O
+await asyncio.to_thread(_setup_llama_index_settings)      # config-only client construction (no catalog I/O)
 (await get_vector_store_singleton()).ensure_initialized() # pools only, no DDL
 ```
 

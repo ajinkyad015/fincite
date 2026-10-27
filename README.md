@@ -103,9 +103,9 @@ flowchart LR
         ST[["Storage bucket<br/>documents/ID/original.pdf"]]
     end
 
-    subgraph Nvidia["NVIDIA AI · build.nvidia.com"]
-        LLM["Llama 3.3 70B Instruct<br/>reasoning · sub-questions · synthesis"]
-        EMB["nvidia/nemotron-3-embed-1b<br/>2048-d embeddings"]
+    subgraph Nvidia["OpenAI-compatible models (default: NVIDIA NIMs)"]
+        LLM["env-selected chat model<br/>reasoning · sub-questions · synthesis"]
+        EMB["env-selected embedding model<br/>2048-d embeddings"]
     end
 
     UI -- "multipart upload" --> R
@@ -126,7 +126,7 @@ flowchart LR
 |---|---|---|
 | **API** | FastAPI · Pydantic v2 · `sse-starlette` | Async-native, typed request/response models, first-class OpenAPI docs, SSE without WebSockets. |
 | **Orchestration** | LlamaIndex 0.12 (`ReActAgent`, `SubQuestionQueryEngine`, `VectorStoreIndex`) | Battle-tested primitives for agentic RAG; callback system doubles as the observability bus. |
-| **Models** | NVIDIA hosted NIMs (build.nvidia.com) — `meta/llama-3.3-70b-instruct` (chat, 128k ctx) · `nvidia/nemotron-3-embed-1b` (2048-d) | One OpenAI-compatible endpoint and key for multi-step reasoning and retrieval-tuned embeddings over dense financial prose; models are env-selectable. |
+| **Models** | Any OpenAI-compatible endpoint (default NVIDIA NIMs) — chat `meta/llama-3.3-70b-instruct`, embeddings `nvidia/nemotron-3-embed-1b` (2048-d) **by default only** | Model ids, endpoint, key **and declared capabilities** come from `.env`; the generic `OpenAILike` chat client has no hardcoded model table, so newer ids (e.g. `nvidia/nemotron-3.5-bolt-e4b`) work without a code change. |
 | **Data** | PostgreSQL + pgvector (Supabase) · SQLAlchemy 2 async · Alembic | One database for relational state *and* vectors — no separate vector DB to operate; migrations are versioned. |
 | **Object storage** | Supabase Storage | Original PDFs are kept for re-indexing and future viewer features; service-role key stays server-side. |
 | **Frontend** | React 19 · TypeScript (strict) · Vite 7 · Tailwind CSS v4 · Framer Motion | Lightweight, no heavy state library; design-token driven editorial UI. |
@@ -139,7 +139,7 @@ The core of Fincite is a **three-tier query harness** built in [`backend/app/cha
 
 ```
             ┌──────────────────────────────────────────────────────────────────────┐
-  Tier 1    │  ReActAgent  (Llama 3.3 70B · max 6 iterations · system prompt w/ doc list) │
+  Tier 1    │ ReActAgent  (env-selected chat LLM · 6 iterations · system prompt)   │
             │  "Should I use a tool? Which? Is the answer complete?"               │
             └───────────────────────────────┬──────────────────────────────────────┘
                                             │ single tool: document_question_engine
@@ -278,7 +278,7 @@ fincitee/
 │   ├── app/
 │   │   ├── main.py                  #   bootstrap, lifespan, uvicorn entrypoint
 │   │   ├── core/config.py           #   pydantic-settings; env validation & URL normalisation
-│   │   ├── llama_index_settings.py  #   NVIDIA LLM + embedding factories + SentenceSplitter
+│   │   ├── llama_index_settings.py  #   env-driven chat + embedding factories + SentenceSplitter
 │   │   ├── api/
 │   │   │   ├── api.py               #   router registry (/conversation, /document, /health)
 │   │   │   ├── crud.py              #   async SQLAlchemy data access
@@ -484,11 +484,15 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 | `DATABASE_URL` | — | Postgres URL; normalised to `postgresql+asyncpg://` automatically |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | — | Storage access (server-side only) |
 | `SUPABASE_STORAGE_BUCKET` | `annual-reports` | Bucket holding original PDFs |
-| `NVIDIA_API_KEY` | — | NVIDIA NIM LLM + embeddings (`nvapi-…` from build.nvidia.com) |
-| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` | Reasoning / synthesis model |
-| `NVIDIA_EMBEDDING_MODEL_NAME` | `nvidia/nemotron-3-embed-1b` | Embedding model |
-| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | NIM endpoint (override for a self-hosted NIM) |
-| `NVIDIA_CHAT_CONTEXT_WINDOW` / `NVIDIA_CHAT_MAX_TOKENS` | `131072` / `4096` | Must match the chat model's NIM limits |
+| `NVIDIA_API_KEY` | — | Key for chat + embeddings (`nvapi-…` from build.nvidia.com by default) |
+| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Any OpenAI-compatible `/v1` endpoint |
+| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` | Reasoning / synthesis model id (any id the endpoint serves) |
+| `NVIDIA_CHAT_IS_CHAT_MODEL` / `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL` | `true` / `false` | Declared `LLMMetadata` booleans — required, never inferred |
+| `NVIDIA_CHAT_CONTEXT_WINDOW` / `NVIDIA_CHAT_MAX_TOKENS` | `131072` / `4096` | Must match the chat model's limits |
+| `NVIDIA_CHAT_TIMEOUT` | `120` | Per-request chat timeout in seconds |
+| `NVIDIA_EMBEDDING_MODEL_NAME` | `nvidia/nemotron-3-embed-1b` | Embedding model id |
+| `NVIDIA_EMBEDDING_REQUEST_STYLE` / `NVIDIA_EMBEDDING_TRUNCATE` | `nim` / `END` | `nim` sends `input_type` + `truncate`; `openai` sends a plain request |
+| `NVIDIA_EMBEDDING_DIMENSIONS` | — | Optional reduced size; must equal `VECTOR_STORE_EMBED_DIM` |
 | `VECTOR_STORE_TABLE_NAME` / `VECTOR_STORE_EMBED_DIM` | `pg_vector_store` / `2048` | pgvector table & dimension (must match the embedding model) |
 | `MAX_UPLOAD_MB` | `50` | Upload size ceiling (413 above it) |
 | `INGESTION_ENABLED` | `true` | `false` accepts uploads without indexing them |
@@ -498,6 +502,34 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 | `BACKEND_CORS_ORIGINS` | `[]` | JSON list or comma-separated origins |
 | `LOG_LEVEL` | `INFO` | `DEBUG` also enables uvicorn reload + verbose agent traces |
 | `SENTRY_DSN` | — | Optional error tracking |
+
+### 8.1 Changing models (no code changes)
+
+The `NVIDIA_*` names are historical — they configure a **generic OpenAI-compatible** client,
+so you can point the app at NVIDIA hosted NIMs, a self-hosted NIM, vLLM, or a gateway. There
+is no hardcoded model id or provider-specific model table in the backend.
+
+1. Set `NVIDIA_CHAT_LLM_NAME` to the exact id your endpoint serves (for example
+   `nvidia/nemotron-3.5-bolt-e4b`), plus `NVIDIA_BASE_URL` / `NVIDIA_API_KEY` if the provider
+   changes.
+2. Update the **whole chat profile** for that model: `NVIDIA_CHAT_IS_CHAT_MODEL`,
+   `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL`, `NVIDIA_CHAT_CONTEXT_WINDOW`,
+   `NVIDIA_CHAT_MAX_TOKENS`, `NVIDIA_CHAT_TIMEOUT`. These are declarations used to build
+   LlamaIndex `LLMMetadata`; a stale context window silently truncates synthesis.
+3. Restart. Startup logs `Models configured — chat=… embeddings=… endpoint=…` (never the key).
+4. Changing the **embedding** model also means checking its output dimension against
+   `VECTOR_STORE_EMBED_DIM`; if it differs, drop `data_pg_vector_store` and re-index every
+   document. Set `NVIDIA_EMBEDDING_REQUEST_STYLE=openai` for plain `/v1/embeddings`
+   providers that reject NIM's `input_type` / `truncate` fields.
+
+See [`backend/.env.example`](backend/.env.example) for the fully commented profile and
+[`AGENTS.md` §10.2](AGENTS.md) for the agent-facing checklist.
+
+> **Fixed (Oct 2026):** with newer model ids, `llama-index-llms-nvidia` used to set
+> `is_chat_model` / `is_function_calling_model` to `None`, so the first `POST /message`
+> failed with `LLMMetadata: 2 validation errors` while building the query engine; the
+> follow-on `MissingGreenlet` prevented the ERROR answer from being persisted. Both are
+> resolved by the explicit config above plus `expire_on_commit=False` on async sessions.
 
 ---
 
@@ -513,7 +545,7 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 - [x] **Conversation listing** — `GET /api/conversation/` returns the sidebar index (title, preview,
       message count, last activity).
 - [ ] **Evaluation harness** — golden Q&A set over public filings for regression-testing answer faithfulness.
-- [x] **Model abstraction** — providers/models swap via `app/llama_index_settings.py` factories + env (Google Gemini → NVIDIA NIM, Oct 2026).
+- [x] **Model abstraction** — providers/models swap via `app/llama_index_settings.py` factories + env (Google Gemini → NVIDIA NIM, Oct 2026); since Oct 27 the chat client is a generic `OpenAILike` with env-declared capabilities, so any model id works without a code change.
 
 ---
 

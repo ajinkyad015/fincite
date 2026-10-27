@@ -14,7 +14,7 @@ output; ❌ marks commands that currently fail (see `AGENTS.md §14`).
 | Node + npm | Node 20+ | frontend only |
 | PostgreSQL + pgvector | 14+ | Supabase project **or** `ankane/pgvector` via compose |
 | Supabase project | — | Storage bucket (default `annual-reports`) + service-role key |
-| NVIDIA API key | — | https://build.nvidia.com — sign in, open any model, "Get API Key" (`nvapi-…`) |
+| Model API key | — | default provider: https://build.nvidia.com — sign in, open any model, "Get API Key" (`nvapi-…`). Any OpenAI-compatible endpoint works (set `NVIDIA_BASE_URL`); no API key is needed for an unauthenticated local server — use any non-empty string. |
 
 There is no `Makefile`, no `justfile`, no CI workflow, and no task runner.
 
@@ -42,8 +42,27 @@ SUPABASE_STORAGE_BUCKET=annual-reports
 ```
 
 `DATABASE_URL` may be written as `postgres://…`, `postgresql://…` or
-`postgresql+asyncpg://…`; `core/config.py:54` normalises it to asyncpg form. The sync head-check
+`postgresql+asyncpg://…`; `core/config.py` normalises it to asyncpg form. The sync head-check
 engine rewrites it back to `psycopg2`.
+
+**Changing models:** copy the whole *chat model profile* / *embedding model profile* block from
+`.env.example`, then edit ids and declared capabilities together. For example, to use
+`nvidia/nemotron-3.5-bolt-e4b`:
+
+```dotenv
+NVIDIA_CHAT_LLM_NAME=nvidia/nemotron-3.5-bolt-e4b
+NVIDIA_CHAT_IS_CHAT_MODEL=true
+NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL=false
+NVIDIA_CHAT_CONTEXT_WINDOW=<that model's context length>
+NVIDIA_CHAT_MAX_TOKENS=<that model's max output tokens>
+NVIDIA_CHAT_TIMEOUT=120
+```
+
+No code change, no catalog lookup, no restart-time `GET /v1/models`. Startup logs
+`Models configured — chat=… embeddings=… endpoint=…`. Booleans are mandatory:
+`LLMMetadata` rejects `None` (that was the first-message crash). For a plain
+`/v1/embeddings` provider set `NVIDIA_EMBEDDING_REQUEST_STYLE=openai`; if the embedding
+dimension changes, drop and recreate `data_pg_vector_store`, then re-index every document.
 
 **Supabase storage layout:** bucket `SUPABASE_STORAGE_BUCKET`, object key
 `documents/{document_id}/original.pdf`. Create the bucket before the first upload.
@@ -95,13 +114,13 @@ and then switch `BASE_URL` to `""`/relative so the browser calls the same origin
 cd backend && uv run pytest -q
 ```
 
-✅ Observed: **15 passed, 4 warnings in ~8 s**. No database, no API key, no network — `conftest.py`
-injects dummy env vars before import and every external boundary is patched.
+✅ Observed 2026-10-27: **70 passed, 2 warnings in ~4 s**. No database, no API key, no network —
+`conftest.py` injects dummy env vars before import and every external boundary is patched.
 
-Warnings you will see (all third-party, ignore): `supabase`/`gotrue`/`supafunc` deprecations,
-a pydantic protected-namespace notice from the NVIDIA model table, and "Unable to determine
-validity of nvidia/nemotron-3-embed-1b" (the model postdates the pinned embeddings client's
-known-model table; harmless).
+Warnings you will see (all third-party, ignore): `supabase`/`gotrue`/`supafunc` deprecations.
+The old pydantic protected-namespace notice (from `llama-index-llms-nvidia`'s `Model` table) and
+"Unable to determine validity of …" (from the pinned embeddings client's model table) are gone —
+both clients are now constructed and validated from config.
 
 ```bash
 cd frontend && npx tsc --noEmit
@@ -224,7 +243,9 @@ offline environment falls back to Georgia/system fonts.
 | Upload 500 "must be set to use Supabase Storage" | missing `SUPABASE_*` | set them; restart |
 | Upload 422 | unreadable/corrupt PDF, or embeddings failed | check logs with `LOG_LEVEL=DEBUG`, retry smaller file |
 | Boot: vector-table dimension mismatch | embedding model/`VECTOR_STORE_EMBED_DIM` changed without recreating the table | `DROP TABLE data_pg_vector_store`, restart, then `POST /api/document/{id}/reindex` for every document |
-| NVIDIA 410/404 on a model | catalog model retired (ids on build.nvidia.com are versioned) | set `NVIDIA_CHAT_LLM_NAME`/`NVIDIA_EMBEDDING_MODEL_NAME` to the successor (embedding change ⇒ table recreate + re-index; also re-check `NVIDIA_CHAT_CONTEXT_WINDOW`/`MAX_TOKENS`) |
+| 410/404 from the model endpoint | catalog model retired (ids on build.nvidia.com are versioned) | set `NVIDIA_CHAT_LLM_NAME`/`NVIDIA_EMBEDDING_MODEL_NAME` to the successor (embedding change ⇒ table recreate + re-index; also re-check the whole chat profile: `NVIDIA_CHAT_CONTEXT_WINDOW`/`MAX_TOKENS`/`IS_CHAT_MODEL`/`IS_FUNCTION_CALLING_MODEL`) |
+| `LLMMetadata: 2 validation errors … is_chat_model / is_function_calling_model … input_value=None` on first message | a client inferred capabilities from a frozen model table (pre-Oct-2026 `llama-index-llms-nvidia`) or a metadata field is `None` | use the current `OpenAILike` factory and set `NVIDIA_CHAT_IS_CHAT_MODEL` / `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL` explicitly in `.env`; both must be `true`/`false`, never blank |
+| `sqlalchemy.exc.MissingGreenlet` in `crud.finalise_message` / final answer stuck in PENDING | an ORM attribute was read after `commit()` (implicit lazy load in async code) | keep `SessionLocal(expire_on_commit=False)`; use the `message_id` argument and copied scalars (`assistant_id`, `created_at`), never `message.<attr>` after commit |
 | Answers have no citations | nodes missing `db_document_id`/`page_label`, or doc not indexed | re-upload; verify with the SQL above |
 | Deleting a thread 500s | FK violation (no cascade) | see `AGENTS.md §14.E` |
 | `tsc` errors about `FinDocument` | broken comment in `types.ts` | close the `/**` on line 1-4 |

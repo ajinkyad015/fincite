@@ -67,12 +67,20 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
     SUPABASE_STORAGE_BUCKET: str = "annual-reports"
-    NVIDIA_API_KEY: str          # required
-    NVIDIA_CHAT_LLM_NAME: str = "meta/llama-3.3-70b-instruct"
-    NVIDIA_EMBEDDING_MODEL_NAME: str = "nvidia/nemotron-3-embed-1b"
+    NVIDIA_API_KEY: str          # required (any /v1 endpoint)
     NVIDIA_BASE_URL: str = "https://integrate.api.nvidia.com/v1"
+    # Chat model profile — ids + DECLARED capabilities (no model table)
+    NVIDIA_CHAT_LLM_NAME: str = "meta/llama-3.3-70b-instruct"
+    NVIDIA_CHAT_IS_CHAT_MODEL: bool = True
+    NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL: bool = False
     NVIDIA_CHAT_CONTEXT_WINDOW: int = 131072
     NVIDIA_CHAT_MAX_TOKENS: int = 4096
+    NVIDIA_CHAT_TIMEOUT: float = 120.0
+    # Embedding model profile
+    NVIDIA_EMBEDDING_MODEL_NAME: str = "nvidia/nemotron-3-embed-1b"
+    NVIDIA_EMBEDDING_REQUEST_STYLE: Literal["nim", "openai"] = "nim"
+    NVIDIA_EMBEDDING_TRUNCATE: Literal["NONE", "START", "END"] = "END"
+    NVIDIA_EMBEDDING_DIMENSIONS: Optional[int] = None
     VECTOR_STORE_TABLE_NAME: str = "pg_vector_store"
     VECTOR_STORE_EMBED_DIM: int = 2048
     LOG_LEVEL: str = "INFO"
@@ -88,11 +96,16 @@ Validators (`mode="before"`):
 | `BACKEND_CORS_ORIGINS` | accepts JSON list string or comma-separated string |
 | `DATABASE_URL` | must start with `postgres`; `postgres://`→`postgresql://`→`postgresql+asyncpg://` (idempotent) |
 | `LOG_LEVEL` | upper-cased; rejects anything outside DEBUG/INFO/WARNING/ERROR/CRITICAL |
+| `NVIDIA_BASE_URL` | strips whitespace + trailing slash (one canonical form for both clients) |
+| `NVIDIA_CHAT_LLM_NAME`, `NVIDIA_EMBEDDING_MODEL_NAME` | trimmed; blank ids rejected — model ids are free-form, never checked against a list |
+| `NVIDIA_CHAT_CONTEXT_WINDOW` / `MAX_TOKENS` / `VECTOR_STORE_EMBED_DIM` | must be positive; `NVIDIA_CHAT_TIMEOUT` too |
+| `model_validator` (`mode="after"`) | `NVIDIA_EMBEDDING_DIMENSIONS` (if set) must equal `VECTOR_STORE_EMBED_DIM` |
 
-`settings` is instantiated at import and immediately exports `NVIDIA_API_KEY` and
-`NVIDIA_BASE_URL` to `os.environ` (`config.py:123-124`) for the NVIDIA LlamaIndex clients'
-env-var fallbacks (construction also passes them explicitly — `llama_index_settings.py`).
-Consequence: **importing anything under `app` requires `DATABASE_URL` and `NVIDIA_API_KEY`.**
+`settings` is instantiated at import, so **importing anything under `app` requires
+`DATABASE_URL` and `NVIDIA_API_KEY`** (tests set them in `conftest.py`). Key and endpoint are
+passed explicitly to both model clients in `llama_index_settings.py`; the old
+`os.environ["NVIDIA_API_KEY"]` / `NVIDIA_BASE_URL` side effects were removed.
+`NVIDIA_*` names are historical — they configure a generic OpenAI-compatible endpoint.
 
 Env file: `.env` in the CWD (`env_file=".env"`, no prefix). See `backend/.env.example`.
 
@@ -103,8 +116,16 @@ Env file: `.env` in the CWD (`env_file=".env"`, no prefix). See `backend/.env.ex
 ```python
 engine = create_async_engine(settings.DATABASE_URL,
     pool_pre_ping=True, pool_size=4, max_overflow=4, pool_recycle=3600, pool_timeout=120)
-SessionLocal = async_sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = async_sessionmaker(autocommit=False, autoflush=False, bind=engine,
+                                  expire_on_commit=False)
 ```
+
+`expire_on_commit=False` is mandatory for async sessions here: with the default (`True`), a
+commit expires ORM instances and the next `message.id` / `assistant.created_at` read performs
+an implicit **sync** lazy load → `sqlalchemy.exc.MissingGreenlet`. The SSE path additionally
+copies those scalars before later commits, and `crud.finalise_message` uses the `message_id`
+argument rather than `message.id` after `commit()`. Code that needs fresh values calls
+`await db.refresh(...)` or re-queries (see `create_message`, `fetch_message_with_sub_processes`).
 
 `pool_size=4 + max_overflow=4` per process ⇒ with `BACKEND_WORKERS=4` the app can open **32**
 connections. Supabase free/pooler tiers have low limits — lower `BACKEND_WORKERS` if you see

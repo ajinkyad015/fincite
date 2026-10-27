@@ -1,15 +1,18 @@
-from typing import List
+from typing import List, Optional
 from llama_index.core.response_synthesizers import BaseSynthesizer
 from llama_index.core.prompts.prompts import RefinePrompt, QuestionAnswerPrompt
 from llama_index.core.prompts.prompt_type import PromptType
 from app.schema import Document as DocumentSchema
 from app.chat.utils import build_title_for_document
 from llama_index.core.callbacks import CallbackManager
+from llama_index.core.llms import LLM
 from llama_index.core.response_synthesizers.factory import get_response_synthesizer
 
 
 def get_custom_response_synth(
-    callback_manager: CallbackManager, documents: List[DocumentSchema]
+    callback_manager: CallbackManager,
+    documents: List[DocumentSchema],
+    llm: Optional[LLM] = None,
 ) -> BaseSynthesizer:
     doc_titles = "\n".join("- " + build_title_for_document(doc) for doc in documents)
 
@@ -59,7 +62,11 @@ Answer:
         prompt_type=PromptType.QUESTION_ANSWER,
     )
 
+    # `llm` defaults to Settings.llm when omitted; passing the configured
+    # client explicitly keeps the synthesizer on the same model/metadata as
+    # the agent (and avoids an unset global in scripts/tests).
     return get_response_synthesizer(
+        llm=llm,
         callback_manager=callback_manager,
         refine_template=refine_prompt,
         text_qa_template=qa_prompt,

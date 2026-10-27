@@ -335,7 +335,7 @@ dependencies = [
     { name = "greenlet" },
     { name = "llama-index-core" },
     { name = "llama-index-embeddings-nvidia" },
-    { name = "llama-index-llms-nvidia" },
+    { name = "llama-index-llms-openai-like" },
     { name = "llama-index-readers-file" },
     { name = "llama-index-vector-stores-postgres" },
     { name = "mako" },
@@ -375,7 +375,7 @@ requires-dist = [
     { name = "greenlet", specifier = "==2.0.2" },
     { name = "llama-index-core", specifier = "==0.12.23" },
     { name = "llama-index-embeddings-nvidia", specifier = "==0.3.4" },
-    { name = "llama-index-llms-nvidia", specifier = "==0.3.3" },
+    { name = "llama-index-llms-openai-like", specifier = "==0.3.4" },
     { name = "llama-index-readers-file", specifier = "==0.4.6" },
     { name = "llama-index-vector-stores-postgres", specifier = "==0.4.2" },
     { name = "mako", specifier = ">=1.4.1" },
@@ -699,20 +699,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c6/94/36f8d2c8409e849ba7650ac6810625234530e6ca8b9236ef0c79b2572fea/llama_index_embeddings_nvidia-0.3.4.tar.gz", hash = "sha256:ec68a4c94364afe7059d55a65cd30ef237f0e6794169f1c6d402cbea899cdb3b", size = 8031, upload-time = "2025-07-01T23:07:06.635Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0a/9e/8e5ad808fbfa2adef6b0a2235aa6991e59331207059fe34a9bee4fb2475d/llama_index_embeddings_nvidia-0.3.4-py3-none-any.whl", hash = "sha256:737c244087a813a94f555bbec00e9ffde0dcb74638a1cb96fd550f5d6001964e", size = 8042, upload-time = "2025-07-01T23:07:05.637Z" },
-]
-
-[[package]]
-name = "llama-index-llms-nvidia"
-version = "0.3.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "llama-index-core" },
-    { name = "llama-index-llms-openai" },
-    { name = "llama-index-llms-openai-like" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d0/9d/f389096a8001116d9c2fed6be3ee3d662a19e5ce0933f8d25769a15c08f2/llama_index_llms_nvidia-0.3.3.tar.gz", hash = "sha256:a6b8d6651b592a894eac1bab0fbe6fc8c2e9419a5f881b093a7e3352da4e5f15", size = 10870, upload-time = "2025-03-06T19:23:12.591Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/22/10/13213a9951d4eada2ef4c0a9c899ce559ebdc28e3bf9f9742f3e7d9a218d/llama_index_llms_nvidia-0.3.3-py3-none-any.whl", hash = "sha256:cd27e324b62e4103153d4765e27fd6e1ec63c659279f17a19a3418bc6a7693d6", size = 10277, upload-time = "2025-03-06T19:23:10.986Z" },
 ]
 
 [[package]]

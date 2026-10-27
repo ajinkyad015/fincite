@@ -96,7 +96,7 @@ roughly half of the reads/writes the UI assumes.
 | B12 | No auth, no tenancy, no rate limiting — every endpoint is public and pays NVIDIA API tokens. | AGENTS.md §14.Q |
 | B13 | `docker-compose.yml` maps host 5433 → container **5433** (Postgres listens on 5432), no frontend/web/reverse-proxy service, obsolete `version: '3'`. | `docker-compose.yml` |
 | B14 | No `.github/workflows` at all. | repo root |
-| B15 | ~~Chat model `models/gemini-1.5-flash` is end-of-life~~ — **RESOLVED pre-M2 by the Google → NVIDIA provider swap** (Oct 2026): chat `meta/llama-3.3-70b-instruct`, embeddings `nvidia/nemotron-3-embed-1b` (2048-d) via build.nvidia.com hosted NIMs; both are env-selected in `llama_index_settings.py`. The standing caution survives: catalog model ids retire (410/404), the *chat* swap is an env change, the *embedding* swap needs a vector-table recreate + full re-index. | `config.py`, `pyproject.toml` |
+| B15 | ~~Chat model `models/gemini-1.5-flash` is end-of-life~~ — **RESOLVED pre-M2 by the Google → NVIDIA provider swap** (Oct 2026): default chat `meta/llama-3.3-70b-instruct`, embeddings `nvidia/nemotron-3-embed-1b` (2048-d) via build.nvidia.com hosted NIMs; both are env-selected in `llama_index_settings.py`. **Updated 2026-10-27:** the chat client is now a generic `OpenAILike` (the NVIDIA client's frozen model table broke newer ids with `None` LLMMetadata booleans), so ids + declared capabilities are configured in `.env` — see `AGENTS.md §10.2`. The standing caution survives: catalog model ids retire (410/404), the *chat* swap is an env change, the *embedding* swap needs a vector-table recreate + full re-index. | `config.py`, `pyproject.toml` |
 
 **Conclusion:** the integration is not a matter of flipping a flag. It is a contract-first project:
 harden the API additively (M1), write a real client transport + mapper (M2), then spend the bulk of the
@@ -530,8 +530,10 @@ fincite.example.com {
 |---|---|---|---|
 | `DATABASE_URL` | local pgvector | Supabase (staging project) | Supabase (prod) |
 | `NVIDIA_API_KEY` | personal | staging key, low quota | prod key, quota alarm |
-| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` (verify still served) | same | same |
+| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` (verify still served; any /v1 id works) | same | same |
+| `NVIDIA_CHAT_IS_CHAT_MODEL` / `IS_FUNCTION_CALLING_MODEL` / `CONTEXT_WINDOW` / `MAX_TOKENS` / `TIMEOUT` | profile matching the chosen chat id (see `.env.example`) | same | same |
 | `NVIDIA_EMBEDDING_MODEL_NAME` | unchanged (`nvidia/nemotron-3-embed-1b`, 2048-d) | unchanged | unchanged |
+| `NVIDIA_EMBEDDING_REQUEST_STYLE` / `TRUNCATE` / `DIMENSIONS` | `nim` / `END` / unset | same | same |
 | `BACKEND_CORS_ORIGINS` | `["http://localhost:5173"]` (unused with proxy) | staging origin | **exact** prod origin |
 | `AUTH_ENABLED` | `false` | `true` | `true` |
 | `BACKEND_WORKERS` | 1 (reload) | 2 | 2–4 |

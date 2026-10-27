@@ -207,7 +207,9 @@ Chunking settings that determine table content: `SentenceSplitter(chunk_size=512
 chunk_overlap=10)` (`chat/constants.py:25`, applied in `llama_index_settings.py:22`).
 
 > Changing `VECTOR_STORE_EMBED_DIM` or the embedding model requires dropping/recreating
-> `data_pg_vector_store*` and re-indexing every document.
+> `data_pg_vector_store*` and re-indexing every document. If
+> `NVIDIA_EMBEDDING_DIMENSIONS` is set, `Settings` rejects a value that differs from
+> `VECTOR_STORE_EMBED_DIM` at boot — mixed dimensions break similarity search.
 
 ---
 

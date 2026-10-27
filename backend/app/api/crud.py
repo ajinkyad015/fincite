@@ -1,5 +1,6 @@
 from typing import List, Optional
 import datetime
+from uuid import UUID
 
 from sqlalchemy import func, or_, select, delete, update
 from sqlalchemy.orm import joinedload
@@ -298,14 +299,21 @@ async def finalise_message(
     message.sources = sources or []
 
     if sub_processes:
-        # Replace the trail wholesale: this call owns the final state.
+        # Replace the trail wholesale: this call owns the final state. Bind a
+        # real UUID object (as `message.id` used to) instead of relying on the
+        # driver coercing our str id for an INSERT.
+        message_uuid = (
+            message_id if isinstance(message_id, UUID) else UUID(str(message_id))
+        )
         await db.execute(
-            delete(MessageSubProcess).where(MessageSubProcess.message_id == message_id)
+            delete(MessageSubProcess).where(
+                MessageSubProcess.message_id == message_uuid
+            )
         )
         for sub_process in sub_processes:
             db.add(
                 MessageSubProcess(
-                    message_id=message.id,
+                    message_id=message_uuid,
                     source=sub_process.source,
                     status=sub_process.status,
                     name=sub_process.name,
@@ -315,7 +323,11 @@ async def finalise_message(
                 )
             )
     await db.commit()
-    return await fetch_message_with_sub_processes(db, message.id)
+    # Never read `message.<attr>` after commit: on an async session a commit
+    # expires ORM instances, and touching one triggers a sync lazy load —
+    # `MissingGreenlet: greenlet_spawn has not been called` — which used to
+    # abort finalisation right here. Use the id we were handed instead.
+    return await fetch_message_with_sub_processes(db, message_id)
 
 
 async def fetch_message_with_sub_processes(
