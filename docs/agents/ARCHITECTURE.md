@@ -13,10 +13,12 @@ Companion files: `../DATA_MODELS.md`, `../WORKFLOWS.md`, `../modules/rag-engine.
 │ Browser                                                                      │
 │   React 19 SPA (Vite 7, Tailwind v4, framer-motion)                          │
 │   frontend/src/store.tsx  ──►  frontend/src/lib/api.ts                       │
-│                                  ├── MockTransport  (ACTIVE, USE_MOCK=true)  │
-│                                  └── RealTransport  (incomplete, see API_REF) │
+│                                  ├── RealTransport  (DEFAULT, M1 contract)   │
+│                                  │     ├─ transport.ts: fetch + POST SSE     │
+│                                  │     └─ wire.ts: DTO → domain mapper       │
+│                                  └── MockTransport  (VITE_USE_MOCK=1 only)   │
 └───────────────────────────┬──────────────────────────────────────────────────┘
-                            │ target: fetch + EventSource to /api/**
+                            │ same-origin /api/** (Vite proxy / reverse proxy)
 ┌───────────────────────────▼──────────────────────────────────────────────────┐
 │ FastAPI (uvicorn, BACKEND_WORKERS=4)                                         │
 │   app/main.py  ── lifespan ──► settings, vector store pools                  │
@@ -283,16 +285,16 @@ One context, ~30 fields, three concerns:
 | Chrome | `view`, `mobileNav`, `health`, `selectedSource`, `toasts`, `booted` | `boot`, `checkHealth`, `pushToast`, `openSource`, `closeSource` |
 
 `patchConversation(id, fn)` is the single mutation primitive for a thread; it re-sorts threads by
-`updated_at` descending. Streaming patches the **last** assistant message by index and role.
-`send()` guards with `streaming` (one in-flight answer per tab).
+`updated_at` descending. M2 batches full assistant snapshots on `requestAnimationFrame` and flushes
+terminal snapshots immediately. `send()` guards with `streaming` (one in-flight answer per tab).
 
 ### 7.3 Transport facade (`lib/api.ts`)
 
-`export const api = { … }` exposes 7 methods. Each is `USE_MOCK ? mock.x() : new RealTransport().x()`.
-`MockTransport` simulates: upload progress ticks → 4-stage indexing pipeline (`STAGE_MS`) →
-`ready`; canned answer selection by regex (`ANSWER_BANK`) → timed sub-process plan → token
-stream (~12-26 ms per 1-2 chars) → `onDone` with sources. `RealTransport` is a partial stub (see
-`AGENTS.md §14.B`).
+`export const api = { … }` exposes the full M1 client surface. Each method is
+`USE_MOCK ? mock.x() : real.x()`. `RealTransport` lives in `transport.ts`, maps DTOs through
+`wire.ts`, POSTs questions and reads unnamed `Message` snapshots from a `ReadableStream`. Both
+transports emit the same full snapshots; `MockTransport` is selected only by `VITE_USE_MOCK=1` and
+uses `ANSWER_BANK` plus timed pipeline stages for offline demos.
 
 ### 7.4 Design system
 
@@ -309,8 +311,9 @@ only for entrance and panel slides.
 ### 7.5 Build
 
 `vite.config.ts`: `react()` + `tailwindcss()` + `viteSingleFile()`, alias `@ → src` (defined in
-both Vite and `tsconfig.json`). `vite build` emits **one** `dist/index.html` (~622 kB, ~189 kB
-gzip) — no code splitting, everything inlined, fonts still fetched from Google Fonts CDN.
+both Vite and `tsconfig.json`), host `0.0.0.0`, allowed preview hosts and a same-origin `/api` proxy.
+`vite build` emits **one** `dist/index.html` (~644 kB, ~195 kB gzip) — no code splitting, everything
+inlined, fonts still fetched from Google Fonts CDN.
 
 ---
 
@@ -325,8 +328,9 @@ gzip) — no code splitting, everything inlined, fonts still fetched from Google
 | New streamed UI metric | `chat/messaging.py` (`get_metadata_from_event`) + `schema.SubProcessMetadataKeysEnum` + `ResearchTrail`/`types.ts` |
 | Swap chat model | **`.env` only** — set `NVIDIA_CHAT_LLM_NAME` + the declared `NVIDIA_CHAT_*` capability/limit profile and restart (§10.2 in AGENTS.md). No code change: `get_chat_llm()` is a generic `OpenAILike` |
 | Swap embedding provider | `.env` embedding profile (`NVIDIA_EMBEDDING_*`, `NVIDIA_BASE_URL`) + `llama_index_settings.py` only if the request shape differs; `pyproject.toml` only for a new SDK. A new dimension means recreating `data_pg_vector_store` + re-indexing |
-| Real backend mode | `lib/api.ts` (`USE_MOCK`, `RealTransport`), plus a wire⇄domain mapper module that does not exist yet |
-| Background indexing | new queue module + `documents.py` (return 202) + progress endpoint + `store.watchDocument` |
+| Change wire↔domain mapping | `lib/wire.ts` first; keep components on `types.ts` |
+| Change API transport / SSE | `lib/transport.ts`; keep full-snapshot handlers and rehydrate after terminal frames |
+| Durable background indexing | replace `app/ingestion/jobs.py` process-local scheduler with a queue; endpoints/store already use 202 + polling |
 
 ---
 
@@ -338,7 +342,7 @@ gzip) — no code splitting, everything inlined, fonts still fetched from Google
 | 500 on first upload | Supabase env missing (`RuntimeError`) | `storage/supabase.py:28` |
 | Empty answers, no citations | documents have no vectors (reuse "worked") | `engine.py:126` |
 | SSE hangs forever | callback task raised (e.g. `KeyError` on unknown `CBEventType`) and the channel never closed | `messaging.py:101` |
-| 500 deleting a thread | FK violation, no cascade | `crud.py:57` |
-| Frontend shows stale data | `RealTransport` mismatch / poller stopped | `api.ts`, `store.tsx:108` |
-| `ModuleNotFoundError: fire` | running any `scripts/*.py` | `pyproject.toml` |
-| Long upload timeouts | synchronous embedding inside the request | `ingestion/pdf.py:107` |
+| 500 deleting a thread | regression in cascade delete (M1 fixed it) | `crud.py`, migration `d4b6f8c0e2a3` |
+| Frontend shows stale data | `/api` proxy/backend down, or poller stopped | `transport.ts`, `store.tsx` |
+| `ModuleNotFoundError: fire` | running a legacy `scripts/*.py` helper | `pyproject.toml` |
+| Upload accepted but never ready | process-local ingestion task died / provider failure | `ingestion/jobs.py`; retry via `POST /reindex` |

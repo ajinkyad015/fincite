@@ -217,10 +217,11 @@ None. Streaming is SSE only; there is no websocket endpoint.
 
 ---
 
-## 6. Frontend contract map (M2 work)
+## 6. Frontend contract map (M2 — implemented)
 
-The UI is connected as of M2 of `docs/plans/connect-and-deploy.md`. Until then `frontend/src/lib/api.ts`
-(`RealTransport`) is stale; the mapping table for the wire→domain translation lives in that plan (§M2.1).
+M2 is landed: `frontend/src/lib/wire.ts` implements the wire→domain translation from §M2.1, and
+`frontend/src/lib/transport.ts` consumes the POST SSE snapshots over `fetch` + `ReadableStream`.
+`api.ts` is now only a facade over the real and explicit-demo transports.
 
 | Concern | Wire shape | UI domain shape |
 |---|---|---|

@@ -1,12 +1,12 @@
 # AGENTS.md — fincitee
 
 > **Read this first, every session.** It is the map of this repository: what it is, how the
-> pieces connect, what is verified working, and what is broken. Everything below was checked
-> against the code at commit `3b43329` (branch `arena/81e80233-fincitee`) on 2026-10-24.
-> Where documentation (root `README.md`) disagrees with the code, **the code wins** — see §14.
+> pieces connect, what is verified working, and what is broken. Originally audited at commit
+> `3b43329` (2026-10-24); M0/M1/M2 updates below were checked against the current branch on
+> 2026-10-27. Where documentation (root `README.md`) disagrees with the code, **the code wins** — see §14.
 
-**Repo:** `shinosuke0103/fincitee` · **License:** MIT · **Size:** 83 tracked files, ~7,350 lines of
-application source (45 Python · 14 TSX · 6 TS · 1 CSS) plus committed lockfiles and a 493-line README.
+**Repo:** `shinosuke0103/fincite_temp` · **License:** MIT · **Size:** ~90 tracked files (45 Python ·
+14 TSX · 8 TS · 1 CSS) plus committed lockfiles and a README.
 
 > **Update 2026-10-27 (chat creation failures + model swapping).** The chat LLM is now a
 > **generic OpenAI-compatible client** (`llama_index.llms.openai_like.OpenAILike`), not
@@ -20,6 +20,18 @@ application source (45 Python · 14 TSX · 6 TS · 1 CSS) plus committed lockfil
 > persistence never touches an expired ORM attribute. Verify with `cd backend && uv run pytest -q`
 > (**70 passed**). Details: `app/llama_index_settings.py`, `app/core/config.py`,
 > `app/chat/engine.py`, `app/api/crud.py`, `app/db/session.py`.
+
+---
+
+> **M2 update (2026-10-27 — frontend connected).** Real API mode is now the default
+> (`VITE_USE_MOCK=1` is the only demo switch). `frontend/src/lib/wire.ts` owns DTO→domain
+> translation, `frontend/src/lib/transport.ts` owns fetch/POST-SSE, and `store.tsx` rehydrates
+> server-backed threads on boot/selection/terminal stream events. Uploads send real `File` bytes,
+> document polling uses server status/backoff, scope changes PATCH the thread, delete errors are
+> surfaced, and citations open `/api/document/{id}/file#page=N`. `scripts/smoke.sh` checks the live
+> flow with a caller-supplied PDF. No new frontend test framework was added. Verified: backend
+> **70 passed**, `npm run typecheck` **0 errors**, both `npm run build` and `npm run build:demo`
+> succeed, and a temporary Node harness exercised the mapper/SSE adapter.
 
 ---
 
@@ -58,8 +70,9 @@ Two deliverables in one repo, deployable independently:
    citations and a persisted reasoning trace ("research trail").
 2. **`frontend/`** — React 19 SPA ("research terminal"): thread rail, chat view, filing
    library with drag-and-drop upload, a live research-trail panel, clickable `[n]` citation
-   chips and a source drawer. **It currently runs against an in-memory mock transport, not the
-   backend** — see §14.B.
+   chips and a source drawer. **M2 made the real API the default**, with server-backed threads,
+   real PDF uploads, POST SSE, and page-linked citations; the mock transport remains an explicit
+   demo mode behind `VITE_USE_MOCK=1`.
 
 **Lineage.** The backend is a fork of a LlamaIndex + FastAPI "chat with documents" template
 (originally SEC-focused) re-skinned for NSE filings. Fossils of the original: the default DB
@@ -72,8 +85,9 @@ sub-process enum values.
 exactly (₹ Crore / ₹ Lakh / USD Million); always name the financial year; cite page numbers;
 never fabricate figures.
 
-**What this project is NOT (yet):** no authentication, no multi-tenancy, no document
-deletion, no background job queue, no CI, no frontend tests.
+**What this project is NOT (yet):** no authentication, no multi-tenancy, no durable job queue,
+no automated frontend test runner, and no end-to-end browser suite. Document deletion and CI now
+exist; `scripts/smoke.sh` is a live-contract check requiring real services and a supplied PDF.
 
 ---
 
@@ -159,6 +173,7 @@ fincitee/
 ├── README.md                      # 493-line product/architecture doc (partly aspirational, §14)
 ├── LICENSE                        # MIT © 2026 Ajinkya Datir
 ├── .gitignore                     # ignores .env*, .venv, node_modules, dist, skills-lock.json
+├── scripts/smoke.sh               # M2 live API smoke test (health → upload → SSE → reload → delete)
 │
 ├── backend/
 │   ├── pyproject.toml             # deps, dev group, `start` console script
@@ -223,8 +238,8 @@ fincitee/
 │
 └── frontend/
     ├── index.html                 # Google Fonts (Fraunces / Space Grotesk / IBM Plex Mono) + #root
-    ├── package.json               # scripts: dev, build, preview ONLY
-    ├── vite.config.ts             # react + tailwind + singlefile; alias `@` → src; NO dev proxy
+    ├── package.json               # dev / dev:mock / dev:real / build / build:demo / typecheck
+    ├── vite.config.ts             # react + tailwind + singlefile; same-origin /api dev proxy
     ├── tsconfig.json              # strict, noUnusedLocals/Parameters, noEmit, jsx react-jsx
     └── src/
         ├── main.tsx               # createRoot + StrictMode
@@ -232,9 +247,11 @@ fincitee/
         ├── store.tsx              # the single React-context store (documents, threads, streaming, health, toasts)
         ├── index.css              # Tailwind v4 @theme design tokens + grain, scrollbars, markdown tables
         ├── lib/
-        │   ├── api.ts             # api facade + MockTransport (active) + RealTransport (incomplete)
-        │   ├── types.ts           # domain types (⚠ first 22 lines swallowed by an unterminated comment)
-        │   ├── mockData.ts        # 5 seeded filings, 4 canned Q&A banks, ticker data, suggestions
+        │   ├── api.ts             # facade + explicit-demo MockTransport; real mode is default
+        │   ├── transport.ts       # fetch/ReadableStream POST SSE, AbortController, ApiError
+        │   ├── wire.ts            # DTO → domain mappers + citation/trail derivation
+        │   ├── types.ts           # strict UI domain types
+        │   ├── mockData.ts        # demo-only seeded filings / canned Q&A / ticker / suggestions
         │   └── format.ts          # labels, dates, byte formatting, uid/nowIso helpers
         ├── utils/cn.ts            # clsx + twMerge (dead code)
         └── components/
@@ -302,7 +319,7 @@ cannot blow up with "No API key found for OpenAI").
 | **Producer/consumer streaming** | task runs `handle_chat_message`, coroutine `event_publisher` drains the channel (`endpoints/conversation.py:110-178`) |
 | **Full-state snapshots over deltas** | every SSE frame is a serialized `schema.Message` (content + sub_processes grow monotonically) |
 | **Compensating transaction** | upload rolls back Storage object **and** DB row when indexing fails (`documents.py:149-174`) |
-| **Transport facade / strategy** | `frontend/src/lib/api.ts` `USE_MOCK` switch between `MockTransport` and `RealTransport`, same method surface |
+| **Transport facade / strategy** | `frontend/src/lib/api.ts` switches between `MockTransport` and `RealTransport`; `wire.ts` maps DTOs and `transport.ts` handles fetch/SSE |
 | **Context store (no Redux/router)** | `frontend/src/store.tsx` — one `createContext`, ~30 fields, all mutations via `patchConversation` |
 | **Schema-first API** | Pydantic v2 models in `app/schema.py` used as `response_model` / annotations |
 | **Derived-state components** | `ResearchTrail` auto-collapses when all steps finish; ChatView sticks to bottom unless user scrolls up |
@@ -364,7 +381,7 @@ endpoints/conversation.py: message_conversation (SSE)
 
 ```
 main.tsx → App.tsx (StoreProvider)
-  ├─ Shell: boot() (store) + 25 s health poll (store.checkHealth → api.health)
+  ├─ Shell: boot() (health + documents + conversation list) + 25 s health poll
   ├─ Ticker            (lib/mockData TICKS)
   ├─ Sidebar           (store: view, conversations, documents, health, deleteConversation)
   ├─ ChatView          (store: active, documents, send, setView)
@@ -373,17 +390,17 @@ main.tsx → App.tsx (StoreProvider)
   │   ├─ MessageItem ──► CiteMarkdown (onCite → store.openSource)
   │   │              └─ ResearchTrail (message.sub_processes)
   │   └─ Composer      (store.send / stopStreaming)
-  ├─ LibraryView       (store: documents, uploadFiles, refreshDocuments, setLibraryOpenDocId)
+  ├─ LibraryView       (store: documents, uploadFiles, retryDocument, refreshDocuments)
   │   ├─ DocRow → StatusPill
   │   ├─ UploadDrawer  (store.uploadFiles)
-  │   └─ DocDetailDrawer (store.startScopedChat, uploadFiles)
-  ├─ SourceDrawer      (store.selectedSource → setLibraryOpenDocId + setView("library"))
+  │   └─ DocDetailDrawer (store.startScopedChat, retryDocument; demo-only upload)
+  ├─ SourceDrawer      (source passage + /api/document/{id}/file#page=N + library jump)
   └─ Toasts            (store.toasts)
 ```
 
-`store.send()` is the hub: it creates a conversation if needed, then calls
-`api.streamMessage(id, q, handlers)` and patches the conversation from `onUserMessage` /
-`onAssistantCreated` / `onSubProcess` / `onToken` / `onDone` / `onError`.
+`store.send()` is the hub: it creates `{title, document_ids}` if needed, then calls
+`api.streamMessage(id, q, handlers)`. Full `onSnapshot`s are rAF-batched; terminal handlers
+rehydrate `GET /api/conversation/{id}` so React state reflects the database.
 
 ---
 
@@ -514,7 +531,8 @@ holds the owning `document.id`; `metadata_->>'page_label'` holds the PDF page.
 `NSEDocumentType`, `DocumentStatus`, `DocumentMetadata`, `FinDocument`, `SubProcessSource`,
 `SubProcessStatus`, `MessageSubProcess`, `MessageRole`, `MessageStatus`, `Source`,
 `ChatMessage`, `Conversation`, `ConversationCreate`, `DocumentUploadResponse`, `HealthResponse`,
-`View`. **These do not match the backend** (see §14.A/§14.K and `DATA_MODELS.md §6`).
+`View`, plus upload/update helper types. They are intentionally UI shapes; `wire.ts` is the sole
+translation boundary from `schema.py` DTOs (M2).
 
 ---
 
@@ -612,14 +630,14 @@ Detailed traces: `docs/agents/WORKFLOWS.md`.
    `Message`; `status` becomes `SUCCESS` or `ERROR`.
 7. Empty answer ⇒ canned apology ("Sorry, I either wasn't able to understand your question…").
 
-### W4 — Frontend question flow (mock)
+### W4 — Frontend question flow (real; demo mirrors it)
 
-`Composer.submit` → `store.send(q)` → create conversation if `activeId` is null →
-`api.streamMessage` (mock walks a 4-step plan: Query understanding → Hybrid retrieval → Rerank
-→ Answer synthesis, `lib/mockData.ts:188` `ANSWER_BANK`) → handlers patch the conversation →
-`MessageItem` renders streaming text (`.stream-caret`) → `ResearchTrail` auto-collapses 1.4 s
-after the last step → completion attaches `sources[]` → clicking `[n]` or a source card calls
-`store.openSource` → `SourceDrawer` shows the passage, "open in library" jumps to `LibraryView`.
+`Composer.submit` → `store.send(q)` → `POST /api/conversation/` if `activeId` is null →
+`transport.ts` POSTs `{"content": q}` and reads unnamed SSE `Message` snapshots → `wire.ts`
+maps cumulative content, trail steps and sources → store applies rAF-batched snapshots →
+terminal `SUCCESS`/`ERROR` rehydrates `GET /api/conversation/{id}` → clicking `[n]` opens
+`SourceDrawer`, whose PDF link jumps to `/api/document/{id}/file#page=N`. The demo transport
+emits the same snapshots from `ANSWER_BANK`.
 
 ### W5 — Deploy bootstrap
 
@@ -666,9 +684,9 @@ endpoint explicitly in `llama_index_settings.py`.
 | `SENTRY_DSN` | unset | enables Sentry |
 | `FINCITE_BOOTSTRAP_DONE` | unset | internal handoff flag (`main.py`) |
 
-**Frontend config:** only `VITE_API_URL` (read via `import.meta.env` at `lib/api.ts:34`,
-default `http://localhost:8000`). **`USE_MOCK` is a hardcoded `true` constant** at
-`lib/api.ts:32` — there is no env switch today.
+**Frontend config:** `VITE_API_URL` (default `""`, same-origin `/api`) and `VITE_USE_MOCK`
+(default `false`; `1` selects demo mode). `VITE_PROXY_TARGET` controls the Vite dev proxy.
+See `frontend/.env.example`.
 
 `backend/.env.example` documents every variable (grouped into *chat model profile* and
 *embedding model profile*); `docker-compose.yml` overrides `DATABASE_URL` and
@@ -725,20 +743,21 @@ cp .env.example .env                     # then fill DATABASE_URL / SUPABASE_* /
 uv run alembic upgrade head              # migrate (CWD must be backend/)
 uv run start                             # bootstrap + uvicorn on 0.0.0.0:8000
 # or: uv run uvicorn app.main:app --port 8000
-uv run pytest -q                         # 15 passed in ~8 s (no DB / API key needed) ✅
+uv run pytest -q                         # 70 passed in ~9 s (no DB / API key needed) ✅
 uv run alembic current                   # applied revision
-uv run alembic heads                     # → 663b3fea3024 ✅ (single head)
-docker compose up --build                # backend + ankane/pgvector (⚠ port map bug, §14.F)
+uv run alembic heads                     # single head ✅
+docker compose up --build                # backend + healthy ankane/pgvector (5433:5432)
 ```
 
 ### Frontend (`cd frontend`)
 
 ```bash
 npm ci                                   # ✅
-npm run dev                              # vite dev server (default :5173) — mock data only
-npm run build                            # ✅ → dist/index.html (622 kB, 189 kB gzip, single file)
-npm run preview                          # serve the build
-npx tsc --noEmit                         # ❌ 5 errors today (§14.A) — fix before claiming "typecheck clean"
+npm run dev                              # vite dev server (:5173) — live API via /api proxy
+npm run dev:mock                         # explicit seeded demo mode
+npm run build                            # ✅ → dist/index.html (single file)
+npm run build:demo                       # ✅ explicit demo build
+npm run typecheck                        # ✅ 0 errors
 ```
 
 ### Linting
@@ -850,34 +869,26 @@ rather than silently adding a new framework.
 Ranked by likelihood of biting an agent. Each item was checked against the code in this
 session; re-verify before acting on one you intend to fix.
 
-> **Closed in the M0/M1 pass** (2026-10-26, see `docs/plans/connect-and-deploy.md`):
-> **A** (typecheck is green — `npm run typecheck`), **E** (cascade deletes + explicit child deletes),
-> **F** (compose port `5433:5432` + healthcheck), **I** (indexing moved to `app/ingestion/jobs.py`),
-> **J** (`DELETE /api/document/{id}` clears vectors, storage and rows), **L** (empty library → `200 []`),
-> **N** (`_bootstrap` anchors `alembic.ini`/`script_location` to `backend/`, CWD-independent).
-> Still open below in updated form: **B** (frontend transport — M2), **C**, **G**, **K**, **M**, **O**, **P**, **Q**.
-> Item **D** (streaming concurrency) was rewritten in M1; the double-close and `_closed` inspection are gone.
+> **Closed in M0/M1** (2026-10-26): **A**, **D**, **E**, **F**, **I**, **J**, **L**, **N**.
+> **Closed in M2** (2026-10-27): **B** (real transport), **K** (wire/domain drift), the frontend half
+> of **E** (delete errors), and the thread-persistence/scope parts of **C**; see
+> `docs/plans/connect-and-deploy.md`. Remaining: **G**, **M**, **O**, **P**, **Q** and the still-aspirational
+> M3+ UX/deploy items.
 
 **A. ~~Frontend does not typecheck~~ — FIXED.** `frontend/src/lib/types.ts` had an unterminated `/**`
 that swallowed four type declarations, plus an unused `Activity` import in `Sidebar.tsx`.
 Both are repaired and `npm run typecheck` is part of CI. If it regresses, `npx tsc --noEmit` is the
 fastest signal.
 
-**B. The frontend is mock-only and its "real" transport does not match the API.**
-`USE_MOCK = true` is a hardcoded const (`lib/api.ts:32`); to hit the backend you must edit source.
-`RealTransport` is stale: it sends `?q=` instead of `?user_message=`
-(`api.ts:417`), listens for `sub_process`/`delta`/`done` events while the backend emits unnamed
-`Message` snapshots (`api.ts:420-433`), and posts `{title, document_scope}` instead of
-`{document_ids}` (`api.ts:399-406`). `EventSource` also cannot set an `Accept` header.
-Expect to rewrite this transport, not patch it.
+**B. ~~Frontend was mock-only / stale real transport~~ — FIXED in M2.** `USE_MOCK` defaults to
+false, `transport.ts` uses `POST /message` with `fetch` + `ReadableStream`, `wire.ts` maps full
+`Message` snapshots, and create/PATCH requests use `document_ids`. `EventSource` is gone; the
+store rehydrates threads from the server. Keep demo mode explicit with `VITE_USE_MOCK=1`.
 
-**C. README drift (root `README.md` describes files/scripts that do not exist).**
-Missing: `frontend/src/lib/backend.ts`, `frontend/README.md`,
-`backend/CONTEXT.md` (referenced by `backend/README.md`), npm scripts `dev:mock`, `typecheck`,
-`check:adapter`, the Vite dev proxy / `VITE_PROXY_TARGET`, the NSE-metadata upload form
-(`UploadDrawer` sends only `{name,size,type}`), thread persistence across reloads
-(conversations live only in React state), and "15 passing backend tests" is correct but
-"`npm run typecheck` zero errors" is false. Trust code and this file.
+**C. Remaining documentation drift (reduced in M2).** `frontend/README.md`,
+`backend/CONTEXT.md` and an NSE metadata upload form still do not exist; mock mode is now explicit,
+scripts/proxy/typecheck/thread persistence are real, and README states 70 backend tests. Trust the
+code and update docs in the same change when these remaining gaps are closed.
 
 **D. Streaming concurrency — rewritten in M1, treat as load-bearing.**
 `handle_chat_message` no longer enters `async with send_chan` (the endpoint owns the channel and
@@ -892,7 +903,8 @@ end-to-end check against a live SSE client.
 **E. ~~`DELETE /api/conversation/{id}` fails for non-empty conversations~~ — FIXED.**
 Migration `d4b6f8c0e2a3` re-creates the child FKs with `ON DELETE CASCADE`, and
 `crud.delete_conversation` also deletes children explicitly (safe on databases created before the
-cascade). The frontend still hides delete failures (`store.tsx`, "local delete anyway") — fix that in M2.
+cascade). M2 changed the frontend to await DELETE and show a real error toast instead of hiding
+failures with a "local delete anyway" fallback.
 
 **F. ~~`docker-compose.yml` database port is wrong~~ — FIXED.** Host `5433` now maps to container
 `5432`, the obsolete `version:` key is gone, and `db` has a `pg_isready` healthcheck that the backend
@@ -914,23 +926,18 @@ and a document whose vectors are missing yields an empty tool. Do not rely on th
 `app/ingestion/jobs.py`, returning **202**; the job walks `parsing → chunking → embedding → indexing →
 ready` writing `progress`/`error`. Constraints worth knowing: the scheduler is **process-local**
 (`asyncio.create_task` + a `Semaphore(1)`), so a restart mid-ingest leaves the row stuck — the boot-time
-sweep `crud.mark_stale_documents_failed` (15 min) marks those `failed` and the library offers a retry.
-Durability across workers needs a real queue (decision record 0002 in the plan).
+sweep `crud.mark_stale_documents_failed` (15 min) marks those `failed` and the library's M2 "Retry
+indexing" button calls `POST /reindex`. Durability across workers needs a real queue.
 
 **J. ~~No document deletion path~~ — FIXED.** `DELETE /api/document/{id}` clears pgvector rows
 (`metadata_->>'db_document_id'`), the stored PDF, conversation links and the row. It fails closed:
 if the vector delete errors, the response is **503** and nothing else is touched.
 
-**K. Frontend/backend type drift (unchanged until M2).** The API now exposes
-`document.status/progress/page_count/file_size` and `message.sources`, which narrows the gap — but the
-UI types are still `nse_symbol`/`fiscal_year`/`pages` and its `SubProcessSource` union still differs
-from `CBEventType`. A `wire.ts` mapper is the planned fix. `FinDocument.metadata` uses `nse_symbol`, `fiscal_year`,
-`period`, `pages`, `file_size`; the backend uses `company_symbol`, `financial_year`,
-`original_filename` and no page/size counters. Document-type enums differ
-(`quarterly_results`/`concall_transcript`/`shareholding_pattern`/`corporate_announcement` in the
-UI vs `financial_results`/`corporate_filing`/`investor_presentation`/`other` in the API).
-Sub-process enums differ too (UI: `llm|retrieval|rerank|parser`; API: LlamaIndex
-`CBEventType` names). A mapper layer is required before real mode works.
+**K. ~~Frontend/backend type drift~~ — FIXED in M2.** `wire.ts` translates
+`company_symbol/financial_year/original_filename/page_count/file_size/message.sources`, maps legacy
+document types and LlamaIndex `CBEventType` names to the UI unions, derives citations from trail
+metadata, normalises fiscal years, and never throws on unknown enum values. Do not put backend field
+names back into components.
 
 **L. ~~`GET /api/document/` returns 404 for an empty library~~ — FIXED.** It returns `200 []`.
 
@@ -956,8 +963,9 @@ model.
 imports `Activity` (TS error); `crud.py` imports `uuid as uuid_module` unused; several
 commented-out UI blocks remain in `Sidebar.tsx`, `ChatView.tsx`, `LibraryView.tsx`.
 
-**Q. No auth, tenancy, rate limiting, or CI.** Every endpoint is public; the Supabase
-service-role key must never leak to the client; there is no `.github/workflows`.
+**Q. No auth, tenancy, or rate limiting.** Every endpoint is public; the Supabase service-role key
+must never leak to the client. CI exists (`.github/workflows/ci.yml`) and runs pytest, typecheck and
+both frontend builds.
 
 **R. Dependency age.** `sentry-sdk` 1.29.2 and `uvicorn` 0.22.0 are old. The model
 integrations are pinned to the last core-0.12-compatible releases
@@ -1029,9 +1037,10 @@ boot against a table built for a different dimension).
    client, in logs, or in API responses.
 4. **Never edit `alembic/versions/*.py` that already ran** (or delete rows from
    `alembic_version`); add a new revision instead.
-5. **Never call the frontend "connected" while `RealTransport` is stale** (§14.B). `USE_MOCK` is now
-   env-driven (`VITE_USE_MOCK`), which makes real mode one variable away — but it is still the old
-   contract. Verify against a live API (`VITE_USE_MOCK=0 npm run dev`) before claiming integration.
+5. **Never regress the M2 transport contract.** Keep POST + unnamed full `Message` snapshots,
+   `wire.ts` as the only mapper, and `VITE_USE_MOCK=1` as the only demo switch. Verify with
+   `npm run typecheck`, both builds, and `scripts/smoke.sh` against a live API before claiming
+   integration.
 6. **Never delete the commented-out UI blocks or "unused" helpers as "cleanup"** without asking;
    they are deliberate parking spots for in-progress UI.
 7. **Never trust `README.md` over the code.** If a doc claim is wrong, fix the doc in the same
@@ -1041,8 +1050,9 @@ boot against a table built for a different dimension).
    no CSS-in-JS.
 9. **Never commit `.env`, `node_modules/`, `dist/`, `.venv/`, or generated PDFs** (all ignored;
    keep new artifacts ignored too).
-10. **Never assume the frontend typecheck is green, the delete endpoint works, or the scripts
-    run** — all three are currently broken (§14.A, §14.E, §14.G).
+10. **Never assume typecheck, delete, or helper scripts are green without running them.** The M2
+    typecheck and delete path are fixed; three legacy `backend/scripts/*.py` helpers still need
+    `fire` (§14.G).
 11. **Never reformat unrelated files.** Diffs should be scoped; this codebase mixes legacy and
     modern Python styles on purpose.
 
@@ -1062,7 +1072,7 @@ boot against a table built for a different dimension).
 cd backend  && uv run pytest -q                     # expect: 70 passed
 cd backend  && uv run python -c "import app.main"   # needs DATABASE_URL + NVIDIA_API_KEY set
 cd frontend && npm run typecheck                    # expect: 0 errors
-cd frontend && npm run build                        # expect: single dist/index.html (~622 kB)
+cd frontend && npm run build                        # expect: single dist/index.html (~644 kB)
 curl -s localhost:8000/api/health/                  # {"status":"healthy","db":true,…} — requires DB + env
 curl -s localhost:8000/api/config/                  # public runtime config
 curl -s localhost:8000/api/document/                 # 200 [] on an empty library

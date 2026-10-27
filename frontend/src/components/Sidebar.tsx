@@ -149,7 +149,7 @@ export default function Sidebar() {
                         <span className="mt-1 flex items-center gap-2 font-mono text-[9.5px] text-bone/35">
                           <span className="tnum">{shortDate(c.updated_at)}</span>
                           <span className="h-px w-2 bg-bone/20" />
-                          <span className="tnum">{c.messages.length} msgs</span>
+                          <span className="tnum">{c.message_count ?? c.messages.length} msgs</span>
                         </span>
                       </span>
                       <span

@@ -1,6 +1,6 @@
 # Fincite — Connect the frontend to the backend, and ship it
 
-> **Status:** M0 ✅ done · M1 ✅ done · M2–M6 open · **Date:** 2026-10-26 · **Branch:** `arena/006dcca4-fincitee`
+> **Status:** M0 ✅ done · M1 ✅ done · M2 ✅ done · M3–M6 open · **Date:** 2026-10-27 · **Branch:** `arena/47f8300c-fincite-temp`
 > **Scope:** make the real FastAPI backend drive the real React UI, then deploy a usable product with a
 > markedly richer frontend (and the backend work that richness requires).
 > **Audience:** whoever executes the plan (human or agent). Every claim below was checked against the
@@ -14,7 +14,7 @@
 |---|---|---|
 | **M0 — Baseline green** | ✅ done | typecheck fixed (runaway comment + unused import); `VITE_USE_MOCK` / `VITE_API_URL` env-driven with same-origin default; Vite dev proxy + `host 0.0.0.0` + `allowedHosts`; `typecheck`/`dev:mock`/`dev:real`/`build:demo` scripts; `frontend/.env.example` (and `.gitignore` un-ignored it); `docker-compose.yml` port fix + healthcheck; `.github/workflows/ci.yml` |
 | **M1 — API a real client can use** | ✅ done | 4 migrations (`a1f0c3d5b7e9`, `b2e4d6f8a0c1`, `c3a5e7b9d1f2`, `d4b6f8c0e2a3`) + matching models; background ingestion (`app/ingestion/jobs.py`); documents: 202 upload, enriched list/`[]`, `DELETE`, `reindex`, `/file`; conversations: optional scope, `GET /` index, `PATCH`, cascade delete; `POST /message` streaming with durable partials; `message.sources`; trail labels + durations; `/health/` v2 + `/api/config/`; CWD-safe bootstrap + stale-ingest sweep; contract tests (52 passing) |
-| **M2 — Frontend actually connected** | next | `wire.ts` mappers + fetch/`ReadableStream` transport + thread rehydration |
+| **M2 — Frontend actually connected** | ✅ done | `wire.ts` mappers + fetch/`ReadableStream` SSE transport + thread rehydration; `scripts/smoke.sh`; real mode is the default |
 | **M3 — UX richness** | open | PDF viewer, trail 2.0, compare mode, palette, upload metadata form |
 | **M4 — Auth & cost control** | open | Supabase JWT, per-user scoping, quotas |
 | **M5 — Deployment** | open | one-origin Caddy + CI/CD + `scripts/smoke.sh` |
@@ -319,7 +319,16 @@ async def run_ingestion(document_id: str):
 
 ---
 
-### M2 — Frontend: actually connected (3–4 days)
+### M2 — Frontend: actually connected (✅ implemented 2026-10-27)
+
+**Minimal landed scope:** `lib/wire.ts` owns DTO→domain mappings and `lib/transport.ts` owns fetch/SSE.
+`lib/api.ts` is a thin facade, `store.tsx` boots from the live thread index and rehydrates conversations,
+and the citation drawer links to `/api/document/{id}/file#page=N`. `scripts/smoke.sh` checks the live
+flow with a caller-supplied real PDF. No new framework, generated API types, or frontend test runner was
+added; the mapper/SSE contract was exercised with a temporary Node harness. Composer drafts persist per
+thread in `localStorage`; scope is persisted server-side. Typed retry actions on every toast and the M3
+metadata form remain deferred. Upload metadata is optional at the transport layer and inferred by the
+backend today.
 
 Goal: `store.tsx` and every component consume live data with no shape guesswork, and stay unchanged from
 here on. All the new work sits in `lib/`.
@@ -667,13 +676,13 @@ README.md · AGENTS.md · docs/agents/*       truth-fix + new API/deploy docs
 
 ```bash
 # backend
-cd backend && uv run pytest -q                       # expect: existing 15 + ~20 new, all green
+cd backend && uv run pytest -q                       # expect: 70 passed (M1 contract suite is green)
 cd frontend && npm run typecheck                     # expect: 0 errors (currently 5 — M0)
 cd frontend && npm run build                         # expect: dist/index.html
 cd frontend && npm run build:demo                    # expect: mock mode build for design review
 
 # contract / end-to-end
-./scripts/smoke.sh http://localhost:8000             # upload → index → ask → cite → reload → delete
+./scripts/smoke.sh http://localhost:8000 ./filing.pdf  # upload → index → ask → cite → reload → delete
 
 # deployment
 ./scripts/smoke.sh https://fincite.example.com       # same script, prod URL, after deploy

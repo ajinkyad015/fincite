@@ -110,8 +110,8 @@ assistant row in PENDING. Regression tests live in `tests/app/test_connect_contr
 
 - `EventSourceResponse` from `sse-starlette==1.6.5`; `sep` defaults to `\r\n`; ping every 15 s
   (`DEFAULT_PING_INTERVAL`) as `: ping - <ts>` comments.
-- Frames carry **no event name** ⇒ browsers deliver them on the default `message` listener
-  (`es.onmessage` / `addEventListener("message")`).
+- Frames carry **no event name**; the M2 `fetch` parser treats every `data:` frame as a snapshot
+  (named frames are accepted for compatibility).
 - Each frame's `data` is one JSON `schema.Message` (see `../API_REFERENCE.md §4`).
 - Content is cumulative, so a client can drop intermediate frames safely.
 
@@ -127,44 +127,27 @@ data: {"id":"b1e0…", … "content":"… full answer …","status":"SUCCESS", "
 
 ---
 
-## 4. Client side today
+## 4. Client side (M2 — implemented)
 
-`frontend/src/lib/api.ts` exports:
+`frontend/src/lib/transport.ts` exports `StreamHandlers` (re-exported by `api.ts`):
 
 ```ts
 export interface StreamHandlers {
   onUserMessage, onAssistantCreated, onSubProcess(stepId, patch), onToken(token),
-  onDone({content, sources}), onError(message)
+  onDone({content, sources}), onError(message), onSnapshot?(message)
 }
 ```
 
-`MockTransport.streamMessage` (`api.ts:195`) synthesizes everything with `setTimeout`s and
-returns a cancel closure. That is the code path in production today (`USE_MOCK = true`).
+`RealTransport.streamMessage` POSTs `{content: question}` with `Accept: text/event-stream` and an
+`AbortController`, then reads `response.body.getReader()`. `consumeSseFrames()` handles CRLF, blank-line
+boundaries, multi-line `data:`, named events and `: ping` comments. `toChatMessage()` maps each JSON
+snapshot; `createSnapshotAdapter()` additionally derives legacy token/trail callbacks from the
+cumulative snapshots for compatibility. `onSnapshot` is the preferred store path.
 
-`RealTransport.streamMessage` (`api.ts:415`) is **wrong for this backend**:
-
-| Issue | Detail |
-|---|---|
-| Query param | sends `?q=` — backend reads `user_message` |
-| Event names | listens for `sub_process` / `delta` / `done`; backend sends unnamed snapshot frames |
-| Snapshot vs delta | expects raw token strings; must diff `content` between snapshots instead |
-| Sources | expects `done.sources`; backend delivers citations inside `sub_processes[].metadata_map.sub_question.citations` |
-| Error handling | `es.onerror` fires the generic "Stream interrupted"; EventSource cannot inspect HTTP status |
-| Transport choice | `EventSource` cannot send `Accept: text/event-stream` or auth headers; a `fetch` + `ReadableStream` reader is more flexible (the README even claims this, but the code does not do it) |
-
-### What a correct adapter must do
-
-1. `fetch(`${BASE_URL}/api/conversation/${id}/message?user_message=${encodeURIComponent(q)}`,
-   { headers: { Accept: "text/event-stream" } })`, then parse `data: ` lines from
-   `response.body.getReader()` (handle `\r\n`, blank-line frame boundaries, `:` comment pings).
-2. Maintain `prevContent`; emit `onToken(snapshot.content.slice(prevContent.length))`.
-3. Map each `sub_processes[]` entry to the UI step model
-   (`source` → `llm|retrieval|rerank|parser`, `status PENDING/FINISHED` → `running/completed`),
-   keying steps by `event_id`, since the backend re-sends the whole array each frame.
-4. Flatten citations from every `sub_question` into `Source[]` with a stable `index` (1-based) and
-   attach them on `onDone`.
-5. Persist nothing locally: after `onDone`, `GET /api/conversation/{id}` gives the canonical,
-   reload-safe thread (the mock store keeps conversations in memory only).
+Non-2xx responses are parsed as `ApiError`; a dropped stream performs one `GET /conversation/{id}`
+rehydrate with `Last-Event-ID` instead of re-POSTing the question. The store always rehydrates the
+canonical thread after `onDone`/`onError`. `MockTransport` emits the same snapshots but only when
+`VITE_USE_MOCK=1`.
 
 ---
 
@@ -172,18 +155,15 @@ returns a cancel closure. That is the code path in production today (`USE_MOCK =
 
 | Handler | Mutation |
 |---|---|
-| `onUserMessage` | append `msg`, set conversation `updated_at` |
-| `onAssistantCreated` | append placeholder |
-| `onSubProcess` | find the message containing `stepId`, `{...step, ...patch}` |
-| `onToken` | last assistant message: `status="streaming"`, `content += token` |
-| `onDone` | last assistant message: `status="completed"`, replace content, set `sources`, clear streaming/cancel |
-| `onError` | `status="failed"`, toast, clear streaming/cancel |
+| `onUserMessage` | append the optimistic user message |
+| `onSnapshot` | replace the last assistant message with the full mapped snapshot |
+| `onAssistantCreated` / `onSubProcess` / `onToken` | compatibility path for handlers without `onSnapshot` |
+| `onDone` | mark completed, set final content/sources, clear streaming/cancel, GET canonical thread |
+| `onError` | mark failed, toast, clear streaming/cancel, GET canonical thread |
 
-`patchConversation` always returns a **new** array sorted by `updated_at` desc. Token patches run
-per chunk (1-2 chars), so this is the hottest React path in the app — keep the reducer shallow.
-
-`stopStreaming()` calls the returned cancel closure and clears `streaming`; the partially rendered
-message stays.
+`onSnapshot` is batched with `requestAnimationFrame`, so one SSE frame causes at most one React state
+patch; terminal snapshots flush immediately. `stopStreaming()` aborts the fetch, keeps the partial
+answer and reloads the persisted thread.
 
 ---
 

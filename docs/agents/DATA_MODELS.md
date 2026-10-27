@@ -240,47 +240,42 @@ chunk_overlap=10)` (`chat/constants.py:25`, applied in `llama_index_settings.py:
 
 ## 7. Frontend domain types (`frontend/src/lib/types.ts`)
 
-⚠ Lines 1-4 open a `/**` comment that is only closed on line 22, so the first four exported
-types are commented out and do not exist at runtime/typecheck
-(see `AGENTS.md §14.A`).
+M2 keeps these UI shapes intentionally stable; `npm run typecheck` is green. `frontend/src/lib/wire.ts`
+maps every backend DTO into them.
 
 | Type | Shape |
 |---|---|
 | `NSEDocumentType` | `annual_report \| quarterly_results \| concall_transcript \| investor_presentation \| shareholding_pattern \| corporate_announcement` |
 | `DocumentStatus` | `uploading \| parsing \| chunking \| embedding \| indexing \| ready \| failed` |
 | `DocumentMetadata` | `company_name, nse_symbol, document_type, fiscal_year, period, pages, file_size, language` |
-| `FinDocument` | `id, filename, status, progress, metadata, uploaded_at` |
+| `FinDocument` | `id, filename, status, progress, metadata, uploaded_at, url?, error?` |
 | `SubProcessSource` | `llm \| retrieval \| rerank \| parser` |
 | `SubProcessStatus` | `pending \| running \| completed \| failed` |
 | `MessageSubProcess` | `id, name, source, status, detail?, duration_ms?` |
 | `MessageRole` / `MessageStatus` | `user\|assistant` / `pending\|processing\|streaming\|completed\|failed` |
 | `Source` | `index, document_id, page, excerpt, score` |
 | `ChatMessage` | `id, conversation_id, role, content, status, sub_processes, sources, created_at` |
-| `Conversation` | `id, title, document_scope[], messages[], created_at, updated_at` |
-| `ConversationCreate` | `title, document_scope?` |
+| `Conversation` | `id, title, document_scope[], messages[], created_at, updated_at, message_count?, preview?` |
+| `ConversationCreate` / `ConversationUpdate` | `title, document_scope?` |
 | `DocumentUploadResponse` | `{ document: FinDocument }` |
-| `HealthResponse` | `status: healthy \| degraded \| down` |
+| `HealthResponse` | `status: healthy \| degraded \| down` plus optional M1 fields |
 | `View` | `chat \| library` |
 
-### 7.1 Backend ⇄ frontend mismatch matrix (must be bridged before real mode)
+### 7.1 Backend ⇄ frontend mapping (M2 `wire.ts`)
 
-| Concept | Backend | Frontend |
+| Concept | Backend DTO | Domain rule |
 |---|---|---|
-| Document id field | `Document.id` (UUID) | `FinDocument.id` (string, often `doc_*` mock ids) |
-| Filename | `metadata_map.original_filename` | `FinDocument.filename` |
-| Company ticker | `nse_document.company_symbol` | `metadata.nse_symbol` |
-| Financial year | `nse_document.financial_year` | `metadata.fiscal_year` (e.g. `"FY2023-24"`) |
-| Document type values | `financial_results`, `corporate_filing`, `investor_presentation`, `other` | `quarterly_results`, `concall_transcript`, `shareholding_pattern`, `corporate_announcement` |
-| Page count / file size / period | not stored | `metadata.pages`, `metadata.file_size`, `metadata.period` |
-| Indexing status | implicit (`status:"indexed"` on upload; no polling endpoint) | 7-state `DocumentStatus` driven by the mock pipeline |
-| Message status | `PENDING \| SUCCESS \| ERROR` | `pending \| processing \| streaming \| completed \| failed` |
-| Sub-process shape | `{message_id, source: CBEventType, status: PENDING\|FINISHED, metadata_map}` | `{id, name, source: llm\|retrieval\|rerank\|parser, status: pending\|running\|completed\|failed, detail?, duration_ms?}` |
-| Citations | `metadata.sub_question.citations[{document_id,text,page_number,score}]` | top-level `ChatMessage.sources[{index,document_id,page,excerpt,score}]` |
-| Conversation create | `{document_ids: [uuid]}` | `{title, document_scope: [id]}` |
-| Conversation title | not persisted | client-side only |
-| SSE frames | unnamed events, full `Message` JSON | expects `sub_process` / `delta` / `done` events |
-
-A mapper module is required (the README's `lib/backend.ts` does not exist).
+| Filename | `metadata_map.original_filename` / nse metadata / URL | `FinDocument.filename` |
+| Company ticker | `nse_document.company_symbol` | `metadata.nse_symbol ?? "—"` |
+| Financial year | `nse_document.financial_year` | `normaliseFiscalYear()` → `FY2024-25` |
+| Document type | M1 enum incl. legacy values | `financial_results→quarterly_results`, `corporate_filing/other→corporate_announcement` |
+| Page count / size / period | `page_count`, `file_size`, `report_date` | `metadata.pages/file_size/period`, `0`/"—" when unknown |
+| Indexing status | `uploaded…ready/failed` | `uploaded→uploading`, others direct, unknown→uploading |
+| Message status | `PENDING \| SUCCESS \| ERROR` | `streaming`/`processing`, `completed`, `failed` |
+| Trail source | LlamaIndex `CBEventType` | `RETRIEVE/SUB_QUESTION→retrieval`, `LLM/SYNTHESIZE→llm`, `RERANK→rerank`, unknown→parser |
+| Citations | `message.sources` or `metadata.sub_question.citations` | deduplicated 1-based `Source[]`; `score` defaults to 0 |
+| Conversation create/update | `{document_ids, title}` | `{title, document_scope}` |
+| SSE frames | unnamed events, full `Message` JSON | `toChatMessage()` snapshot replacing state |
 
 ---
 
@@ -291,7 +286,8 @@ A mapper module is required (the README's `lib/backend.ts` does not exist).
 2. `cd backend && uv run alembic revision --autogenerate -m "…"` — review the generated file:
    enum changes and `server_default` edits are frequently missed.
 3. `uv run alembic upgrade head`; `uv run alembic heads` must show exactly one head.
-4. Update `app/schema.py` if the API shape changes; update `frontend/src/lib/types.ts` to match.
+4. Update `app/schema.py` if the API shape changes; update `frontend/src/lib/wire.ts` (and `types.ts`
+   only when the UI domain itself changes). Keep DTO names out of components.
 5. Update `docs/agents/DATA_MODELS.md` (this file) in the same commit.
 6. If the change affects vector metadata (`db_document_id`, `page_label`), plan a re-index.
 7. Remember `_bootstrap()` refuses to start when the DB is not at head — deploy migrations

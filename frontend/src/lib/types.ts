@@ -1,9 +1,8 @@
 /**
  * Domain types
  *
- * These are the shapes the UI renders. They are intentionally *not* the wire
- * shapes: `src/lib/api.ts` (and, from M2 on, `src/lib/wire.ts`) is the only
- * place allowed to translate API payloads into these types.
+ * These are the shapes the UI renders. The wire DTOs live in `wire.ts` and
+ * `transport.ts`; UI components must never consume API payloads directly.
  */
 
 export type NSEDocumentType =
@@ -22,6 +21,22 @@ export type DocumentStatus =
   | "indexing"
   | "ready"
   | "failed";
+
+/** The minimum file shape the upload UI and mock transport need. */
+export interface UploadableFile {
+  name: string;
+  size: number;
+  type: string;
+}
+
+/** Optional multipart fields accepted by POST /api/document/upload. */
+export interface DocumentUploadMetadata {
+  company_name?: string;
+  company_symbol?: string;
+  financial_year?: string;
+  document_type?: NSEDocumentType;
+  exchange?: string;
+}
 
 /** DocumentMetadataKeysEnum */
 export interface DocumentMetadata {
@@ -43,6 +58,9 @@ export interface FinDocument {
   progress: number; // 0..100 for upload
   metadata: DocumentMetadata;
   uploaded_at: string;
+  /** Present on M1 API documents; mock documents omit these two fields. */
+  url?: string;
+  error?: string | null;
 }
 
 /** MessageSubProcessSourceEnum */
@@ -98,6 +116,9 @@ export interface Conversation {
   messages: ChatMessage[];
   created_at: string;
   updated_at: string;
+  /** Set by GET /api/conversation/ summaries; hydrated threads use messages.length. */
+  message_count?: number;
+  preview?: string | null;
 }
 
 /** ConversationCreate */
@@ -106,13 +127,23 @@ export interface ConversationCreate {
   document_scope?: string[];
 }
 
-/** DocumentUploadResponse */
+/** ConversationUpdate */
+export interface ConversationUpdate {
+  title?: string;
+  document_scope?: string[];
+}
+
+/** DocumentUploadResponse (normalised from the M1 API's bare Document DTO) */
 export interface DocumentUploadResponse {
   document: FinDocument;
 }
 
 export interface HealthResponse {
   status: "healthy" | "degraded" | "down";
+  db?: boolean;
+  vector_store?: boolean | null;
+  version?: string;
+  uptime_s?: number;
 }
 
 export type View = "chat" | "library";

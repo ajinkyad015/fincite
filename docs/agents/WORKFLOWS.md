@@ -5,10 +5,10 @@ End-to-end traces for the five flows that matter. Line references are to the cur
 
 | # | Flow | Entry point | Exit |
 |---|---|---|---|
-| W1 | Upload & index a filing | `POST /api/document/upload` | 201 `DocumentUploadResponse` |
+| W1 | Upload & index a filing | `POST /api/document/upload` | 202 `DocumentUploadResponse`, then polled `ready` |
 | W2 | Create a scoped conversation | `POST /api/conversation/` | `Conversation` with linked documents |
-| W3 | Ask a question (streamed RAG) | `GET /api/conversation/{id}/message` | SSE frames → persisted messages |
-| W4 | Frontend question (mock transport) | `Composer.submit` | rendered answer + research trail + sources |
+| W3 | Ask a question (streamed RAG) | `POST /api/conversation/{id}/message` | SSE frames → persisted messages |
+| W4 | Frontend question (real; demo mirrors it) | `Composer.submit` | rendered answer + research trail + sources |
 | W5 | Deploy bootstrap | `uv run start` | uvicorn serving N workers |
 
 ---
@@ -236,49 +236,39 @@ uvicorn reload.
 
 ---
 
-## W4 — Frontend question flow (mock transport)
+## W4 — Frontend question flow (M2 real transport)
 
 ```
-Composer.submit                                              Composer.tsx:36
-  └─ store.send(q)                                           store.tsx:175
-       ├─ guard: q non-empty && !streaming
-       ├─ setStreaming(true); setView("chat"); setSelectedSource(null)
-       ├─ if no activeId: api.createConversation({title: first 46 chars})
-       │     → prepend to conversations, setActiveId
-       └─ api.streamMessage(cid, q, handlers)                lib/api.ts:195
-            MockTransport.streamMessage:
-              pickAnswer(q, scopedDocs)   ← ANSWER_BANK regex match or generic fallback
-              after(0)    onUserMessage
-              after(240)  onAssistantCreated (4-step plan, all "pending")
-              per step:   onSubProcess running → onSubProcess completed(+detail,duration)
-              then tokens (~12-26 ms, 1-2 chars each) → onToken
-              final:      onSubProcess last step completed → onDone({content, sources})
+Composer.submit → store.send(q)
+  ├─ guard: q non-empty && !streaming
+  ├─ boot state already has GET /api/conversation/ summaries + active-thread rehydration
+  ├─ if no activeId: POST /api/conversation/ {title, document_ids: []}
+  └─ transport.streamMessage(cid, q, handlers)
+       ├─ POST /api/conversation/{cid}/message {content: q}
+       ├─ fetch + ReadableStream reader (Accept: text/event-stream)
+       ├─ consume unnamed data: frames (also tolerates named frames / : pings)
+       ├─ wire.toChatMessage(snapshot) → onSnapshot + legacy callbacks
+       └─ terminal SUCCESS/ERROR → onDone/onError → GET /api/conversation/{cid}
 ```
 
 Store reactions:
 
 | Handler | Effect |
 |---|---|
-| `onUserMessage` | append user message, bump `updated_at` |
-| `onAssistantCreated` | append assistant placeholder (`status: processing`) |
-| `onSubProcess` | find the message owning `stepId`, merge patch into that step |
-| `onToken` | patch the **last** assistant message: `status: "streaming"`, `content += token` |
-| `onDone` | set `status: "completed"`, replace content, attach `sources`, `setStreaming(false)` |
-| `onError` | `status: "failed"`, toast "Answer interrupted" |
+| `onUserMessage` | optimistic append; replaced by canonical rehydration |
+| `onSnapshot` | rAF-batched replacement of the assistant message (terminal flushes immediately) |
+| `onAssistantCreated` / `onSubProcess` / `onToken` | compatibility callbacks for handlers without snapshots |
+| `onDone` | completed status, final content/sources, clear stream, rehydrate canonical thread |
+| `onError` | failed status, toast, clear stream, rehydrate canonical thread |
 
-Rendering:
+Rendering is unchanged: `MessageItem` shows the trail/stream/markdown and sources, `CiteMarkdown`
+opens `SourceDrawer`, and the drawer now links to `/api/document/{id}/file#page=N` for the original
+PDF. `ResearchTrail` auto-collapses after the final step. `VITE_USE_MOCK=1` runs the same snapshot
+sequence from `ANSWER_BANK` instead of HTTP.
 
-1. `MessageItem` (`components/MessageItem.tsx:11`) — user bubble right-aligned; assistant block
-   with brand row, `ResearchTrail` (while steps exist), streaming text (`.stream-caret`) or
-   `CiteMarkdown`, then the "Grounded sources" grid, then copy-answer.
-2. `CiteMarkdown` rewrites `[1]` → `[1](#cite-1)` and renders `#cite-*` links as buttons calling
-   `openSource`.
-3. `SourceDrawer` shows the cited passage, document monogram, page and score; "open in library"
-   sets `libraryOpenDocId` and switches view, where `DocDetailDrawer` opens automatically.
-4. `ResearchTrail` auto-collapses 1.4 s after the last step completes (`ResearchTrail.tsx:43`).
-
-**Stop button:** `store.stopStreaming()` calls the cancel closure returned by
-`api.streamMessage`, clears `streaming`, leaves the partial message in place.
+**Stop button:** `store.stopStreaming()` aborts the fetch, clears `streaming`, keeps the partial
+message and reloads the persisted thread. backend continues/terminates per its durable partial
+logic.
 
 ---
 

@@ -16,7 +16,8 @@ output; ❌ marks commands that currently fail (see `AGENTS.md §14`).
 | Supabase project | — | Storage bucket (default `annual-reports`) + service-role key |
 | Model API key | — | default provider: https://build.nvidia.com — sign in, open any model, "Get API Key" (`nvapi-…`). Any OpenAI-compatible endpoint works (set `NVIDIA_BASE_URL`); no API key is needed for an unauthenticated local server — use any non-empty string. |
 
-There is no `Makefile`, no `justfile`, no CI workflow, and no task runner.
+There is no `Makefile`, `justfile`, or task runner. `.github/workflows/ci.yml` runs backend pytest,
+frontend typecheck and both frontend builds on pushes/PRs.
 
 ---
 
@@ -84,27 +85,19 @@ still requires real Supabase credentials even in local mode.
 
 ```bash
 cd frontend
-npm ci          # ✅ 6-7 s
-npm run dev     # vite dev server (default http://localhost:5173)
-npm run build   # ✅ single-file dist/index.html (~622 kB, ~189 kB gzip)
-npm run preview # serve the built file
+npm ci               # ✅ pinned dependencies
+npm run dev          # live API via the same-origin /api proxy (default)
+npm run dev:mock     # explicit seeded demo, no backend
+npm run typecheck    # ✅ 0 errors
+npm run build        # ✅ single-file dist/index.html (real mode)
+npm run build:demo   # ✅ single-file build with VITE_USE_MOCK=1
+npm run preview      # serve the built file
 ```
 
-Only three scripts exist (`dev`, `build`, `preview`). The README mentions `dev:mock`,
-`typecheck` and `check:adapter` — **they do not exist**.
-
-**Current mode:** `frontend/src/lib/api.ts:32` `export const USE_MOCK = true;` — the UI runs
-entirely on `lib/mockData.ts` (5 seeded filings, 4 canned Q&A banks). No backend is contacted, so
-`npm run dev` alone gives a fully interactive demo. Flipping the constant to `false` exposes an
-incomplete `RealTransport` (§`API_REFERENCE.md §6`) — do not ship that.
-
-**If you need a live dev proxy** (it does not exist yet), add to `vite.config.ts`:
-
-```ts
-server: { proxy: { "/api": { target: "http://localhost:8000", changeOrigin: true } } }
-```
-
-and then switch `BASE_URL` to `""`/relative so the browser calls the same origin.
+**Current mode (M2):** `USE_MOCK` defaults to false. `VITE_API_URL` defaults to `""`, so the Vite
+proxy forwards `/api/*` to `VITE_PROXY_TARGET` (default `http://127.0.0.1:8000`). `wire.ts` and
+`transport.ts` implement the M1 contract; no source edits are needed to switch between real and demo
+mode.
 
 ---
 
@@ -123,14 +116,16 @@ The old pydantic protected-namespace notice (from `llama-index-llms-nvidia`'s `M
 both clients are now constructed and validated from config.
 
 ```bash
-cd frontend && npx tsc --noEmit
+cd frontend && npm run typecheck
+cd frontend && npm run build
+cd frontend && npm run build:demo
 ```
 
-❌ Observed: **5 errors** — `types.ts` has an unterminated leading comment (swallows four type
-exports) plus one unused import in `Sidebar.tsx`. Fix those two files before trusting typecheck.
-
-There is **no** frontend test runner, no integration test, no evaluation harness for answer
-quality (the README lists the latter as roadmap).
+✅ Observed 2026-10-27: **0 typecheck errors**, both builds succeed. The M2 mapper/SSE adapter was
+also exercised with a temporary Node harness; there is still no committed frontend test runner, no
+automated browser E2E test, and no answer-quality evaluation harness. Use
+`./scripts/smoke.sh <base-url> <real.pdf>` against a configured live backend for the end-to-end
+contract.
 
 ---
 
@@ -219,12 +214,13 @@ port is published on `127.0.0.1:8000` only.
 **Backend only, no frontend** — Swagger at `http://localhost:8000/api/docs`; use
 `/test_message` (SSE is not rendered) or `curl -N` on `/message`.
 
-**Frontend only, no backend** — `npm run dev`; everything is mock (`USE_MOCK = true`), including
-uploads (simulated 4-stage pipeline) and health (`healthy`).
+**Frontend only, no backend** — `npm run dev:mock`; everything is seeded demo data
+(`VITE_USE_MOCK=1`), including uploads (simulated 4-stage pipeline) and health (`healthy`).
 
-**Full stack with a remote DB** — set `.env` to the Supabase pooled connection string, run
-`uv run alembic upgrade head` once, `uv run start`, then either fix `RealTransport` or keep using
-the mock UI for screenshots.
+**Full stack with a remote DB** — set `backend/.env` to the Supabase pooled connection string, run
+`uv run alembic upgrade head` once, `uv run start`, then `npm run dev` (or `npm run dev:real`). The
+UI uses real documents, conversations, POST SSE, citations and PDF links. Run
+`./scripts/smoke.sh http://localhost:8000 path/to/filing.pdf` for a CLI contract check.
 
 **Preview build** — `npm run build` produces one self-contained `dist/index.html` you can serve
 from any static host. Fonts are still loaded from `fonts.googleapis.com` (`index.html`), so an
@@ -247,7 +243,7 @@ offline environment falls back to Georgia/system fonts.
 | `LLMMetadata: 2 validation errors … is_chat_model / is_function_calling_model … input_value=None` on first message | a client inferred capabilities from a frozen model table (pre-Oct-2026 `llama-index-llms-nvidia`) or a metadata field is `None` | use the current `OpenAILike` factory and set `NVIDIA_CHAT_IS_CHAT_MODEL` / `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL` explicitly in `.env`; both must be `true`/`false`, never blank |
 | `sqlalchemy.exc.MissingGreenlet` in `crud.finalise_message` / final answer stuck in PENDING | an ORM attribute was read after `commit()` (implicit lazy load in async code) | keep `SessionLocal(expire_on_commit=False)`; use the `message_id` argument and copied scalars (`assistant_id`, `created_at`), never `message.<attr>` after commit |
 | Answers have no citations | nodes missing `db_document_id`/`page_label`, or doc not indexed | re-upload; verify with the SQL above |
-| Deleting a thread 500s | FK violation (no cascade) | see `AGENTS.md §14.E` |
-| `tsc` errors about `FinDocument` | broken comment in `types.ts` | close the `/**` on line 1-4 |
-| Frontend shows data that does not exist in the DB | mock transport | expected (`USE_MOCK = true`) |
+| Deleting a thread 500s | regression in cascade delete | see `AGENTS.md §14.E`; M1 fixed this |
+| `tsc` errors about `FinDocument` | regression in `types.ts` or a new mapper | run `npm run typecheck`; the M0 broken comment is fixed |
+| Frontend shows seeded data that does not exist in the DB | explicit demo mode | expected only with `VITE_USE_MOCK=1`; otherwise check `/api` proxy/backend |
 | Vite build enormous | `viteSingleFile()` inlines everything | expected by design |

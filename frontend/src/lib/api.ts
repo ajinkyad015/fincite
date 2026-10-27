@@ -1,71 +1,59 @@
 /**
- * fincite API client
+ * fincite API facade
  * ------------------
- * Mirrors the FastAPI backend contract exactly:
+ * `MockTransport` remains an explicit demo mode. `RealTransport` in
+ * `transport.ts` speaks the M1 contract (fetch, POST SSE, PATCH, thread list).
+ * `wire.ts` is the only place DTOs are translated to UI domain objects.
  *
- *   GET    /api/health/
- *   POST   /api/conversation/
- *   GET    /api/conversation/{id}
- *   DELETE /api/conversation/{id}
- *   GET    /api/conversation/{id}/message          (streamed answer)
- *   GET    /api/conversation/{id}/test_message
- *   POST   /api/document/upload
- *   GET    /api/document/
- *   GET    /api/document/{id}
+ *   VITE_USE_MOCK=1  → in-memory demo transport (default off)
+ *   VITE_USE_MOCK=0  → real backend (also the default)
  *
- * Transport selection is environment-driven (see M0 of
- * docs/plans/connect-and-deploy.md):
- *
- *   VITE_USE_MOCK=1  → in-memory demo transport (seeded corpus, canned answers)
- *   VITE_USE_MOCK=0  → real backend
- *   unset            → mock in `vite dev`, real in a production build
- *
- * VITE_API_URL defaults to "" (same origin) so the Vite dev proxy and the
- * production reverse proxy both work without configuration.
+ * `VITE_API_URL` defaults to "" (same origin), so the Vite dev proxy and a
+ * production reverse proxy work without baking a host into the single-file build.
  */
-
 import type {
   ChatMessage,
   Conversation,
   ConversationCreate,
+  ConversationUpdate,
+  DocumentUploadMetadata,
   DocumentUploadResponse,
   FinDocument,
   HealthResponse,
   MessageSubProcess,
   Source,
+  UploadableFile,
 } from "./types";
 import { ANSWER_BANK, FALLBACK_EXCERPT, SEED_DOCUMENTS, type CannedAnswer } from "./mockData";
 import { nowIso, uid } from "./format";
+import {
+  BASE_URL,
+  RealTransport,
+  createSnapshotAdapter,
+  type ApiTransport,
+  type StreamHandlers,
+} from "./transport";
+
+export { BASE_URL };
+export type { StreamHandlers };
 
 const env = (import.meta as unknown as { env?: Record<string, string | boolean> }).env ?? {};
 
 function resolveUseMock(): boolean {
   const raw = env.VITE_USE_MOCK;
-  if (raw === undefined || raw === "") {
-    // No explicit choice: demo data while developing, real API in a build.
-    return env.DEV === true || env.DEV === "true";
-  }
-  return raw === "1" || raw === "true";
+  return raw === true || raw === "1" || String(raw ?? "").toLowerCase() === "true";
 }
 
-export const USE_MOCK: boolean = resolveUseMock();
-export const BASE_URL: string = (env.VITE_API_URL as string | undefined) || "";
+/** Real API is the default; demo data requires an explicit opt-in. */
+export const USE_MOCK = resolveUseMock();
 
-/* ------------------------------------------------------------------ */
-/*  Streaming handler contract                                         */
-/* ------------------------------------------------------------------ */
-
-export interface StreamHandlers {
-  onUserMessage: (msg: ChatMessage) => void;
-  onAssistantCreated: (msg: ChatMessage) => void;
-  onSubProcess: (stepId: string, patch: Partial<MessageSubProcess>) => void;
-  onToken: (token: string) => void;
-  onDone: (result: { content: string; sources: Source[] }) => void;
-  onError: (message: string) => void;
+/** URL of the backend-proxied original PDF, opened at a cited page. */
+export function documentFileUrl(documentId: string, page: number): string {
+  return `${BASE_URL}/api/document/${encodeURIComponent(documentId)}/file#page=${Math.max(1, page)}`;
 }
 
 /* ================================================================== */
-/*  MOCK TRANSPORT                                                     */
+/*  MOCK TRANSPORT (explicit demo mode)                                */
 /* ================================================================== */
 
 interface PipelineState {
@@ -80,7 +68,7 @@ const STAGE_MS: Record<string, number> = {
   indexing: 1300,
 };
 
-class MockTransport {
+class MockTransport implements ApiTransport {
   documents: FinDocument[];
   pipelines = new Map<string, PipelineState>();
   conversations = new Map<string, Conversation>();
@@ -89,15 +77,13 @@ class MockTransport {
     this.documents = SEED_DOCUMENTS.map((d) => ({ ...d }));
   }
 
-  /* -------- health -------- */
-  health(latencyMs: number): Promise<{ data: HealthResponse; latency: number }> {
+  health(latencyMs = 20): Promise<{ data: HealthResponse; latency: number }> {
     return this.delay(180).then(() => ({
       data: { status: "healthy" },
       latency: Math.max(8, Math.round(latencyMs + Math.random() * 24)),
     }));
   }
 
-  /* -------- documents -------- */
   listDocuments(): Promise<FinDocument[]> {
     return this.delay(320).then(() => this.documents.map((d) => this.refresh(d)));
   }
@@ -133,8 +119,9 @@ class MockTransport {
   }
 
   uploadDocument(
-    file: { name: string; size: number; type: string },
-    onProgress: (pct: number) => void
+    file: UploadableFile,
+    onProgress: (pct: number) => void,
+    metadata: DocumentUploadMetadata = {}
   ): { promise: Promise<DocumentUploadResponse>; cancel: () => void } {
     let cancelled = false;
     const timers: number[] = [];
@@ -158,10 +145,10 @@ class MockTransport {
             progress: 0,
             uploaded_at: nowIso(),
             metadata: {
-              company_name: titleCase(pretty.split(" ").slice(0, 3).join(" ")),
-              nse_symbol: guessSymbol(file.name),
-              document_type: guessType(file.name),
-              fiscal_year: "FY2024-25",
+              company_name: metadata.company_name ?? titleCase(pretty.split(" ").slice(0, 3).join(" ")),
+              nse_symbol: metadata.company_symbol ?? guessSymbol(file.name),
+              document_type: metadata.document_type ?? guessType(file.name),
+              fiscal_year: metadata.financial_year ?? "FY2024-25",
               period: "Unclassified",
               pages: 40 + Math.floor(Math.random() * 220),
               file_size: file.size,
@@ -177,7 +164,29 @@ class MockTransport {
       };
       timers.push(window.setTimeout(tick, 200));
     });
-    return { promise, cancel: () => { cancelled = true; timers.forEach(clearTimeout); } };
+    return {
+      promise,
+      cancel: () => {
+        cancelled = true;
+        timers.forEach(clearTimeout);
+      },
+    };
+  }
+
+  async reindexDocument(id: string): Promise<DocumentUploadResponse> {
+    const doc = this.documents.find((d) => d.id === id);
+    if (!doc) throw new Error("Document not found");
+    doc.status = "parsing";
+    doc.progress = 0;
+    doc.error = null;
+    this.pipelines.set(id, { doc, startedAt: Date.now() });
+    await this.delay(140);
+    return { document: { ...doc } };
+  }
+
+  async deleteDocument(id: string): Promise<void> {
+    this.documents = this.documents.filter((d) => d.id !== id);
+    this.pipelines.delete(id);
   }
 
   /* -------- conversations -------- */
@@ -190,17 +199,35 @@ class MockTransport {
         messages: [],
         created_at: nowIso(),
         updated_at: nowIso(),
+        message_count: 0,
       };
       this.conversations.set(convo.id, convo);
-      return { ...convo };
+      return cloneConversation(convo);
     });
+  }
+
+  listConversations(): Promise<Conversation[]> {
+    return this.delay(120).then(() =>
+      [...this.conversations.values()].map(cloneConversation).sort(byUpdatedAt)
+    );
   }
 
   getConversation(id: string): Promise<Conversation> {
     return this.delay(120).then(() => {
       const c = this.conversations.get(id);
       if (!c) throw new Error("Conversation not found");
-      return { ...c };
+      return cloneConversation(c);
+    });
+  }
+
+  updateConversation(id: string, body: ConversationUpdate): Promise<Conversation> {
+    return this.delay(100).then(() => {
+      const c = this.conversations.get(id);
+      if (!c) throw new Error("Conversation not found");
+      if (body.title !== undefined) c.title = body.title;
+      if (body.document_scope !== undefined) c.document_scope = [...body.document_scope];
+      c.updated_at = nowIso();
+      return cloneConversation(c);
     });
   }
 
@@ -214,9 +241,21 @@ class MockTransport {
     let cancelled = false;
     const after = (ms: number, fn: () => void) =>
       timers.push(window.setTimeout(() => !cancelled && fn(), ms));
+    const start = Date.now();
 
-    const convo = this.conversations.get(conversationId);
+    const convo =
+      this.conversations.get(conversationId) ??
+      ({
+        id: conversationId,
+        title: question.slice(0, 80),
+        document_scope: [],
+        messages: [],
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      } satisfies Conversation);
+    this.conversations.set(conversationId, convo);
     const scoped = this.scopedDocs(convo);
+    const canned = this.pickAnswer(question, scoped);
 
     const userMsg: ChatMessage = {
       id: uid("msg"),
@@ -228,82 +267,111 @@ class MockTransport {
       sources: [],
       created_at: nowIso(),
     };
-
-    const canned = this.pickAnswer(question, scoped);
-    const steps: MessageSubProcess[] = canned.plan.map((p, i) => ({
+    const steps: MessageSubProcess[] = canned.plan.map((p) => ({
       id: uid("sp"),
       name: p.name,
       source: p.source,
-      status: i === 0 ? "pending" : "pending",
+      status: "pending",
     }));
-
-    const assistant: ChatMessage = {
+    let assistant: ChatMessage = {
       id: uid("msg"),
       conversation_id: conversationId,
       role: "assistant",
       content: "",
       status: "processing",
-      sub_processes: steps,
+      sub_processes: steps.map((s) => ({ ...s })),
       sources: [],
       created_at: nowIso(),
     };
 
-    // 1. user message lands immediately
-    after(0, () => h.onUserMessage(userMsg));
+    convo.messages = [...convo.messages, userMsg, assistant];
+    convo.updated_at = userMsg.created_at;
+    convo.message_count = convo.messages.length;
+    h.onUserMessage({ ...userMsg });
 
-    // 2. assistant placeholder, then walk the sub-process plan
-    after(240, () => {
-      h.onAssistantCreated(assistant);
-      let t = 260;
-      steps.forEach((step, i) => {
-        const dur = canned.plan[i].duration_ms || 400;
-        after(t, () => h.onSubProcess(step.id, { status: "running" }));
-        after(t + dur, () =>
-          h.onSubProcess(step.id, {
-            status: "completed",
-            duration_ms: dur,
-            detail: canned.plan[i].detail,
-          })
-        );
-        t += dur;
-      });
-
-      // 3. synthesis streams tokens
-      after(t + 60, () => h.onSubProcess(steps[steps.length - 1].id, { status: "running" }));
-      const tokens = canned.answer.match(/\S+\s*/g) ?? [canned.answer];
-      let i = 0;
-      const synthStart = t + 60;
-      const emit = () => {
-        if (cancelled) return;
-        const burst = 1 + Math.floor(Math.random() * 2);
-        const chunk = tokens.slice(i, i + burst).join("");
-        i += burst;
-        h.onToken(chunk);
-        if (i < tokens.length) {
-          timers.push(window.setTimeout(emit, 12 + Math.random() * 26));
-          return;
-        }
-        const synthMs = Date.now() - start - synthStart;
-        h.onSubProcess(steps[steps.length - 1].id, {
-          status: "completed",
-          duration_ms: Math.max(600, synthMs),
-          detail: `Grounded generation · cited ${canned.sources.length} sources`,
-        });
-        h.onDone({
-          content: canned.answer,
-          sources: canned.sources.map((s, idx) => ({
-            index: idx + 1,
-            document_id: s.doc_id,
-            page: s.page,
-            excerpt: s.excerpt,
-            score: s.score,
-          })),
-        });
+    const adapter = createSnapshotAdapter(h);
+    const sync = (next: ChatMessage) => {
+      assistant = {
+        ...next,
+        sub_processes: next.sub_processes.map((s) => ({ ...s })),
+        sources: next.sources.map((s) => ({ ...s })),
       };
-      after(t + 60, emit);
+      const stored = this.conversations.get(conversationId);
+      if (stored) {
+        const index = stored.messages.findIndex((m) => m.id === assistant.id);
+        if (index >= 0) stored.messages[index] = { ...assistant };
+        else stored.messages.push({ ...assistant });
+        stored.updated_at = nowIso();
+        stored.message_count = stored.messages.length;
+      }
+      adapter.snapshot({ ...assistant });
+    };
+
+    after(0, () => sync(assistant));
+
+    let t = 260;
+    steps.forEach((_, i) => {
+      const dur = canned.plan[i].duration_ms || 400;
+      after(t, () => {
+        steps[i] = { ...steps[i], status: "running" };
+        sync({ ...assistant, sub_processes: [...steps] });
+      });
+      after(t + dur, () => {
+        steps[i] = {
+          ...steps[i],
+          status: "completed",
+          duration_ms: dur,
+          detail: canned.plan[i].detail,
+        };
+        sync({ ...assistant, sub_processes: [...steps] });
+      });
+      t += dur;
     });
 
-    const start = Date.now();
+    after(t + 60, () => {
+      steps[steps.length - 1] = { ...steps[steps.length - 1], status: "running" };
+      sync({ ...assistant, sub_processes: [...steps] });
+    });
+
+    const tokens = canned.answer.match(/\S+\s*/g) ?? [canned.answer];
+    let i = 0;
+    const synthStart = t + 60;
+    const emit = () => {
+      if (cancelled) return;
+      const burst = 1 + Math.floor(Math.random() * 2);
+      const chunk = tokens.slice(i, i + burst).join("");
+      i += burst;
+      sync({ ...assistant, status: "streaming", content: assistant.content + chunk });
+      if (i < tokens.length) {
+        timers.push(window.setTimeout(emit, 12 + Math.random() * 26));
+        return;
+      }
+      const synthMs = Date.now() - start - synthStart;
+      steps[steps.length - 1] = {
+        ...steps[steps.length - 1],
+        status: "completed",
+        duration_ms: Math.max(600, synthMs),
+        detail: `Grounded generation · cited ${canned.sources.length} sources`,
+      };
+      const sources: Source[] = canned.sources.map((s, idx) => ({
+        index: idx + 1,
+        document_id: s.doc_id,
+        page: s.page,
+        excerpt: s.excerpt,
+        score: s.score,
+      }));
+      const final: ChatMessage = {
+        ...assistant,
+        status: "completed",
+        content: canned.answer,
+        sub_processes: [...steps],
+        sources,
+      };
+      sync(final);
+      h.onDone({ content: canned.answer, sources });
+    };
+    after(synthStart, emit);
+
     return () => {
       cancelled = true;
       timers.forEach(clearTimeout);
@@ -320,7 +388,6 @@ class MockTransport {
   private pickAnswer(question: string, scope: FinDocument[]): CannedAnswer {
     const hit = ANSWER_BANK.find((a) => a.patterns.some((p) => p.test(question)));
     if (hit) return hit;
-    // generic grounded fallback across the scoped corpus
     const pool = scope.filter((d) => FALLBACK_EXCERPT[d.id]).slice(0, 2);
     const refs = pool.length ? pool : this.documents.slice(0, 2);
     const cites = refs
@@ -356,6 +423,23 @@ class MockTransport {
   }
 }
 
+function cloneConversation(conversation: Conversation): Conversation {
+  return {
+    ...conversation,
+    document_scope: [...conversation.document_scope],
+    messages: conversation.messages.map((message) => ({
+      ...message,
+      sub_processes: message.sub_processes.map((step) => ({ ...step })),
+      sources: message.sources.map((source) => ({ ...source })),
+    })),
+    message_count: conversation.message_count ?? conversation.messages.length,
+  };
+}
+
+function byUpdatedAt(a: Conversation, b: Conversation): number {
+  return +new Date(b.updated_at) - +new Date(a.updated_at);
+}
+
 function titleCase(s: string): string {
   return s.replace(/\w\S*/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase());
 }
@@ -384,94 +468,26 @@ function guessType(name: string): FinDocument["metadata"]["document_type"] {
   return "corporate_announcement";
 }
 
-/* ================================================================== */
-/*  REAL TRANSPORT (swap-in when the FastAPI server is running)        */
-/* ================================================================== */
-
-class RealTransport {
-  async health() {
-    const t = performance.now();
-    const res = await fetch(`${BASE_URL}/api/health/`);
-    return { data: (await res.json()) as HealthResponse, latency: Math.round(performance.now() - t) };
-  }
-  async listDocuments(): Promise<FinDocument[]> {
-    const res = await fetch(`${BASE_URL}/api/document/`);
-    return res.json();
-  }
-  async getDocument(id: string): Promise<FinDocument> {
-    const res = await fetch(`${BASE_URL}/api/document/${id}`);
-    return res.json();
-  }
-  uploadDocument(file: File, onProgress: (pct: number) => void) {
-    const xhr = new XMLHttpRequest();
-    const promise = new Promise<DocumentUploadResponse>((resolve, reject) => {
-      xhr.open("POST", `${BASE_URL}/api/document/upload`);
-      xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(Math.round((e.loaded / e.total) * 100));
-      xhr.onload = () => resolve(JSON.parse(xhr.responseText));
-      xhr.onerror = () => reject(new Error("Upload failed"));
-      xhr.send(Object.assign(new FormData(), { file }));
-    });
-    return { promise, cancel: () => xhr.abort() };
-  }
-  async createConversation(body: ConversationCreate): Promise<Conversation> {
-    const res = await fetch(`${BASE_URL}/api/conversation/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    return res.json();
-  }
-  async getConversation(id: string): Promise<Conversation> {
-    const res = await fetch(`${BASE_URL}/api/conversation/${id}`);
-    return res.json();
-  }
-  async deleteConversation(id: string): Promise<void> {
-    await fetch(`${BASE_URL}/api/conversation/${id}`, { method: "DELETE" });
-  }
-  /** SSE stream — adjust event names to the backend's emitter */
-  streamMessage(conversationId: string, question: string, h: StreamHandlers): () => void {
-    const es = new EventSource(
-      `${BASE_URL}/api/conversation/${conversationId}/message?q=${encodeURIComponent(question)}`
-    );
-    let acc = "";
-    es.addEventListener("sub_process", (e) => {
-      const d = JSON.parse((e as MessageEvent).data);
-      h.onSubProcess(d.id, d);
-    });
-    es.addEventListener("delta", (e) => {
-      const t = (e as MessageEvent).data;
-      acc += t;
-      h.onToken(t);
-    });
-    es.addEventListener("done", (e) => {
-      const d = JSON.parse((e as MessageEvent).data);
-      h.onDone({ content: acc, sources: d.sources ?? [] });
-      es.close();
-    });
-    es.onerror = () => {
-      h.onError("Stream interrupted");
-      es.close();
-    };
-    return () => es.close();
-  }
-}
-
 /* ------------------------------------------------------------------ */
 
 const mock = new MockTransport();
+const real = new RealTransport();
 
 export const api = {
-  health: () => (USE_MOCK ? mock.health(performance.now() % 30) : new RealTransport().health()),
-  listDocuments: () => (USE_MOCK ? mock.listDocuments() : new RealTransport().listDocuments()),
-  getDocument: (id: string) => (USE_MOCK ? mock.getDocument(id) : new RealTransport().getDocument(id)),
-  uploadDocument: (file: File | { name: string; size: number; type: string }, onProgress: (pct: number) => void) =>
-    USE_MOCK
-      ? mock.uploadDocument(file, onProgress)
-      : new RealTransport().uploadDocument(file as File, onProgress),
+  health: () => (USE_MOCK ? mock.health(performance.now() % 30) : real.health()),
+  listDocuments: () => (USE_MOCK ? mock.listDocuments() : real.listDocuments()),
+  getDocument: (id: string) => (USE_MOCK ? mock.getDocument(id) : real.getDocument(id)),
+  uploadDocument: (file: UploadableFile, onProgress: (pct: number) => void, metadata?: DocumentUploadMetadata) =>
+    USE_MOCK ? mock.uploadDocument(file, onProgress, metadata) : real.uploadDocument(file, onProgress, metadata),
+  reindexDocument: (id: string) => (USE_MOCK ? mock.reindexDocument(id) : real.reindexDocument(id)),
+  deleteDocument: (id: string) => (USE_MOCK ? mock.deleteDocument(id) : real.deleteDocument(id)),
+  listConversations: () => (USE_MOCK ? mock.listConversations() : real.listConversations()),
   createConversation: (body: ConversationCreate) =>
-    USE_MOCK ? mock.createConversation(body) : new RealTransport().createConversation(body),
-  getConversation: (id: string) => (USE_MOCK ? mock.getConversation(id) : new RealTransport().getConversation(id)),
-  deleteConversation: (id: string) => (USE_MOCK ? mock.deleteConversation(id) : new RealTransport().deleteConversation(id)),
+    USE_MOCK ? mock.createConversation(body) : real.createConversation(body),
+  getConversation: (id: string) => (USE_MOCK ? mock.getConversation(id) : real.getConversation(id)),
+  updateConversation: (id: string, body: ConversationUpdate) =>
+    USE_MOCK ? mock.updateConversation(id, body) : real.updateConversation(id, body),
+  deleteConversation: (id: string) => (USE_MOCK ? mock.deleteConversation(id) : real.deleteConversation(id)),
   streamMessage: (conversationId: string, question: string, h: StreamHandlers) =>
-    USE_MOCK ? mock.streamMessage(conversationId, question, h) : new RealTransport().streamMessage(conversationId, question, h),
+    USE_MOCK ? mock.streamMessage(conversationId, question, h) : real.streamMessage(conversationId, question, h),
 };

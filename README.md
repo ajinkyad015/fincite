@@ -298,7 +298,7 @@ fincitee/
 │   │   └── schema.py                #   Pydantic API schemas incl. NSE metadata + citations
 │   ├── alembic/                     #   6 versioned migrations
 │   ├── scripts/                     #   SSE chat CLI, vector-table builder, dedupe tool
-│   ├── tests/                       #   15 unit tests, fully mocked (no DB / API key)
+│   ├── tests/                       #   70 unit tests, fully mocked (no DB / API key)
 │   ├── Dockerfile · docker-compose.yml · pyproject.toml · uv.lock · .env.example
 │
 ├── frontend/                        # React research terminal
@@ -306,7 +306,9 @@ fincitee/
 │   │   ├── App.tsx                  #   shell: ticker · sidebar · views · drawers · splash
 │   │   ├── store.tsx                #   React-context store: docs, threads, streaming, health
 │   │   ├── lib/
-│   │   │   ├── api.ts               #   API facade: MockTransport (active) + RealTransport (incomplete)
+│   │   │   ├── api.ts               #   thin facade: demo transport vs real transport
+│   │   │   ├── transport.ts         #   fetch + POST/ReadableStream SSE client
+│   │   │   ├── wire.ts              #   backend DTO → UI domain mappers
 │   │   │   ├── types.ts             #   domain types
 │   │   │   ├── format.ts            #   labels, formatters
 │   │   │   └── mockData.ts          #   seeded demo corpus + canned answers
@@ -352,9 +354,10 @@ By subsystem:
 | | Docker image + compose with local pgvector | ✅ |
 | | Optional Sentry, configurable CORS, structured logging | ✅ |
 | | OpenAPI / Swagger / ReDoc at `/api/docs`, `/api/redoc` | ✅ |
-| **Frontend** | Research threads, streaming answers, live research trail, citation chips, source drawer | ✅ (demo data) |
-| | Filing library: drag-and-drop upload, search, detail drawer, scoped threads | ✅ |
-| | Mock transport: seeded corpus + canned cited answers, no backend required | ✅ |
+| **Frontend** | Research threads, streaming answers, live research trail, citation chips, source drawer | ✅ (live API) |
+| | Filing library: real PDF uploads, polling, search, detail drawer, scoped threads | ✅ |
+| | Server-backed thread list, reload-safe messages, PATCH scope, real delete errors | ✅ |
+| | Explicit demo transport: seeded corpus + canned cited answers, no backend required | ✅ |
 | | Single-file production build (`dist/index.html`) | ✅ |
 
 ### Try it in the sandbox
@@ -362,8 +365,11 @@ By subsystem:
 Four ways to exercise the system:
 
 ```bash
-# 0. The research terminal (mock mode — no backend required)
+# 0a. The research terminal against the live API (backend + /api proxy required)
 cd frontend && npm ci && npm run dev          # http://localhost:5173
+
+# 0b. The same terminal in explicit demo mode (no backend required)
+cd frontend && npm ci && npm run dev:mock     # http://localhost:5173
 
 # 1. Swagger UI — interactive, every endpoint (use /test_message for a non-streamed answer)
 open http://localhost:8000/api/docs
@@ -410,8 +416,9 @@ cd backend && docker compose up --build
 ```bash
 cd frontend
 npm ci
-npm run dev                    # http://localhost:5173 — demo data (mock transport)
-npm run dev:real               # same UI against the backend via the Vite /api proxy
+npm run dev                    # http://localhost:5173 — live API via the Vite /api proxy
+npm run dev:mock               # explicit demo mode (seeded data, no backend)
+npm run dev:real               # explicitly force live API (same as the default)
 npm run build                  # → dist/index.html, a single static file
 npm run typecheck              # tsc --noEmit (0 errors)
 ```
@@ -420,26 +427,30 @@ Transport selection is environment-driven — no source edits:
 
 | `VITE_USE_MOCK` | Behaviour |
 |---|---|
-| unset | mock while `vite dev`, real API in a production build |
+| unset / `0` | real API (`npm run dev` / `npm run dev:real` / `npm run build`) |
 | `1` | always mock (demo mode, `npm run dev:mock` / `npm run build:demo`) |
-| `0` | always real (`npm run dev:real`) |
 
 `VITE_API_URL` defaults to `""` (same origin), which is what the Vite dev proxy
 (`server.proxy`, target `VITE_PROXY_TARGET`) and the production reverse proxy expect — so CORS is not
 part of local development. See `frontend/.env.example`.
 
-> **Status:** the backend contract is complete and tested (M1), but the UI's `RealTransport` still
-> speaks the pre-M1 protocol (no `POST /message`, no `sources`, no thread list/status polling).
-> Connecting the two is M2 of [`docs/plans/connect-and-deploy.md`](docs/plans/connect-and-deploy.md);
-> until it lands, treat the frontend as a working demo shell.
+> **M2 status:** the real transport uses `POST /message` over fetch/`ReadableStream`, maps unnamed
+> `Message` snapshots in [`frontend/src/lib/wire.ts`](frontend/src/lib/wire.ts), rehydrates the thread
+> list and messages from the server, PATCHes scope, polls real ingestion status, and opens the original
+> PDF at the cited page. Demo mode remains only behind `VITE_USE_MOCK=1`. See
+> [`docs/plans/connect-and-deploy.md`](docs/plans/connect-and-deploy.md).
 
 ### 6.4 Run the tests
 
 ```bash
-cd backend && uv run pytest -q      # 52 passed — no database or API key required
+cd backend && uv run pytest -q      # 70 passed — no database or API key required
 cd frontend && npm run typecheck     # 0 errors
 cd frontend && npm run build         # single dist/index.html
+cd frontend && npm run build:demo    # still typechecks/builds demo mode
 ```
+
+With a running backend and a real PDF, `./scripts/smoke.sh http://localhost:8000 path/to/filing.pdf`
+checks upload → indexing → streaming answer → citation → reload → cleanup.
 
 CI (`.github/workflows/ci.yml`) runs the backend suite, the typecheck, and both the real and demo builds
 on every push, so mock mode cannot rot.
@@ -535,6 +546,8 @@ See [`backend/.env.example`](backend/.env.example) for the fully commented profi
 
 ## 9. Roadmap
 
+- [x] **Frontend connected (M2)** — real POST SSE, server-backed threads, live uploads and citations;
+      demo mode is explicit.
 - [x] **Background indexing** — uploads return 202 and a job reports `status`/`progress`/`error`
       (process-local scheduler; a durable queue is the follow-up).
 - [ ] **Authentication & tenancy** — per-user libraries and threads.

@@ -3,6 +3,9 @@
 React 19 + TypeScript 5.9 (strict) + Vite 7 + Tailwind 4 + framer-motion. No router, no state
 library, no test runner. Builds to a single inlined `dist/index.html` via `vite-plugin-singlefile`.
 
+> **M2 status:** real API mode is the default. `wire.ts` maps M1 DTOs, `transport.ts` handles fetch/SSE,
+> and `store.tsx` is server-backed. The in-memory transport survives only behind `VITE_USE_MOCK=1`.
+
 ---
 
 ## 1. File map
@@ -11,10 +14,12 @@ library, no test runner. Builds to a single inlined `dist/index.html` via `vite-
 |---|---|---|
 | `main.tsx` | 10 | `createRoot` + `StrictMode` |
 | `App.tsx` | 180 | `Shell` (layout, boot splash, health polling, mobile nav), `Splash`, `App` (providers) |
-| `store.tsx` | 392 | the entire app state + `useStore()` |
-| `lib/api.ts` | 460 | `USE_MOCK`, `BASE_URL`, `StreamHandlers`, `MockTransport`, `RealTransport`, `api` facade |
+| `store.tsx` | ~600 | server-backed app state, rAF snapshot batching, polling + `useStore()` |
+| `lib/api.ts` | ~480 | `USE_MOCK`, facade, explicit `MockTransport` |
+| `lib/transport.ts` | ~470 | `BASE_URL`, `StreamHandlers`, real fetch/SSE `RealTransport`, snapshot adapter |
+| `lib/wire.ts` | ~500 | backend DTO types, mappers, `ApiError`, source/trail derivation |
 | `lib/mockData.ts` | 395 | `COMPANY_HUE`, `SEED_DOCUMENTS` (5), `FALLBACK_EXCERPT`, `ANSWER_BANK` (4), `TICKS`, `SUGGESTIONS` |
-| `lib/types.ts` | 114 | domain types (⚠ broken leading comment) |
+| `lib/types.ts` | ~130 | UI domain types |
 | `lib/format.ts` | 85 | `initials`, `timeHM`, `shortDate`, `formatFileSize`, label maps, `uid`, `nowIso` |
 | `utils/cn.ts` | 6 | `clsx` + `tailwind-merge` — **unused** |
 | `index.css` | 121 | `@theme` tokens, grain overlay, scrollbars, `.stream-caret`, markdown rules |
@@ -31,9 +36,9 @@ Components: `ChatView` (306) with `Hero` (103) and `ScopePicker` (198); `Library
 ```ts
 interface Store {
   view; setView; booted; boot;
-  documents; refreshDocuments; uploadFiles; uploading; libraryOpenDocId; setLibraryOpenDocId;
-  conversations; activeId; active; selectConversation; newChat; deleteConversation;
-  setScope; startScopedChat; send; streaming; stopStreaming;
+  documents; refreshDocuments; uploadFiles; retryDocument; uploading; libraryOpenDocId;
+  conversations; refreshConversations; activeId; active; selectConversation; newChat;
+  deleteConversation; renameConversation; setScope; startScopedChat; send; streaming; stopStreaming;
   health; checkHealth;
   selectedSource; openSource; closeSource;
   mobileNav; setMobileNav;
@@ -41,46 +46,44 @@ interface Store {
 }
 ```
 
-Behaviours worth knowing:
-
 | Function | Detail |
 |---|---|
-| `boot()` | `Promise.all([refreshDocuments(), checkHealth()])`, then `booted = true`; `App` also awaits a 1.5 s minimum splash |
-| `refreshDocuments()` | swallows errors and keeps stale state |
-| `watchDocument(id)` | 900 ms `getDocument` poll until `ready`/`failed`; toast on success; map `pollers` prevents duplicates |
-| `uploadFiles(files)` | sequential per file; optimistic `uploading` entry with progress; on success prepend document + start poller; on error keep the row for 3.2 s with the message |
-| `send(q)` | guards `streaming`; creates a conversation when `activeId` is null (title = first 46 chars + `…`); wires the six stream handlers; stores the cancel closure in a ref |
-| `stopStreaming()` | cancels the transport, clears `streaming` |
-| `deleteConversation(id)` | calls the API, ignores failures ("local delete anyway"), always removes locally |
-| `setScope(id, docIds)` | patches `document_scope` (client-side only; the backend has no scope update endpoint) |
-| `startScopedChat(doc)` | creates a thread titled `SYMBOL · doc type` with `document_scope: [doc.id]`, switches to chat |
-| `checkHealth()` | `api.health()` → `{status, latency}`; catch → `"down"` |
+| `boot()` | health + documents + `GET /api/conversation/` in parallel; restores `lastThreadId` from `localStorage` only if still present, then `GET /api/conversation/{id}` |
+| `refreshConversations()` | maps thread summaries to domain `Conversation`s and preserves already-hydrated messages |
+| `loadConversation(id)` | fetches a full thread; a 15 s cache avoids refetch storms |
+| `watchDocument(id)` | `getDocument` polling with 500 ms → 5 s backoff until `ready`/`failed`; real `error` is toasted |
+| `uploadFiles(files, metadata?)` | requires real `File` bytes in live mode, sends optional multipart metadata, prepends the server DTO and starts polling |
+| `send(q)` | creates `{title, document_ids}` when needed, then consumes `onSnapshot` via one `requestAnimationFrame` batch per frame; rehydrates canonical messages on done/error |
+| `stopStreaming()` | aborts the fetch stream, keeps the partial answer, and reloads the persisted thread |
+| `deleteConversation(id)` | awaits DELETE, surfaces failures, and only removes locally on success |
+| `setScope(id, docIds)` | optimistic `PATCH {document_ids}` with rollback on failure |
+| `checkHealth()` | `api.health()` → `{status, latency}`; catch → `"down"` and an App retry banner |
 
-`active` is derived with `useMemo`. Conversations are **not** rehydrated from `GET
-/api/conversation/{id}` anywhere — `api.getConversation` is exported but unused.
+`active` is derived with `useMemo`. On every terminal stream event the store calls
+`GET /api/conversation/{id}`, so React state is a view of the database.
 
 ---
 
-## 3. Transport (`lib/api.ts`)
+## 3. Transport (`lib/api.ts`, `lib/transport.ts`, `lib/wire.ts`)
 
 ```ts
-export const USE_MOCK = true;                                   // hardcoded
-export const BASE_URL = (import.meta as any).env?.VITE_API_URL ?? "http://localhost:8000";
-export const api = { health, listDocuments, getDocument, uploadDocument,
-                     createConversation, getConversation, deleteConversation, streamMessage };
+export const USE_MOCK = env.VITE_USE_MOCK === "1"; // real API by default
+export const BASE_URL = env.VITE_API_URL ?? "";    // same-origin /api
+export const api = { health, listDocuments, getDocument, uploadDocument, reindexDocument,
+                     deleteDocument, listConversations, createConversation, getConversation,
+                     updateConversation, deleteConversation, streamMessage };
 ```
 
-`MockTransport`: `SEED_DOCUMENTS` clone; `STAGE_MS = {parsing:1500, chunking:1700,
-embedding:1600, indexing:1300}`; `refresh()` advances a document based on elapsed wall time;
-`uploadDocument` ticks progress with `setTimeout`; `pickAnswer` regex-matches `ANSWER_BANK`
-(`reliance_revenue`, `it_margins`, `hdfc_asset_quality`, `itc_fmcg`) or builds a grounded-sounding
-fallback from `FALLBACK_EXCERPT`; `streamMessage` emits a 4-step plan then tokens.
+`RealTransport` uses `fetch` and a `ReadableStream` reader for `POST /message`; `consumeSseFrames()`
+handles unnamed frames, CRLF, comments and named frames. `createSnapshotAdapter()` emits both
+`onSnapshot` and the legacy token/trail callbacks. A dropped stream performs one `GET` rehydrate with
+`Last-Event-ID` rather than a duplicate POST. Uploads use XHR only to retain progress events.
 
-`RealTransport`: see `../API_REFERENCE.md §6` — incomplete/mismatched.
+`wire.ts` maps `Document`, `ConversationSummary`, `Conversation`, and `Message` DTOs; derives citations
+from old trail metadata when `sources` is absent; normalises fiscal years, statuses, document types and
+`CBEventType` names; and centralises friendly FastAPI errors via `ApiError`.
 
-**To add a real mode**, prefer a new `lib/wire.ts` mapper module + a rewritten `RealTransport`,
-keeping the `StreamHandlers` interface so `store.tsx` does not change. Do not silently flip
-`USE_MOCK`.
+`MockTransport` remains for explicit demo mode and now emits the same full snapshots as the real path.
 
 ---
 
@@ -94,12 +97,12 @@ keeping the `StreamHandlers` interface so `store.tsx` does not change. Do not si
 | `MessageItem` | `message, documents` | `openSource` | `openSource` |
 | `ResearchTrail` | `steps: MessageSubProcess[]` | — | local `open` state; auto-collapse |
 | `CiteMarkdown` | `content, onCite(n)` | — | `onCite` |
-| `SourceDrawer` | — | `selectedSource, documents, closeSource, setView, setLibraryOpenDocId` | view switch |
+| `SourceDrawer` | — | `selectedSource, documents, closeSource, setView, setLibraryOpenDocId` | PDF page link, view switch |
 | `LibraryView` | — | `documents, uploadFiles, uploading, setLibraryOpenDocId, refreshDocuments` | uploads |
 | `DocRow` / `StatusPill` | `doc` (+`processing`) | — | `onOpen` |
 | `UploadDrawer` | `open, onClose` | `uploadFiles, uploading` | uploads |
 | `DocDetailDrawer` | — | `libraryOpenDocId, documents, startScopedChat, uploadFiles` | scoped chat |
-| `Composer` | `centered?` | `send, streaming, stopStreaming, active, documents` | `send` |
+| `Composer` | `centered?` | `send, streaming, stopStreaming, active, documents` plus a per-thread localStorage draft | `send` |
 | `Sidebar` | — | `view, conversations, activeId, documents, health, …` | nav/delete |
 | `Toasts` | — | `toasts, dismissToast` | dismiss |
 | `Ticker` | — | `TICKS` | marquee |
@@ -129,19 +132,16 @@ opacity (multiply). `.stream-caret::after` renders the blinking block cursor whi
 
 ## 6. Frontend gotchas
 
-1. `lib/types.ts:1-4` — unterminated `/**` swallows four type exports; `tsc` cannot resolve
-   `DocumentStatus`/`NSEDocumentType`/`FinDocument`. Fix before any type-sensitive work.
-2. `vite build` still succeeds (esbuild strips types without checking) — never use it as your only
-   gate.
-3. `Sidebar.tsx:3` imports `Activity` but never uses it (`noUnusedLocals` error).
-4. `active.document_scope` is client-only; the backend never learns about scope changes, so a real
-   transport must create a new conversation when the scope changes.
-5. `UploadDrawer` sends only `{name, size, type}` to `uploadFiles` — even in real mode, no NSE
-   metadata is collected (the README claims a metadata form exists).
-6. `DocDetailDrawer`'s "Re-upload a revision" fabricates a fake file object (`reindexed-…`) rather
-   than reading bytes; harmless only because the mock ignores content.
-7. `SourceDrawer`'s "open in library" assumes the source's `document_id` exists in `documents`.
-8. `Analytics` is mounted unconditionally; it is a no-op outside Vercel.
-9. Fonts load from Google Fonts; the app degrades to Georgia/system serif offline.
-10. No persistence: a refresh loses all threads (mock); the planned real mode must hydrate from
-    `GET /api/conversation/{id}` per thread.
+1. `npm run typecheck` is green, but `vite build` alone does not typecheck — keep both in CI.
+2. `wire.ts` is the only place backend field names belong. Components consume `types.ts` domain shapes.
+3. `uploadFiles` needs actual `File`/`Blob` bytes in real mode. Demo-only sample/revision shortcuts are
+   hidden when `USE_MOCK` is false.
+4. Optional upload metadata is accepted by `uploadFiles(files, metadata)`; there is deliberately no M3
+   metadata form yet, so the backend infers company/type from the filename.
+5. A failed document exposes `error` and offers `POST /reindex`; the fake "Re-upload a revision" action
+   is demo-only.
+6. `SourceDrawer` opens `/api/document/{id}/file#page=N` directly and assumes `document_id` is in the
+   current library for its rich header.
+7. `Analytics` is mounted unconditionally; it is a no-op outside Vercel.
+8. Fonts load from Google Fonts; the app degrades to Georgia/system serif offline.
+9. Real mode persists threads server-side; demo mode is intentionally session-only.
