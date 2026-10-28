@@ -8,7 +8,7 @@ change — see ``backend/.env.example`` and ``AGENTS.md`` §10.
 """
 from typing import List, Union, Literal, Optional
 
-from pydantic import AnyHttpUrl, field_validator, model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -106,7 +106,10 @@ class Settings(BaseSettings):
 
     # CORS — JSON-formatted list of origins
     # e.g: '["http://localhost", "http://localhost:3000"]'
-    BACKEND_CORS_ORIGINS: List[AnyHttpUrl | Literal["*"]] = []
+    # NOTE: plain str, NOT AnyHttpUrl — Pydantic normalises AnyHttpUrl by appending
+    # a trailing slash ("http://localhost:5173/") which breaks CORSMiddleware's
+    # exact-match against the browser Origin header ("http://localhost:5173").
+    BACKEND_CORS_ORIGINS: List[str] = []
 
     # Optional observability
     SENTRY_DSN: Optional[str] = None

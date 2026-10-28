@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 _STARTED_AT = time.time()
 
 
-@router.get("/", response_model=schema.HealthResponse)
+@router.get("", response_model=schema.HealthResponse)
+@router.get("/", response_model=schema.HealthResponse, include_in_schema=False)
 async def health(db: AsyncSession = Depends(deps.get_db)) -> schema.HealthResponse:
     """
     Liveness + readiness probe.
