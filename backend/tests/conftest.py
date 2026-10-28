@@ -1,11 +1,11 @@
 """
 pytest configuration — sets required environment variables before any app
-module is imported, so unit tests don't need a real database or Google API key.
+module is imported, so unit tests don't need a real database or NVIDIA API key.
 """
 import os
 
 # Set required env vars before the app settings module is imported
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost:5432/testdb")
-os.environ.setdefault("GOOGLE_API_KEY", "test-key")
+os.environ.setdefault("NVIDIA_API_KEY", "nvapi-test-key")
 os.environ.setdefault("SUPABASE_URL", "https://test.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key")

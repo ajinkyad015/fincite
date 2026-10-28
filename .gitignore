@@ -6,7 +6,10 @@ __pycache__/
 # C extensions
 *.so
 ../frontend/temp/
-
+AGENTS.md
+./docs
+AGENTS.md
+/docs/
 # Distribution / packaging
 .Python
 build/
@@ -157,6 +160,8 @@ adoc/
 # Environments
 .env
 .env.*
+# …but the committed templates are documentation, not secrets
+!.env.example
 .envrc
 .venv
 env/

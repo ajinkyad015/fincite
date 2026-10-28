@@ -1,6 +1,7 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { ArrowUpRight, BookOpen, Quote, X } from "lucide-react";
 import { useStore } from "../store";
+import { USE_MOCK, documentFileUrl } from "../lib/api";
 import { DOC_TYPE_LABEL } from "../lib/format";
 import Monogram from "./Monogram";
 
@@ -138,11 +139,27 @@ export default function SourceDrawer() {
               </div>
             </div>
 
-            <div className="shrink-0 border-t border-line p-4">
+            <div className="shrink-0 space-y-2 border-t border-line p-4">
+              {!USE_MOCK && (
+                <a
+                  href={documentFileUrl(src.document_id, src.page)}
+                  target="_blank"
+                  rel="noreferrer"
+                  aria-label={`Open original PDF at page ${src.page}`}
+                  className="group flex w-full items-center justify-center gap-2 bg-accent px-4 py-3 text-[13px] font-medium text-paper transition-colors hover:bg-accent-deep"
+                >
+                  <BookOpen size={14} />
+                  Open PDF at page {src.page}
+                  <ArrowUpRight
+                    size={13}
+                    className="transition-transform group-hover:-translate-y-0.5 group-hover:translate-x-0.5"
+                  />
+                </a>
+              )}
               <button
                 type="button"
                 onClick={openInLibrary}
-                className="group flex w-full items-center justify-center gap-2 bg-ink px-4 py-3 text-[13px] font-medium text-paper transition-colors hover:bg-accent-deep"
+                className="group flex w-full items-center justify-center gap-2 border border-line bg-ink px-4 py-3 text-[13px] font-medium text-paper transition-colors hover:bg-accent-deep"
               >
                 <BookOpen size={14} />
                 Open filing in library

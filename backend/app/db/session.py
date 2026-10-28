@@ -11,4 +11,13 @@ engine = create_async_engine(
     pool_recycle=3600,  # Recycle connections after 1 hour
     pool_timeout=120,  # Raise an exception after 2 minutes if no connection is available from the pool
 )
-SessionLocal = async_sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = async_sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine,
+    # Async sessions must never lazy-load an expired attribute implicitly:
+    # that does sync IO in an async context and raises MissingGreenlet. Code
+    # that needs fresh values refreshes/re-queries explicitly (see
+    # crud.create_message / crud.finalise_message).
+    expire_on_commit=False,
+)

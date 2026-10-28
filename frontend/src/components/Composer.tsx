@@ -2,10 +2,32 @@ import { useEffect, useRef, useState } from "react";
 import { ArrowUp, CornerDownLeft, Square } from "lucide-react";
 import { useStore } from "../store";
 
+function readDraft(key: string): string {
+  try {
+    return window.localStorage.getItem(key) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeDraft(key: string, value: string): void {
+  try {
+    if (value) window.localStorage.setItem(key, value);
+    else window.localStorage.removeItem(key);
+  } catch {
+    /* storage disabled: the composer still works for this session */
+  }
+}
+
 export default function Composer({ centered = false }: { centered?: boolean }) {
   const { send, streaming, stopStreaming, active, documents } = useStore();
-  const [value, setValue] = useState("");
+  const draftKey = `fincite.draft.${active?.id ?? "new"}`;
+  const [value, setValue] = useState(() => readDraft(draftKey));
   const ref = useRef<HTMLTextAreaElement>(null);
+
+  // Keep one unsent draft per thread across reloads and thread switches.
+  useEffect(() => setValue(readDraft(draftKey)), [draftKey]);
+  useEffect(() => writeDraft(draftKey, value), [draftKey, value]);
 
   // auto-grow
   useEffect(() => {

@@ -12,7 +12,7 @@ Upload PDFs, ask questions in plain English, and get answers that cite the exact
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](backend/pyproject.toml)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](backend/app/main.py)
 [![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.12-6B4FBB)](backend/app/chat/engine.py)
-[![Gemini](https://img.shields.io/badge/Google%20Gemini-LLM%20%2B%20Embeddings-4285F4?logo=google&logoColor=white)](backend/app/llama_index_settings.py)
+[![NVIDIA NIM](https://img.shields.io/badge/NVIDIA%20NIM-LLM%20%2B%20Embeddings-76B900?logo=nvidia&logoColor=white)](backend/app/llama_index_settings.py)
 [![Supabase](https://img.shields.io/badge/Supabase-Postgres%20%2B%20pgvector%20%2B%20Storage-3FCF8E?logo=supabase&logoColor=white)](backend/app/storage/supabase.py)
 [![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/package.json)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)](frontend/tsconfig.json)
@@ -75,7 +75,7 @@ A single research session, end to end:
 ```
 
 1. **Upload** — `POST /api/document/upload` with the PDF and optional NSE metadata (company, ticker, financial year, document type). Duplicates are detected by SHA-256 and returned idempotently.
-2. **Index** — the PDF is stored in Supabase Storage, parsed page-by-page, split into sentence-aware chunks, embedded with Gemini, and written to pgvector with the document ID stamped on every node.
+2. **Index** — the PDF is stored in Supabase Storage, parsed page-by-page, split into sentence-aware chunks, embedded with NVIDIA Nemotron, and written to pgvector with the document ID stamped on every node.
 3. **Ask** — create a conversation over any set of indexed documents, then send a question. The agent decides which documents to consult, breaks the question into per-document sub-questions, retrieves and synthesises.
 4. **Read & verify** — the answer streams token-by-token over Server-Sent Events alongside structured sub-process events, so the UI can render a research trail and clickable `[n]` citations that open the exact passage.
 
@@ -99,13 +99,13 @@ flowchart LR
 
     subgraph Supabase["Supabase"]
         PG[("PostgreSQL<br/>conversations · messages · documents")]
-        VEC[("pgvector<br/>data_pg_vector_store · 3072-d")]
+        VEC[("pgvector<br/>data_pg_vector_store · 2048-d")]
         ST[["Storage bucket<br/>documents/ID/original.pdf"]]
     end
 
-    subgraph Google["Google AI"]
-        LLM["Gemini 1.5 Flash<br/>reasoning · sub-questions · synthesis"]
-        EMB["gemini-embedding-001<br/>3072-d embeddings"]
+    subgraph Nvidia["OpenAI-compatible models (default: NVIDIA NIMs)"]
+        LLM["env-selected chat model<br/>reasoning · sub-questions · synthesis"]
+        EMB["env-selected embedding model<br/>2048-d embeddings"]
     end
 
     UI -- "multipart upload" --> R
@@ -126,7 +126,7 @@ flowchart LR
 |---|---|---|
 | **API** | FastAPI · Pydantic v2 · `sse-starlette` | Async-native, typed request/response models, first-class OpenAPI docs, SSE without WebSockets. |
 | **Orchestration** | LlamaIndex 0.12 (`ReActAgent`, `SubQuestionQueryEngine`, `VectorStoreIndex`) | Battle-tested primitives for agentic RAG; callback system doubles as the observability bus. |
-| **Models** | Google Gemini — `gemini-1.5-flash` (chat) · `gemini-embedding-001` (3072-d) | Fast, inexpensive long-context model for multi-step reasoning; high-dimensional embeddings for dense financial prose. |
+| **Models** | Any OpenAI-compatible endpoint (default NVIDIA NIMs) — chat `meta/llama-3.3-70b-instruct`, embeddings `nvidia/nemotron-3-embed-1b` (2048-d) **by default only** | Model ids, endpoint, key **and declared capabilities** come from `.env`; the generic `OpenAILike` chat client has no hardcoded model table, so newer ids (e.g. `nvidia/nemotron-3.5-bolt-e4b`) work without a code change. |
 | **Data** | PostgreSQL + pgvector (Supabase) · SQLAlchemy 2 async · Alembic | One database for relational state *and* vectors — no separate vector DB to operate; migrations are versioned. |
 | **Object storage** | Supabase Storage | Original PDFs are kept for re-indexing and future viewer features; service-role key stays server-side. |
 | **Frontend** | React 19 · TypeScript (strict) · Vite 7 · Tailwind CSS v4 · Framer Motion | Lightweight, no heavy state library; design-token driven editorial UI. |
@@ -139,7 +139,7 @@ The core of Fincite is a **three-tier query harness** built in [`backend/app/cha
 
 ```
             ┌──────────────────────────────────────────────────────────────────────┐
-  Tier 1    │  ReActAgent  (Gemini · max 6 iterations · system prompt w/ doc list) │
+  Tier 1    │ ReActAgent  (env-selected chat LLM · 6 iterations · system prompt)   │
             │  "Should I use a tool? Which? Is the answer complete?"               │
             └───────────────────────────────┬──────────────────────────────────────┘
                                             │ single tool: document_question_engine
@@ -159,7 +159,7 @@ The core of Fincite is a **three-tier query harness** built in [`backend/app/cha
                                                │
                                    ┌───────────▼───────────┐
                                    │  pgvector (one table) │
-                                   │  cosine · 3072-d      │
+                                   │  cosine · 2048-d      │
                                    └───────────────────────┘
 ```
 
@@ -179,7 +179,7 @@ sequenceDiagram
     participant U as Browser
     participant API as FastAPI · /api/conversation/:id/message
     participant H as handle_chat_message
-    participant A as ReActAgent · Gemini
+    participant A as ReActAgent · Llama 3.3 70B
     participant S as SubQuestionQueryEngine
     participant V as pgvector
     participant DB as PostgreSQL
@@ -215,7 +215,7 @@ PDF bytes ─▶ validate (MIME + %PDF magic) ─▶ SHA-256 dedupe ─▶ UUID
         ─▶ Postgres  document row  { url, metadata_map: { nse_document, content_hash, original_filename } }
         ─▶ PDFReader (page-labelled LlamaIndex Documents, db_document_id stamped)
         ─▶ SentenceSplitter  chunk 512 · overlap 10
-        ─▶ GeminiEmbedding  3072-d
+        ─▶ NVIDIAEmbedding  2048-d
         ─▶ pgvector  data_pg_vector_store
         ─▶ 201 { status: "indexed" }
 ```
@@ -266,7 +266,7 @@ Vectors live alongside in `data_pg_vector_store` (managed by LlamaIndex), linked
 
 ### 3.6 Process model
 
-`uv run start` performs deploy-time bootstrap **once** in the parent process — wait for DB, verify Alembic is at head, `CREATE EXTENSION vector`, create vector tables, pre-fetch NLTK tokenizer data — then launches `uvicorn` with `BACKEND_WORKERS` (default 4) worker processes. Each worker's lifespan only does per-process work: configure Gemini settings off the event loop, open its own connection pools, and close them on shutdown. The vector store deliberately **shares the app's async engine**, so a worker holds one pool, not two.
+`uv run start` performs deploy-time bootstrap **once** in the parent process — wait for DB, verify Alembic is at head, `CREATE EXTENSION vector`, create vector tables, pre-fetch NLTK tokenizer data — then launches `uvicorn` with `BACKEND_WORKERS` (default 4) worker processes. Each worker's lifespan only does per-process work: configure NVIDIA model clients off the event loop, open its own connection pools, and close them on shutdown. The vector store deliberately **shares the app's async engine**, so a worker holds one pool, not two.
 
 ---
 
@@ -278,7 +278,7 @@ fincitee/
 │   ├── app/
 │   │   ├── main.py                  #   bootstrap, lifespan, uvicorn entrypoint
 │   │   ├── core/config.py           #   pydantic-settings; env validation & URL normalisation
-│   │   ├── llama_index_settings.py  #   Gemini LLM + embeddings + SentenceSplitter
+│   │   ├── llama_index_settings.py  #   env-driven chat + embedding factories + SentenceSplitter
 │   │   ├── api/
 │   │   │   ├── api.py               #   router registry (/conversation, /document, /health)
 │   │   │   ├── crud.py              #   async SQLAlchemy data access
@@ -298,7 +298,7 @@ fincitee/
 │   │   └── schema.py                #   Pydantic API schemas incl. NSE metadata + citations
 │   ├── alembic/                     #   6 versioned migrations
 │   ├── scripts/                     #   SSE chat CLI, vector-table builder, dedupe tool
-│   ├── tests/                       #   15 unit tests, fully mocked (no DB / API key)
+│   ├── tests/                       #   70 unit tests, fully mocked (no DB / API key)
 │   ├── Dockerfile · docker-compose.yml · pyproject.toml · uv.lock · .env.example
 │
 ├── frontend/                        # React research terminal
@@ -306,7 +306,9 @@ fincitee/
 │   │   ├── App.tsx                  #   shell: ticker · sidebar · views · drawers · splash
 │   │   ├── store.tsx                #   React-context store: docs, threads, streaming, health
 │   │   ├── lib/
-│   │   │   ├── api.ts               #   API facade: MockTransport (active) + RealTransport (incomplete)
+│   │   │   ├── api.ts               #   thin facade: demo transport vs real transport
+│   │   │   ├── transport.ts         #   fetch + POST/ReadableStream SSE client
+│   │   │   ├── wire.ts              #   backend DTO → UI domain mappers
 │   │   │   ├── types.ts             #   domain types
 │   │   │   ├── format.ts            #   labels, formatters
 │   │   │   └── mockData.ts          #   seeded demo corpus + canned answers
@@ -329,25 +331,33 @@ By subsystem:
 | **Ingestion** | Upload PDF with NSE metadata (company, ticker, FY, type, exchange) | ✅ |
 | | MIME + magic-byte validation; empty-file rejection | ✅ |
 | | SHA-256 duplicate detection (idempotent re-upload) | ✅ |
-| | Page-labelled parsing → sentence-aware chunking → Gemini embeddings → pgvector | ✅ |
+| | Page-labelled parsing → sentence-aware chunking → NVIDIA embeddings → pgvector | ✅ |
 | | Atomic rollback of Storage + DB on indexing failure | ✅ |
-| **Conversations** | Create / fetch / delete conversations scoped to 1..n documents | ✅ |
+| | **Background indexing** (202 + `status`/`progress`/`error`, polled by the UI) | ✅ |
+| | **Delete a filing** — vectors, stored PDF, links and rows | ✅ |
+| | **Re-index / retry** from the stored PDF | ✅ |
+| | **PDF streaming** through the API (`/file`, `#page=N` ready) | ✅ |
+| **Conversations** | Create / fetch / patch / delete conversations scoped to 0..n documents | ✅ |
+| | **Thread index** — title, message count, preview, last activity | ✅ |
 | | Chat history replay (failed / empty messages filtered out) | ✅ |
 | **Reasoning** | ReAct agent with domain system prompt (units, FY, citations, refusal) | ✅ |
 | | Per-document isolated retrieval (metadata-filtered, top-3) | ✅ |
 | | Multi-document sub-question decomposition with async fan-out | ✅ |
 | | Custom QA / Refine synthesis prompts | ✅ |
 | **Streaming** | SSE token stream with structured sub-process events | ✅ |
-| | Page-level citations with passage text + relevance score | ✅ |
-| | Full reasoning trace persisted per message | ✅ |
+| | **`POST /message`** with the question in the body (GET kept, deprecated) | ✅ |
+| | Page-level citations with passage text + relevance score, **flattened onto the message** | ✅ |
+| | Full reasoning trace persisted per message, with step labels + durations | ✅ |
+| | **Durable partials** — user message + placeholder written first, content flushed mid-stream | ✅ |
 | **Ops** | One-shot deploy bootstrap, multi-worker uvicorn, pooled connections | ✅ |
 | | Alembic migrations with head verification at boot | ✅ |
 | | Docker image + compose with local pgvector | ✅ |
 | | Optional Sentry, configurable CORS, structured logging | ✅ |
 | | OpenAPI / Swagger / ReDoc at `/api/docs`, `/api/redoc` | ✅ |
-| **Frontend** | Research threads, streaming answers, live research trail, citation chips, source drawer | ✅ |
-| | Filing library: drag-and-drop upload, search, detail drawer, scoped threads | ✅ |
-| | Mock transport: seeded corpus + canned cited answers, no backend required | ✅ |
+| **Frontend** | Research threads, streaming answers, live research trail, citation chips, source drawer | ✅ (live API) |
+| | Filing library: real PDF uploads, polling, search, detail drawer, scoped threads | ✅ |
+| | Server-backed thread list, reload-safe messages, PATCH scope, real delete errors | ✅ |
+| | Explicit demo transport: seeded corpus + canned cited answers, no backend required | ✅ |
 | | Single-file production build (`dist/index.html`) | ✅ |
 
 ### Try it in the sandbox
@@ -355,8 +365,11 @@ By subsystem:
 Four ways to exercise the system:
 
 ```bash
-# 0. The research terminal (mock mode — no backend required)
+# 0a. The research terminal against the live API (backend + /api proxy required)
 cd frontend && npm ci && npm run dev          # http://localhost:5173
+
+# 0b. The same terminal in explicit demo mode (no backend required)
+cd frontend && npm ci && npm run dev:mock     # http://localhost:5173
 
 # 1. Swagger UI — interactive, every endpoint (use /test_message for a non-streamed answer)
 open http://localhost:8000/api/docs
@@ -380,19 +393,19 @@ cd backend && uv run python scripts/chat_llama.py --base_url http://localhost:80
 | **Node 20+** and npm | for the frontend |
 | **PostgreSQL with pgvector** | a Supabase project (recommended) **or** the bundled `docker compose` database |
 | **Supabase project** | Storage bucket (default name `annual-reports`) + service-role key |
-| **Google AI Studio API key** | https://aistudio.google.com/apikey |
+| **NVIDIA API key** (`nvapi-…`) | https://build.nvidia.com — sign in, open any model, “Get API Key” |
 
 ### 6.2 Backend
 
 ```bash
 cd backend
-cp .env.example .env          # fill in DATABASE_URL, SUPABASE_*, GOOGLE_API_KEY
+cp .env.example .env          # fill in DATABASE_URL, SUPABASE_*, NVIDIA_API_KEY
 uv sync                        # installs from uv.lock (dev group included)
 uv run alembic upgrade head    # create tables
 uv run start                   # bootstrap + uvicorn on http://0.0.0.0:8000
 ```
 
-Or with Docker (local pgvector included — you still need Supabase Storage + Gemini credentials in `.env`):
+Or with Docker (local pgvector included — you still need Supabase Storage + an NVIDIA API key in `.env`):
 
 ```bash
 cd backend && docker compose up --build
@@ -403,39 +416,73 @@ cd backend && docker compose up --build
 ```bash
 cd frontend
 npm ci
-npm run dev                    # http://localhost:5173 — runs in mock mode (no backend required)
+npm run dev                    # http://localhost:5173 — live API via the Vite /api proxy
+npm run dev:mock               # explicit demo mode (seeded data, no backend)
+npm run dev:real               # explicitly force live API (same as the default)
 npm run build                  # → dist/index.html, a single static file
-npm run preview                # serve the production build
+npm run typecheck              # tsc --noEmit (0 errors)
 ```
 
-The frontend currently runs against an in-memory mock transport (`USE_MOCK = true` in `src/lib/api.ts`). To connect to the real backend, you would need to edit `src/lib/api.ts` and set `USE_MOCK = false`, but note that the `RealTransport` implementation is incomplete and does not match the backend's SSE contract (see AGENTS.md §14.B).
+Transport selection is environment-driven — no source edits:
+
+| `VITE_USE_MOCK` | Behaviour |
+|---|---|
+| unset / `0` | real API (`npm run dev` / `npm run dev:real` / `npm run build`) |
+| `1` | always mock (demo mode, `npm run dev:mock` / `npm run build:demo`) |
+
+`VITE_API_URL` defaults to `""` (same origin), which is what the Vite dev proxy
+(`server.proxy`, target `VITE_PROXY_TARGET`) and the production reverse proxy expect — so CORS is not
+part of local development. See `frontend/.env.example`.
+
+> **M2 status:** the real transport uses `POST /message` over fetch/`ReadableStream`, maps unnamed
+> `Message` snapshots in [`frontend/src/lib/wire.ts`](frontend/src/lib/wire.ts), rehydrates the thread
+> list and messages from the server, PATCHes scope, polls real ingestion status, and opens the original
+> PDF at the cited page. Demo mode remains only behind `VITE_USE_MOCK=1`. See
+> [`docs/plans/connect-and-deploy.md`](docs/plans/connect-and-deploy.md).
 
 ### 6.4 Run the tests
 
 ```bash
-cd backend && uv run pytest -q      # 15 passed — no database or API key required
-cd frontend && npx tsc --noEmit     # TypeScript typecheck (currently 5 errors, see AGENTS.md §14.A)
+cd backend && uv run pytest -q      # 70 passed — no database or API key required
+cd frontend && npm run typecheck     # 0 errors
+cd frontend && npm run build         # single dist/index.html
+cd frontend && npm run build:demo    # still typechecks/builds demo mode
 ```
 
-There is no `npm run typecheck` or `npm run check:adapter` script; run `npx tsc --noEmit` directly for type checking.
+With a running backend and a real PDF, `./scripts/smoke.sh http://localhost:8000 path/to/filing.pdf`
+checks upload → indexing → streaming answer → citation → reload → cleanup.
+
+CI (`.github/workflows/ci.yml`) runs the backend suite, the typecheck, and both the real and demo builds
+on every push, so mock mode cannot rot.
 
 ---
 
 ## 7. API surface
 
-All routes are prefixed with `/api`. Full request/response documentation lives in the [backend README](backend/README.md#8-api-reference) and in the generated OpenAPI spec.
+All routes are prefixed with `/api`. Full request/response documentation lives in
+[`docs/agents/API_REFERENCE.md`](docs/agents/API_REFERENCE.md) and in the generated OpenAPI spec.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health/` | Liveness probe — runs `SELECT 1` |
-| `POST` | `/document/upload` | Multipart PDF upload + synchronous indexing → `201 { status: "indexed" }` |
-| `GET` | `/document/` | List documents (optionally `?document_ids=…`) |
-| `GET` | `/document/{id}` | Fetch one document with its NSE metadata |
-| `POST` | `/conversation/` | Create a conversation over `document_ids[]` |
-| `GET` | `/conversation/{id}` | Conversation + messages + sub-process trace |
-| `DELETE` | `/conversation/{id}` | Delete a conversation → `204` |
-| `GET` | `/conversation/{id}/message?user_message=` | **SSE** — streamed assistant answer with research trail |
+| `GET` | `/health/` | Liveness + readiness → `{status, db, version, uptime_s}` (never 5xx) |
+| `GET` | `/config/` | Public runtime config: upload limit, accepted types, `auth_enabled`, `demo_mode` |
+| `POST` | `/document/upload` | Multipart PDF upload → **202** `{status:"uploaded"}`; indexing runs in the background |
+| `GET` | `/document/` | List documents (`?status=&q=&limit=&offset=`) → `[]` when empty |
+| `GET` | `/document/{id}` | One document incl. `status` / `progress` / `error` |
+| `GET` | `/document/{id}/file` | Streams the original PDF (citation viewer, `#page=N`) |
+| `POST` | `/document/{id}/reindex` | Re-run ingestion from the stored PDF (retry) |
+| `DELETE` | `/document/{id}` | Delete vectors + stored PDF + rows → `204` |
+| `POST` | `/conversation/` | Create a thread over `document_ids[]` (optional) + `title` |
+| `GET` | `/conversation/` | Thread index: title, message count, preview, last activity |
+| `GET` | `/conversation/{id}` | Thread + messages + research trail + citations |
+| `PATCH` | `/conversation/{id}` | Rename and/or replace the document scope |
+| `DELETE` | `/conversation/{id}` | Delete a thread → `204` |
+| `POST` | `/conversation/{id}/message` | **SSE** — `{"content": "…"}` → streamed answer with trail + citations |
+| `GET` | `/conversation/{id}/message?user_message=` | Same stream (deprecated, kept for `curl`) |
 | `GET` | `/conversation/{id}/test_message?user_message=` | Same, non-streamed (handy in Swagger) |
+
+Full request/response documentation: [`docs/agents/API_REFERENCE.md`](docs/agents/API_REFERENCE.md) and
+the generated OpenAPI spec at `/api/docs`.
 
 ---
 
@@ -448,27 +495,70 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 | `DATABASE_URL` | — | Postgres URL; normalised to `postgresql+asyncpg://` automatically |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` | — | Storage access (server-side only) |
 | `SUPABASE_STORAGE_BUCKET` | `annual-reports` | Bucket holding original PDFs |
-| `GOOGLE_API_KEY` | — | Gemini LLM + embeddings |
-| `GEMINI_CHAT_LLM_NAME` | `models/gemini-1.5-flash` | Reasoning / synthesis model |
-| `GEMINI_EMBEDDING_MODEL_NAME` | `models/gemini-embedding-001` | Embedding model |
-| `VECTOR_STORE_TABLE_NAME` / `VECTOR_STORE_EMBED_DIM` | `pg_vector_store` / `3072` | pgvector table & dimension (must match the embedding model) |
+| `NVIDIA_API_KEY` | — | Key for chat + embeddings (`nvapi-…` from build.nvidia.com by default) |
+| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | Any OpenAI-compatible `/v1` endpoint |
+| `NVIDIA_CHAT_LLM_NAME` | `meta/llama-3.3-70b-instruct` | Reasoning / synthesis model id (any id the endpoint serves) |
+| `NVIDIA_CHAT_IS_CHAT_MODEL` / `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL` | `true` / `false` | Declared `LLMMetadata` booleans — required, never inferred |
+| `NVIDIA_CHAT_CONTEXT_WINDOW` / `NVIDIA_CHAT_MAX_TOKENS` | `131072` / `4096` | Must match the chat model's limits |
+| `NVIDIA_CHAT_TIMEOUT` | `120` | Per-request chat timeout in seconds |
+| `NVIDIA_EMBEDDING_MODEL_NAME` | `nvidia/nemotron-3-embed-1b` | Embedding model id |
+| `NVIDIA_EMBEDDING_REQUEST_STYLE` / `NVIDIA_EMBEDDING_TRUNCATE` | `nim` / `END` | `nim` sends `input_type` + `truncate`; `openai` sends a plain request |
+| `NVIDIA_EMBEDDING_DIMENSIONS` | — | Optional reduced size; must equal `VECTOR_STORE_EMBED_DIM` |
+| `VECTOR_STORE_TABLE_NAME` / `VECTOR_STORE_EMBED_DIM` | `pg_vector_store` / `2048` | pgvector table & dimension (must match the embedding model) |
+| `MAX_UPLOAD_MB` | `50` | Upload size ceiling (413 above it) |
+| `INGESTION_ENABLED` | `true` | `false` accepts uploads without indexing them |
+| `AUTH_ENABLED` | `false` | Reserved for M4 (Supabase JWT); endpoints are public while false |
+| `DEMO_MODE` | `false` | Labels a seeded/demo deployment |
 | `BACKEND_WORKERS` | `4` | uvicorn worker processes |
 | `BACKEND_CORS_ORIGINS` | `[]` | JSON list or comma-separated origins |
 | `LOG_LEVEL` | `INFO` | `DEBUG` also enables uvicorn reload + verbose agent traces |
 | `SENTRY_DSN` | — | Optional error tracking |
 
+### 8.1 Changing models (no code changes)
+
+The `NVIDIA_*` names are historical — they configure a **generic OpenAI-compatible** client,
+so you can point the app at NVIDIA hosted NIMs, a self-hosted NIM, vLLM, or a gateway. There
+is no hardcoded model id or provider-specific model table in the backend.
+
+1. Set `NVIDIA_CHAT_LLM_NAME` to the exact id your endpoint serves (for example
+   `nvidia/nemotron-3.5-bolt-e4b`), plus `NVIDIA_BASE_URL` / `NVIDIA_API_KEY` if the provider
+   changes.
+2. Update the **whole chat profile** for that model: `NVIDIA_CHAT_IS_CHAT_MODEL`,
+   `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL`, `NVIDIA_CHAT_CONTEXT_WINDOW`,
+   `NVIDIA_CHAT_MAX_TOKENS`, `NVIDIA_CHAT_TIMEOUT`. These are declarations used to build
+   LlamaIndex `LLMMetadata`; a stale context window silently truncates synthesis.
+3. Restart. Startup logs `Models configured — chat=… embeddings=… endpoint=…` (never the key).
+4. Changing the **embedding** model also means checking its output dimension against
+   `VECTOR_STORE_EMBED_DIM`; if it differs, drop `data_pg_vector_store` and re-index every
+   document. Set `NVIDIA_EMBEDDING_REQUEST_STYLE=openai` for plain `/v1/embeddings`
+   providers that reject NIM's `input_type` / `truncate` fields.
+
+See [`backend/.env.example`](backend/.env.example) for the fully commented profile and
+[`AGENTS.md` §10.2](AGENTS.md) for the agent-facing checklist.
+
+> **Fixed (Oct 2026):** with newer model ids, `llama-index-llms-nvidia` used to set
+> `is_chat_model` / `is_function_calling_model` to `None`, so the first `POST /message`
+> failed with `LLMMetadata: 2 validation errors` while building the query engine; the
+> follow-on `MissingGreenlet` prevented the ERROR answer from being persisted. Both are
+> resolved by the explicit config above plus `expire_on_commit=False` on async sessions.
+
 ---
 
 ## 9. Roadmap
 
-- [ ] **Background indexing** — move embedding to a job queue with progress events for 300-page filings.
+- [x] **Frontend connected (M2)** — real POST SSE, server-backed threads, live uploads and citations;
+      demo mode is explicit.
+- [x] **Background indexing** — uploads return 202 and a job reports `status`/`progress`/`error`
+      (process-local scheduler; a durable queue is the follow-up).
 - [ ] **Authentication & tenancy** — per-user libraries and threads.
 - [ ] **Hybrid retrieval + reranking** — BM25 fusion and a cross-encoder stage ahead of synthesis.
-- [ ] **In-app PDF viewer** — jump from a citation chip to the highlighted page.
+- [ ] **In-app PDF viewer** — backend half is done (`GET /api/document/{id}/file` streams the PDF);
+      the UI viewer is M3.
 - [ ] **Richer NSE metadata** — quarterly results, concall transcripts, shareholding patterns as first-class document types (the UI already labels them).
-- [ ] **Conversation listing** — a server-side thread index so libraries follow the user across devices.
+- [x] **Conversation listing** — `GET /api/conversation/` returns the sidebar index (title, preview,
+      message count, last activity).
 - [ ] **Evaluation harness** — golden Q&A set over public filings for regression-testing answer faithfulness.
-- [ ] **Model abstraction** — swap Gemini for other providers via LlamaIndex settings.
+- [x] **Model abstraction** — providers/models swap via `app/llama_index_settings.py` factories + env (Google Gemini → NVIDIA NIM, Oct 2026); since Oct 27 the chat client is a generic `OpenAILike` with env-declared capabilities, so any model id works without a code change.
 
 ---
 
@@ -480,7 +570,9 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 | [`AGENTS.md`](AGENTS.md) | AI agents / contributors | Repo map, verified commands, known issues, coding conventions, agent rules |
 | [`backend/README.md`](backend/README.md) | Backend / ML engineers | Harness internals, SSE protocol, data model, configuration, API reference, ops |
 
-> **Note:** `frontend/README.md` and `backend/CONTEXT.md` do not currently exist. The `docs/agents/` directory with module-level deep dives is referenced in `AGENTS.md` but not yet created.
+> **Note:** `frontend/README.md` and `backend/CONTEXT.md` do not exist. `docs/agents/` holds the
+> module-level deep dives, and [`docs/plans/connect-and-deploy.md`](docs/plans/connect-and-deploy.md)
+> is the roadmap for connecting the frontend to the backend and deploying them.
 
 ---
 
@@ -489,5 +581,5 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 MIT © 2026 Ajinkya Datir — see [`LICENSE`](LICENSE).
 
 <div align="center">
-<sub>Built with FastAPI · LlamaIndex · Google Gemini · Supabase · React</sub>
+<sub>Built with FastAPI · LlamaIndex · NVIDIA NIM · Supabase · React</sub>
 </div>

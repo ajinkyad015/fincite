@@ -41,7 +41,7 @@ def chat_tuples_to_chat_messages(
     return chat_messages
 
 
-def test_get_vector_store_singleton_uses_3072_embedding_dimension(monkeypatch):
+def test_get_vector_store_singleton_uses_2048_embedding_dimension(monkeypatch):
     calls = {}
 
     def fake_from_params(cls, *args, **kwargs):
@@ -58,7 +58,11 @@ def test_get_vector_store_singleton_uses_3072_embedding_dimension(monkeypatch):
     result = asyncio.run(pg_vector.get_vector_store_singleton())
 
     assert result is not None
-    assert calls["kwargs"]["embed_dim"] == 3072
+    # 2048 = nvidia/nemotron-3-embed-1b's native output dimension. Pinning the
+    # literal here (rather than echoing the setting) is deliberate: changing
+    # the dimension means recreating the vector table and re-indexing, and
+    # this test failing is the reminder.
+    assert calls["kwargs"]["embed_dim"] == 2048
 
 
 class TestGetChatHistory:

@@ -13,8 +13,8 @@ start() (once per deploy, in the process that launches uvicorn):
 lifespan (per worker process):
     1. _bootstrap() only if start() did not already run it (e.g. when the app
        is launched via `uvicorn app.main:app` directly)
-    2. Configure LlamaIndex settings (Gemini LLM + embeddings) — per process;
-       the blocking Gemini model-metadata lookup runs in a worker thread
+    2. Configure LlamaIndex settings (OpenAI-compatible LLM + embeddings) —
+       per process; client construction runs in a worker thread (see lifespan)
     3. Initialise pgvector store engines for this process (no DDL — tables
        were already created in start())
     4. Start FastAPI
@@ -22,6 +22,7 @@ lifespan (per worker process):
 from typing import cast
 import asyncio
 import os
+from pathlib import Path
 import uvicorn
 import logging
 import sys
@@ -40,11 +41,17 @@ from app.api.api import api_router
 from app.db.wait_for_db import check_database_connection
 from app.core.config import settings
 from app.chat.pg_vector import get_vector_store_singleton, CustomPGVectorStore
+from app.api import crud
+from app.db.session import SessionLocal
 from app.llama_index_settings import _setup_llama_index_settings
 
 logger = logging.getLogger(__name__)
 
 _BOOTSTRAP_DONE_ENV_VAR = "FINCITE_BOOTSTRAP_DONE"
+
+#: Repository-root-relative locations — never depend on the process CWD.
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+ALEMBIC_INI_PATH = BACKEND_DIR / "alembic.ini"
 
 
 def check_current_head(alembic_cfg: Config, connectable: Engine) -> bool:
@@ -85,7 +92,10 @@ async def _bootstrap(release_connections: bool = False) -> None:
     await check_database_connection()
 
     # 2. Verify Alembic migrations are current (sync psycopg2 engine)
-    cfg = Config("alembic.ini")
+    cfg = Config(str(ALEMBIC_INI_PATH))
+    # `script_location = alembic` in the ini is relative to the CWD, so anchor
+    # it to the backend directory: the app must boot from any working dir.
+    cfg.set_main_option("script_location", str(BACKEND_DIR / "alembic"))
     db_url = settings.DATABASE_URL.replace(
         "postgresql+asyncpg://", "postgresql+psycopg2://"
     )
@@ -110,6 +120,16 @@ async def _bootstrap(release_connections: bool = False) -> None:
     except FileExistsError:
         logger.info("NLTK tokenizer files already present.")
 
+    # 5. Fail ingestion runs that a previous process left half-finished, so the
+    #    UI stops waiting on a status that will never change.
+    try:
+        async with SessionLocal() as db:
+            stale = await crud.mark_stale_documents_failed(db)
+        if stale:
+            logger.warning("Marked %d stale document(s) as failed", stale)
+    except Exception:  # noqa: BLE001 — never block boot on a cleanup sweep
+        logger.warning("Could not sweep stale documents at boot", exc_info=True)
+
     if release_connections:
         # The parent process does not serve requests: release its DB
         # connections (each uvicorn worker creates its own engines).
@@ -123,9 +143,11 @@ async def lifespan(app: FastAPI):
     if os.environ.get(_BOOTSTRAP_DONE_ENV_VAR) != "1":
         await _bootstrap()
 
-    # 1. Configure LlamaIndex (Gemini LLM + embeddings) — per process. The
-    #    Gemini constructor makes a blocking network call (model metadata
-    #    lookup), so keep it off the event loop.
+    # 1. Configure LlamaIndex (configured LLM + embeddings) — per process.
+    #    Construction is config-only and network-free now (see
+    #    app/llama_index_settings.py); keeping it off the event loop stays
+    #    cheap insurance against future provider SDKs that do blocking work
+    #    in their constructors.
     await asyncio.to_thread(_setup_llama_index_settings)
 
     # 2. Create this process's vector store engines (no DDL).
@@ -153,7 +175,9 @@ app = FastAPI(
 if settings.BACKEND_CORS_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[str(origin) for origin in settings.BACKEND_CORS_ORIGINS],
+        allow_origins=[
+            origin.rstrip("/") for origin in settings.BACKEND_CORS_ORIGINS
+        ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

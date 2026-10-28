@@ -11,7 +11,17 @@ import SourceDrawer from "./components/SourceDrawer";
 import Toasts from "./components/Toasts";
 
 function Shell() {
-  const { booted, boot, view, mobileNav, setMobileNav, checkHealth, health } = useStore();
+  const {
+    booted,
+    boot,
+    view,
+    mobileNav,
+    setMobileNav,
+    checkHealth,
+    health,
+    refreshDocuments,
+    refreshConversations,
+  } = useStore();
   const [splashing, setSplashing] = useState(true);
 
   useEffect(() => {
@@ -33,6 +43,26 @@ function Shell() {
   return (
     <div className="flex h-full flex-col overflow-hidden bg-bone text-ink">
       <Ticker />
+
+      {booted && health?.status === "down" && (
+        <div
+          role="status"
+          className="flex shrink-0 items-center gap-3 border-b border-rust/30 bg-rust-soft px-4 py-2 font-mono text-[10px] text-rust"
+        >
+          <span>Backend unreachable — live filings and threads are unavailable.</span>
+          <button
+            type="button"
+            onClick={() =>
+              void Promise.all([checkHealth(), refreshDocuments(), refreshConversations()]).catch(
+                () => undefined
+              )
+            }
+            className="ml-auto border border-rust/40 px-2 py-1 uppercase tracking-[0.12em] hover:bg-rust hover:text-paper"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       <div className="flex min-h-0 flex-1">
         {/* desktop rail */}

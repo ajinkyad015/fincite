@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime
 from uuid import uuid4, UUID
 from fastapi.exceptions import HTTPException
-from fastapi import UploadFile
+from fastapi import Response, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import schema
@@ -137,12 +137,9 @@ async def test_pdf_ingestion_flow(mock_storage_context, mock_vector_index, mock_
 @patch("app.api.endpoints.documents.upload_document")
 @patch("app.api.endpoints.documents.get_document_url")
 @patch("app.api.endpoints.documents.crud")
-@patch("app.api.endpoints.documents.get_vector_store_singleton")
-@patch("app.api.endpoints.documents.ingest_document")
+@patch("app.api.endpoints.documents.jobs")
 @pytest.mark.asyncio
-async def test_upload_document_endpoint_success(
-    mock_ingest, mock_get_vector_store, mock_crud, mock_get_url, mock_upload
-):
+async def test_upload_document_endpoint_success(mock_jobs, mock_crud, mock_get_url, mock_upload):
     mock_upload.return_value = "documents/some_uuid/original.pdf"
     mock_get_url.return_value = "https://example.supabase.co/bucket/documents/some_uuid/original.pdf"
     
@@ -172,7 +169,9 @@ async def test_upload_document_endpoint_success(
     
     db_session = AsyncMock(spec=AsyncSession)
     
+    http_response = Response()
     response = await upload_document_endpoint(
+        response=http_response,
         file=mock_file,
         company_name="TCS",
         company_symbol="TCS",
@@ -181,14 +180,20 @@ async def test_upload_document_endpoint_success(
         exchange="NSE",
         db=db_session
     )
-    
+
     assert response.id == doc_id
-    assert response.status == "indexed"
     assert response.url == mock_db_doc.url
-    
+    # Indexing is now asynchronous: the upload only reports acceptance …
+    assert response.status == "uploaded"
+    assert http_response.status_code == 202
+
     mock_upload.assert_called_once()
     mock_crud.create_document.assert_called_once()
-    mock_ingest.assert_called_once_with(mock_db_doc, mock_get_vector_store.return_value)
+    # … and the background job is scheduled instead of being awaited inline.
+    # (The endpoint mints a fresh document id, so assert the shape, not the value.)
+    mock_jobs.schedule_ingestion.assert_called_once()
+    (scheduled_id,), _kwargs = mock_jobs.schedule_ingestion.call_args
+    UUID(scheduled_id)
 
 
 @patch("app.api.endpoints.documents.crud")
@@ -203,6 +208,7 @@ async def test_upload_document_endpoint_invalid_file(mock_crud):
     
     with pytest.raises(HTTPException) as excinfo:
         await upload_document_endpoint(
+            response=Response(),
             file=mock_file,
             company_name="TCS",
             db=db_session
@@ -220,6 +226,19 @@ from app.api.endpoints.health import health
 async def test_health_endpoint():
     db_session = AsyncMock(spec=AsyncSession)
     res = await health(db=db_session)
-    assert res == {"status": "alive"}
+    assert res.status == "healthy"
+    assert res.db is True
+    assert res.version
+    assert res.uptime_s >= 0
     db_session.execute.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_reports_degraded_when_db_down():
+    db_session = AsyncMock(spec=AsyncSession)
+    db_session.execute.side_effect = RuntimeError("connection refused")
+    res = await health(db=db_session)
+    # A degraded database is still a reachable API: 200 + degraded, not a 500.
+    assert res.status == "degraded"
+    assert res.db is False
 

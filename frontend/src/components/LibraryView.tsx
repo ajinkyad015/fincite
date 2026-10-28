@@ -14,6 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { useStore } from "../store";
+import { USE_MOCK } from "../lib/api";
 import type { FinDocument } from "../lib/types";
 import {
   DOC_TYPE_LABEL,
@@ -36,11 +37,8 @@ export default function LibraryView() {
     e.preventDefault();
     dragDepth.current = 0;
     setDragging(false);
-    const files = Array.from(e.dataTransfer.files ?? []).map((f) => ({
-      name: f.name,
-      size: f.size,
-      type: f.type,
-    }));
+    // Keep the real File objects: M2 uploads their bytes via FormData.
+    const files = Array.from(e.dataTransfer.files ?? []);
     if (files.length) void uploadFiles(files);
   };
 
@@ -320,9 +318,7 @@ function UploadDrawer({ open, onClose }: { open: boolean; onClose: () => void })
 
   const pick = (files: FileList | null) => {
     if (!files?.length) return;
-    void uploadFiles(
-      Array.from(files).map((f) => ({ name: f.name, size: f.size, type: f.type }))
-    );
+    void uploadFiles(Array.from(files));
   };
 
   const sample = () =>
@@ -431,24 +427,26 @@ function UploadDrawer({ open, onClose }: { open: boolean; onClose: () => void })
                 </div>
               )}
 
-              <div className="mt-6 border-t border-line pt-4">
-                <p className="font-mono text-[9px] uppercase tracking-[0.18em] text-moss">
-                  No PDF at hand?
-                </p>
-                <button
-                  type="button"
-                  onClick={sample}
-                  className="mt-2 flex w-full items-center justify-between border border-ink bg-paper px-3.5 py-3 text-left transition-colors hover:bg-ink hover:text-paper"
-                >
-                  <span>
-                    <span className="block text-[13px] font-medium">Index a sample filing</span>
-                    <span className="mt-0.5 block font-mono text-[9px] opacity-60">
-                      Bajaj Finance · investor deck · 4.2 MB
+              {USE_MOCK && (
+                <div className="mt-6 border-t border-line pt-4">
+                  <p className="font-mono text-[9px] uppercase tracking-[0.18em] text-moss">
+                    No PDF at hand?
+                  </p>
+                  <button
+                    type="button"
+                    onClick={sample}
+                    className="mt-2 flex w-full items-center justify-between border border-ink bg-paper px-3.5 py-3 text-left transition-colors hover:bg-ink hover:text-paper"
+                  >
+                    <span>
+                      <span className="block text-[13px] font-medium">Index a sample filing</span>
+                      <span className="mt-0.5 block font-mono text-[9px] opacity-60">
+                        Bajaj Finance · investor deck · 4.2 MB
+                      </span>
                     </span>
-                  </span>
-                  <FileUp size={15} />
-                </button>
-              </div>
+                    <FileUp size={15} />
+                  </button>
+                </div>
+              )}
             </div>
           </motion.aside>
         </>
@@ -462,7 +460,7 @@ function UploadDrawer({ open, onClose }: { open: boolean; onClose: () => void })
 /* ------------------------------------------------------------------ */
 
 function DocDetailDrawer() {
-  const { libraryOpenDocId, setLibraryOpenDocId, documents, startScopedChat, uploadFiles } =
+  const { libraryOpenDocId, setLibraryOpenDocId, documents, startScopedChat, uploadFiles, retryDocument } =
     useStore();
   const doc = documents.find((d) => d.id === libraryOpenDocId);
 
@@ -615,21 +613,33 @@ function DocDetailDrawer() {
                 <MessagesSquare size={14} />
                 Query this filing
               </button>
-              <button
-                type="button"
-                onClick={() =>
-                  void uploadFiles([
-                    {
-                      name: `reindexed-${doc.filename}`,
-                      size: doc.metadata.file_size,
-                      type: "application/pdf",
-                    },
-                  ])
-                }
-                className="w-full border border-line px-4 py-2.5 font-mono text-[10px] uppercase tracking-[0.12em] text-moss transition-colors hover:border-ink/40 hover:text-ink"
-              >
-                Re-upload a revision
-              </button>
+              {doc.status === "failed" ? (
+                <button
+                  type="button"
+                  onClick={() => void retryDocument(doc.id)}
+                  className="w-full border border-accent/50 bg-accent-soft/40 px-4 py-2.5 font-mono text-[10px] uppercase tracking-[0.12em] text-accent-deep transition-colors hover:border-accent hover:text-ink"
+                >
+                  Retry indexing
+                </button>
+              ) : (
+                USE_MOCK && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void uploadFiles([
+                        {
+                          name: `reindexed-${doc.filename}`,
+                          size: doc.metadata.file_size,
+                          type: "application/pdf",
+                        },
+                      ])
+                    }
+                    className="w-full border border-line px-4 py-2.5 font-mono text-[10px] uppercase tracking-[0.12em] text-moss transition-colors hover:border-ink/40 hover:text-ink"
+                  >
+                    Re-upload a revision
+                  </button>
+                )
+              )}
             </div>
           </motion.aside>
         </>

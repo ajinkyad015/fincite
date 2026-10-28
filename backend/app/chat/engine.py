@@ -1,8 +1,10 @@
 """
 Chat engine construction.
 
-Builds a ReActAgent with per-document RAG query engines powered by Google Gemini.
-Documents are retrieved from Supabase Storage and indexed into pgvector.
+Builds a ReActAgent with per-document RAG query engines powered by the
+configured OpenAI-compatible chat model (see app/llama_index_settings.py —
+model id and capabilities come from env, never from this module). Documents
+are retrieved from Supabase Storage and indexed into pgvector.
 
 Flow:
     conversation documents
@@ -19,9 +21,9 @@ Flow:
           ↓
     SubQuestionQueryEngine
           ↓
-    ReActAgent (streaming, powered by Gemini)
+    ReActAgent (streaming, powered by the configured chat model)
 """
-from typing import Dict, List
+from typing import Dict, List, Optional
 import logging
 from datetime import datetime
 from tempfile import TemporaryDirectory
@@ -40,8 +42,8 @@ from llama_index.core.callbacks.base import BaseCallbackHandler, CallbackManager
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core.query_engine import SubQuestionQueryEngine
 from llama_index.core.agent import ReActAgent
-from llama_index.llms.gemini import Gemini
 from llama_index.core.base.llms.types import MessageRole
+from llama_index.core.llms import LLM
 
 from llama_index.readers.file.docs.base import PDFReader
 
@@ -56,6 +58,7 @@ from app.chat.constants import DB_DOC_ID_KEY, SYSTEM_MESSAGE
 from app.chat.utils import build_title_for_document, build_description_for_document
 from app.chat.pg_vector import get_vector_store_singleton
 from app.chat.qa_response_synth import get_custom_response_synth
+from app.llama_index_settings import get_chat_llm
 from app.storage.supabase import download_document
 
 logger = logging.getLogger(__name__)
@@ -101,12 +104,19 @@ def fetch_and_read_document(
         )
 
 
-def index_to_query_engine(doc_id: str, index: VectorStoreIndex) -> BaseQueryEngine:
-    """Create a query engine filtered to a single document."""
+def index_to_query_engine(
+    doc_id: str, index: VectorStoreIndex, llm: Optional[LLM] = None
+) -> BaseQueryEngine:
+    """Create a query engine filtered to a single document.
+
+    Passing the configured LLM explicitly keeps every stage on the same
+    model/capability metadata instead of relying on a global default that may
+    have been built with a different (or unset) configuration.
+    """
     filters = MetadataFilters(
         filters=[ExactMatchFilter(key=DB_DOC_ID_KEY, value=doc_id)]
     )
-    return index.as_query_engine(similarity_top_k=3, filters=filters)
+    return index.as_query_engine(similarity_top_k=3, filters=filters, llm=llm)
 
 
 async def build_doc_id_to_index_map(
@@ -183,7 +193,7 @@ async def get_chat_engine(
     conversation: ConversationSchema,
 ) -> ReActAgent:
     """
-    Build a ReActAgent (powered by Gemini) for a conversation.
+    Build a ReActAgent (powered by the configured chat model) for a conversation.
 
     Architecture:
         One QueryEngineTool per selected document (filtered to that doc's vectors)
@@ -193,6 +203,13 @@ async def get_chat_engine(
         ReActAgent (streaming, with system prompt)
     """
     callback_manager = CallbackManager([callback_handler])
+
+    # One instance shared by the agent, the question generator, the response
+    # synthesizer and every per-document query engine. The factory is
+    # config-driven and network-free, so no model-catalog lookup blocks the
+    # event loop and no stage can silently fall back to a different model.
+    chat_llm = get_chat_llm()
+
     doc_id_to_index = await build_doc_id_to_index_map(
         callback_manager, conversation.documents
     )
@@ -203,7 +220,7 @@ async def get_chat_engine(
     # One tool per document, each with a metadata filter for that doc's ID
     vector_query_engine_tools = [
         QueryEngineTool(
-            query_engine=index_to_query_engine(doc_id, index),
+            query_engine=index_to_query_engine(doc_id, index, llm=chat_llm),
             metadata=ToolMetadata(
                 name=doc_id,
                 description=build_description_for_document(id_to_doc[doc_id]),
@@ -212,18 +229,20 @@ async def get_chat_engine(
         for doc_id, index in doc_id_to_index.items()
     ]
 
-    response_synth = get_custom_response_synth(callback_manager, conversation.documents)
+    response_synth = get_custom_response_synth(
+        callback_manager, conversation.documents, llm=chat_llm
+    )
 
     from llama_index.core.question_gen import LLMQuestionGenerator
-    
-    chat_llm = Gemini(
-        model=settings.GEMINI_CHAT_LLM_NAME,
-        api_key=settings.GOOGLE_API_KEY,
-    )
+
     question_gen = LLMQuestionGenerator.from_defaults(llm=chat_llm)
 
     document_question_engine = SubQuestionQueryEngine.from_defaults(
         query_engine_tools=vector_query_engine_tools,
+        # from_defaults resolves Settings.llm even when we supply both
+        # question_gen and a synthesizer; pass ours so no global default can
+        # put a different model (or an unset one) into the pipeline.
+        llm=chat_llm,
         question_gen=question_gen,
         response_synthesizer=response_synth,
         verbose=settings.LOG_LEVEL == "DEBUG",

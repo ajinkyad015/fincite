@@ -23,8 +23,23 @@ dependencies = [
   "pydantic-settings==2.8.1",
   "llama-index-vector-stores-postgres==0.4.2",
   "llama-index-readers-file==0.4.6",
-  "llama-index-llms-gemini>=0.5.0",
-  "llama-index-embeddings-gemini>=0.3.2",
+  # OpenAI-compatible chat client. Generic on purpose: model ids, endpoint
+  # and capabilities come from .env, with NO provider-specific model table.
+  # (Replaces llama-index-llms-nvidia, whose frozen catalog set
+  # is_chat_model / is_function_calling_model to None for newer ids and broke
+  # LLMMetadata.) 0.3.4 is the newest release in the core-0.12-compatible
+  # line; revisit it together with the core pin below.
+  "llama-index-llms-openai-like==0.3.4",
+  # Embeddings client: subclassed in app/llama_index_settings.py so the
+  # NIM-specific request fields are config-driven and arbitrary model ids
+  # work. 0.3.4 is the last core-0.12-compatible release.
+  "llama-index-embeddings-nvidia==0.3.4",
+  # Transitive via openai-like, but capped here: llms-openai 0.3.38 (the
+  # newest on that chain) imports response types that openai>=1.82 renamed,
+  # so an uncapped `openai<2` resolves to a combination that fails at import
+  # time. Both clients are OpenAI SDK clients underneath. Drop with the pins
+  # above during the core 0.13+ upgrade.
+  "openai>=1.66.3,<1.82",
   "supabase==2.16.0",
   "python-multipart==0.0.9",
   "nest-asyncio==1.6.0",
