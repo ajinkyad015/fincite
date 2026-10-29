@@ -6,10 +6,10 @@ __pycache__/
 # C extensions
 *.so
 ../frontend/temp/
-AGENTS.md
-./docs
-AGENTS.md
-/docs/
+# AGENTS.md
+# ./docs
+# AGENTS.md
+# /docs/
 # Distribution / packaging
 .Python
 build/
