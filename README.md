@@ -523,6 +523,8 @@ is no hardcoded model id or provider-specific model table in the backend.
 1. Set `NVIDIA_CHAT_LLM_NAME` to the exact id your endpoint serves (for example
    `nvidia/nemotron-3.5-bolt-e4b`), plus `NVIDIA_BASE_URL` / `NVIDIA_API_KEY` if the provider
    changes.
+
+   
 2. Update the **whole chat profile** for that model: `NVIDIA_CHAT_IS_CHAT_MODEL`,
    `NVIDIA_CHAT_IS_FUNCTION_CALLING_MODEL`, `NVIDIA_CHAT_CONTEXT_WINDOW`,
    `NVIDIA_CHAT_MAX_TOKENS`, `NVIDIA_CHAT_TIMEOUT`. These are declarations used to build
