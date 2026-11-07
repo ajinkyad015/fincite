@@ -266,7 +266,9 @@ Vectors live alongside in `data_pg_vector_store` (managed by LlamaIndex), linked
 
 ### 3.6 Process model
 
-`uv run start` performs deploy-time bootstrap **once** in the parent process — wait for DB, verify Alembic is at head, `CREATE EXTENSION vector`, create vector tables, pre-fetch NLTK tokenizer data — then launches `uvicorn` with `BACKEND_WORKERS` (default 4) worker processes. Each worker's lifespan only does per-process work: configure NVIDIA model clients off the event loop, open its own connection pools, and close them on shutdown. The vector store deliberately **shares the app's async engine**, so a worker holds one pool, not two.
+`uv run start` performs deploy-time bootstrap **once** in the parent process — wait for DB, verify Alembic is at head, `CREATE EXTENSION vector`, create vector tables, pre-fetch NLTK tokenizer data — then launches `uvicorn` on `PORT` (default 8000) with `WEB_CONCURRENCY`/`BACKEND_WORKERS` (default 1) worker processes. Each worker's lifespan only does per-process work: configure NVIDIA model clients off the event loop, open its own connection pools, and close them on shutdown. The vector store deliberately **shares the app's async engine**, so a worker holds one pool, not two.
+
+> **Sizing note.** Every worker is a full copy of the app — the LlamaIndex stack, model clients, its own DB pools and its own process-local ingestion scheduler. On small or free-tier instances, keep `BACKEND_WORKERS=1`: multiple workers multiply RAM and Postgres connections, and an upload handled by one worker is invisible to another's scheduler. The pool knobs below are **per worker**.
 
 ---
 
@@ -509,7 +511,12 @@ Copy [`backend/.env.example`](backend/.env.example). The important knobs:
 | `INGESTION_ENABLED` | `true` | `false` accepts uploads without indexing them |
 | `AUTH_ENABLED` | `false` | Reserved for M4 (Supabase JWT); endpoints are public while false |
 | `DEMO_MODE` | `false` | Labels a seeded/demo deployment |
-| `BACKEND_WORKERS` | `4` | uvicorn worker processes |
+| `PORT` | `8000` | Bind port; PaaS platforms inject this and health-check exactly it |
+| `WEB_CONCURRENCY` | — | PaaS-standard worker override; wins over `BACKEND_WORKERS` |
+| `RELOAD` | `false` | uvicorn StatReload watcher (local dev); no longer tied to `LOG_LEVEL` |
+| `BACKEND_WORKERS` | `1` | uvicorn worker processes (full app copy each — see sizing note above) |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `2` / `2` | Postgres pool **per worker**; total ≈ workers × (size + overflow) |
+| `DB_POOL_RECYCLE_S` / `DB_POOL_TIMEOUT_S` | `1800` / `30` | Recycle before provider idle timeouts; pool checkout wait |
 | `BACKEND_CORS_ORIGINS` | `[]` | JSON list or comma-separated origins |
 | `LOG_LEVEL` | `INFO` | `DEBUG` also enables uvicorn reload + verbose agent traces |
 | `SENTRY_DSN` | — | Optional error tracking |

@@ -101,8 +101,35 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
 
     # Server
-    # Uvicorn worker processes (ignored by uvicorn when reload is enabled)
-    BACKEND_WORKERS: int = 4
+    # Port uvicorn binds. PaaS platforms (Render, Railway, Fly) inject PORT
+    # and health-check exactly that port; binding anything else gets the
+    # container killed ("no open ports detected"). An env var always beats
+    # the .env file, so a platform-injected PORT wins automatically.
+    PORT: int = 8000
+    # PaaS-standard concurrency override (Render/Railway set WEB_CONCURRENCY).
+    # Wins over BACKEND_WORKERS when set.
+    WEB_CONCURRENCY: Optional[int] = None
+    # Uvicorn auto-reload (StatReload file watcher). Explicit on purpose: it
+    # used to be derived from LOG_LEVEL=DEBUG, so any verbose production
+    # deployment silently ran the reloader as a single process watching /app.
+    RELOAD: bool = False
+    # Uvicorn worker processes (ignored by uvicorn when reload is enabled).
+    # Each worker is a FULL copy of the app (LlamaIndex stack, model clients)
+    # with its own DB pools and its own process-local ingestion scheduler, so
+    # >1 multiplies RAM and DB connections and splits ingestion state across
+    # processes. Keep at 1 on small/free instances; scale up deliberately.
+    BACKEND_WORKERS: int = 1
+
+    # Database connection pool — PER WORKER. Total connections to Postgres are
+    # roughly workers x (DB_POOL_SIZE + DB_MAX_OVERFLOW), plus the vector
+    # store's sync engine per worker. Size for the database's limit (hosted
+    # free tiers are tight), not for throughput hopes.
+    DB_POOL_SIZE: int = 2
+    DB_MAX_OVERFLOW: int = 2
+    # Recycle connections before the provider's idle timeout drops them
+    # (Supabase's pooler closes long-idle connections).
+    DB_POOL_RECYCLE_S: int = 1800
+    DB_POOL_TIMEOUT_S: int = 30
 
     # CORS — JSON-formatted list of origins
     # e.g: '["http://localhost", "http://localhost:3000"]'
@@ -173,6 +200,20 @@ class Settings(BaseSettings):
     def positive_int(cls, v: int) -> int:
         if v <= 0:
             raise ValueError("must be a positive integer")
+        return v
+
+    @field_validator("PORT", "DB_POOL_SIZE", "DB_POOL_TIMEOUT_S")
+    @classmethod
+    def positive_server_int(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("must be a positive integer")
+        return v
+
+    @field_validator("DB_MAX_OVERFLOW", "DB_POOL_RECYCLE_S")
+    @classmethod
+    def non_negative_server_int(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("must be zero or a positive integer")
         return v
 
     @field_validator("NVIDIA_CHAT_TIMEOUT")
