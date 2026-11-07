@@ -7,8 +7,9 @@ start() (once per deploy, in the process that launches uvicorn):
     3. _bootstrap(): wait for database connection, verify Alembic migrations,
        initialise pgvector store (CREATE EXTENSION + tables), pre-download
        NLTK sentence tokenizer data, release the parent's DB connections
-    4. Start uvicorn (BACKEND_WORKERS workers, default 4; reload when
-       LOG_LEVEL=DEBUG, in which case workers are ignored by uvicorn)
+    4. Start uvicorn (WEB_CONCURRENCY or BACKEND_WORKERS workers, default 1;
+       reload only when RELOAD=true, in which case workers are ignored by
+       uvicorn). Binds settings.PORT so PaaS-injected $PORT is honoured.
 
 lifespan (per worker process):
     1. _bootstrap() only if start() did not already run it (e.g. when the app
@@ -186,6 +187,31 @@ if settings.BACKEND_CORS_ORIGINS:
 app.include_router(api_router, prefix=settings.API_PREFIX)
 
 
+def _server_options() -> dict:
+    """Uvicorn bind/concurrency options, resolved from settings.
+
+    Port: PaaS platforms (Render, Railway, Fly) assign the port through the
+    PORT env var and health-check exactly that port. Hardcoding a different
+    port makes the platform kill the container ("no open ports detected") —
+    a deploy that looks like random shutdowns.
+
+    Workers: WEB_CONCURRENCY (the PaaS convention) wins over BACKEND_WORKERS.
+    Every worker is a full copy of the app with its own DB pools and its own
+    process-local ingestion scheduler, so the default is 1 — multiple workers
+    on a small instance multiply memory (OOM kills) and Postgres connections,
+    and an upload handled by one worker is invisible to the other's scheduler.
+    """
+    # Reload is explicit (RELOAD), never derived from the log level: a
+    # verbose production deploy must not silently run the StatReload watcher
+    # as a single process (uvicorn ignores workers under reload anyway).
+    return {
+        "host": "0.0.0.0",
+        "port": settings.PORT,
+        "reload": settings.RELOAD,
+        "workers": settings.WEB_CONCURRENCY or settings.BACKEND_WORKERS,
+    }
+
+
 def start() -> None:
     """Launched with `uv run start`."""
     _setup_logging(settings.LOG_LEVEL)
@@ -198,10 +224,12 @@ def start() -> None:
     asyncio.run(_bootstrap(release_connections=True))
     os.environ[_BOOTSTRAP_DONE_ENV_VAR] = "1"
 
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=settings.LOG_LEVEL == "DEBUG",
-        workers=settings.BACKEND_WORKERS,
+    options = _server_options()
+    logger.info(
+        "Binding uvicorn on %s:%s (workers=%s, reload=%s)",
+        options["host"],
+        options["port"],
+        options["workers"],
+        options["reload"],
     )
+    uvicorn.run("app.main:app", **options)

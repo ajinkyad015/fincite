@@ -24,6 +24,7 @@ Flow:
     ReActAgent (streaming, powered by the configured chat model)
 """
 from typing import Dict, List, Optional
+import asyncio
 import logging
 from datetime import datetime
 from tempfile import TemporaryDirectory
@@ -65,6 +66,70 @@ logger = logging.getLogger(__name__)
 
 logger.info("Applying nested asyncio patch")
 nest_asyncio.apply()
+
+#: Serialises chat-path re-indexing (the fallback below), the same way
+#: ingestion jobs are serialised: parsing is memory-hungry and the embedding
+#: endpoint is rate-limited, so concurrent questions must not fan out into
+#: unbounded parallel re-indexing. Created lazily on first use (per process).
+_REINDEX_LOCK: Optional[asyncio.Lock] = None
+
+
+def _reindex_lock() -> asyncio.Lock:
+    global _REINDEX_LOCK
+    if _REINDEX_LOCK is None:
+        _REINDEX_LOCK = asyncio.Lock()
+    return _REINDEX_LOCK
+
+
+def _fetch_and_index(
+    doc: DocumentSchema,
+    storage_context: StorageContext,
+    callback_manager: CallbackManager,
+) -> VectorStoreIndex:
+    """Blocking re-index pipeline, run in a worker thread via to_thread."""
+    llama_docs = fetch_and_read_document(doc)
+    return VectorStoreIndex.from_documents(
+        llama_docs,
+        storage_context=storage_context,
+        callback_manager=callback_manager,
+    )
+
+
+async def _reindex_document(
+    doc: DocumentSchema,
+    storage_context: StorageContext,
+    callback_manager: CallbackManager,
+) -> VectorStoreIndex:
+    """Re-index one document off the event loop, serialised process-wide.
+
+    The lock is held until the worker thread ACTUALLY finishes, even when the
+    caller is cancelled: shielding keeps the thread handle and the drain loop
+    waits it out before the async-with releases the lock. A plain
+    ``async with lock: await to_thread(...)`` would release the lock on
+    cancellation while the thread kept running, letting repeated cancelled
+    requests stack parallel embedding jobs (memory + rate limits). Threads
+    cannot be killed, so on server shutdown an in-flight re-index runs to
+    completion — bounded to one by this lock.
+    """
+    async with _reindex_lock():
+        thread_run = asyncio.ensure_future(
+            asyncio.to_thread(_fetch_and_index, doc, storage_context, callback_manager)
+        )
+        try:
+            return await asyncio.shield(thread_run)
+        except asyncio.CancelledError:
+            # Caller went away; the thread cannot be interrupted. Drain it
+            # before releasing the lock, surface its failure (if any) to the
+            # logs, then propagate the cancellation.
+            while not thread_run.done():
+                await asyncio.sleep(0.1)
+            if (exc := thread_run.exception()) is not None:
+                logger.warning(
+                    "Re-index of document %s failed after caller disconnect: %s",
+                    doc.id,
+                    exc,
+                )
+            raise
 
 
 def fetch_and_read_document(
@@ -148,12 +213,9 @@ async def build_doc_id_to_index_map(
                 "Re-indexing from storage.",
                 doc_id,
             )
-            llama_docs = fetch_and_read_document(doc)
-            index = VectorStoreIndex.from_documents(
-                llama_docs,
-                storage_context=storage_context,
-                callback_manager=callback_manager,
-            )
+            # Blocking (HTTP download + PDF parse, then chunk + embed):
+            # offloaded and serialised — see _reindex_document.
+            index = await _reindex_document(doc, storage_context, callback_manager)
             index.set_index_id(doc_id)
             doc_id_to_index[doc_id] = index
 
